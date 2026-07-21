@@ -52,7 +52,7 @@ if file:
         columnas_deseadas = {
             "fecha": "Fecha",
             "descripción": "Descripción",
-            "concepto": "Descripción",
+            "concepto": "Concepto",
             "referencia": "Descripción",
             "cargo": "Cargo/Abono",
             "abono": "Cargo/Abono",
