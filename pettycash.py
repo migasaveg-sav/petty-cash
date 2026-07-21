@@ -4,21 +4,11 @@ import xml.etree.ElementTree as ET
 import datetime
 from io import BytesIO
 
-# Paleta de colores estilo Quickel
-C_AZUL_MUY_OSCURO = "#1A4756"
-C_TEAL_VIVO = "#038191"
-C_CORAL_ALERTA = "#F84E65"
-C_CREMA_FONDO = "#ff9f1c"
-
 st.set_page_config(page_title="Comprobación Caja Chica", layout="wide")
 
-st.markdown(f"""
-<style>
-.stApp {{ background-color: {C_AZUL_MUY_OSCURO}; color: {C_CREMA_FONDO}; }}
-table, th, td {{ border: 1px solid #ccc; border-collapse: collapse; padding: 6px; }}
-th {{ background-color: {C_TEAL_VIVO}; color: white; }}
-</style>
-""", unsafe_allow_html=True)
+# Estado inicial
+if "concatenados" not in st.session_state:
+    st.session_state.concatenados = []
 
 st.title("Comprobación de Caja Chica")
 
@@ -31,9 +21,6 @@ if file:
         df = pd.read_excel(file)
 
     st.subheader("Movimientos")
-    st.write("Selecciona el gasto a comprobar:")
-
-    # Añadir columna de selección
     if "Seleccionar" not in df.columns:
         df.insert(0, "Seleccionar", False)
 
@@ -54,12 +41,11 @@ if file:
     seleccionados = edited_df[edited_df["Seleccionar"] == True].index.tolist()
 
     if seleccionados:
+        gasto_sel = df.loc[seleccionados[0]]
         st.subheader("Comprobación de gasto")
-        gasto_sel = df.loc[seleccionados[0]]  # tomar el primero marcado
 
         xml_file = st.file_uploader("Sube el XML del CFDI", type=["xml"])
         if xml_file:
-            # --- Extracción estilo Quickel ---
             tree = ET.parse(xml_file)
             root = tree.getroot()
             ns = {
@@ -75,7 +61,6 @@ if file:
             rfc_emisor = emisor.get('Rfc', 'N/A') if emisor is not None else "N/A"
             razon_social = emisor.get('Nombre', 'N/A') if emisor is not None else "N/A"
 
-            # IVA
             valor_iva = 0.0
             impuestos_globales = root.find('./cfdi:Impuestos', ns)
             if impuestos_globales is not None:
@@ -83,11 +68,10 @@ if file:
                     if traslado.get('Impuesto') == '002':
                         valor_iva = float(traslado.get('Importe', 0))
 
-            # Concepto
             concepto_nodo = root.find('.//cfdi:Concepto', ns)
             concepto = concepto_nodo.get('Descripcion', 'N/A') if concepto_nodo is not None else "N/A"
 
-            comprobacion = pd.DataFrame([{
+            comprobacion = {
                 "Fecha Factura": fecha_factura,
                 "UUID": uuid,
                 "Concepto": concepto,
@@ -95,15 +79,74 @@ if file:
                 "Razón Social": razon_social,
                 "IVA": valor_iva,
                 "Monto Total": total
-            }])
+            }
 
-            st.dataframe(comprobacion)
+            st.write(pd.DataFrame([comprobacion]))
 
-            # Validación de diferencia
-            monto_gasto = float(gasto_sel["Cargo"])
-            diferencia = round(monto_gasto - total, 2)
-
+            # Validación
+            diferencia = round(float(gasto_sel["Cargo"]) - total, 2)
             if abs(diferencia) <= 0.01:
                 st.success(f"Gasto comprobado correctamente. Diferencia: {diferencia}")
-            else:
-                st.error(f"Diferencia mayor a 1 centavo: {diferencia} pesos")
+
+                # Botón Guardar y Concatenar
+                if st.button("Guardar y concatenar"):
+                    combinado = {
+                        "Fecha Estado": gasto_sel["Fecha"],
+                        "Descripción Estado": gasto_sel["Descripción"],
+                        "Cargo Estado": gasto_sel["Cargo"],
+                        "Fecha Factura": comprobacion["Fecha Factura"],
+                        "UUID": comprobacion["UUID"],
+                        "Concepto Factura": comprobacion["Concepto"],
+                        "RFC Emisor": comprobacion["RFC Emisor"],
+                        "Razón Social": comprobacion["Razón Social"],
+                        "IVA": comprobacion["IVA"],
+                        "Monto Factura": comprobacion["Monto Total"]
+                    }
+                    st.session_state.concatenados.append(combinado)
+                    st.success("Concatenado correctamente.")
+
+        # --- Comprobación manual ---
+        st.markdown("### Comprobación manual (sin XML)")
+        with st.form("manual_form"):
+            fecha_factura = st.date_input("Fecha de factura", value=datetime.date.today())
+            uuid = st.text_input("UUID")
+            concepto = st.text_input("Concepto/Descripción")
+            rfc_emisor = st.text_input("RFC Emisor")
+            razon_social = st.text_input("Razón Social Emisor")
+            iva = st.number_input("IVA", min_value=0.0, format="%.2f")
+            monto_total = st.number_input("Monto Total", min_value=0.0, format="%.2f")
+            guardar_manual = st.form_submit_button("Guardar comprobación manual")
+
+            if guardar_manual:
+                combinado = {
+                    "Fecha Estado": gasto_sel["Fecha"],
+                    "Descripción Estado": gasto_sel["Descripción"],
+                    "Cargo Estado": gasto_sel["Cargo"],
+                    "Fecha Factura": fecha_factura,
+                    "UUID": uuid,
+                    "Concepto Factura": concepto,
+                    "RFC Emisor": rfc_emisor,
+                    "Razón Social": razon_social,
+                    "IVA": iva,
+                    "Monto Factura": monto_total
+                }
+                st.session_state.concatenados.append(combinado)
+                st.success("Comprobación manual guardada.")
+
+# --- Tabla final concatenada ---
+if st.session_state.concatenados:
+    st.subheader("Tabla de comprobaciones acumuladas")
+    df_final = pd.DataFrame(st.session_state.concatenados)
+    st.dataframe(df_final)
+
+    # Botón para descargar Excel
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df_final.to_excel(writer, index=False, sheet_name="Comprobaciones")
+
+    st.download_button(
+        label="📥 Descargar Excel",
+        data=output.getvalue(),
+        file_name=f"Comprobaciones_{datetime.datetime.now().strftime('%Y%m%d')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
