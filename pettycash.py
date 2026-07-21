@@ -151,7 +151,7 @@ if file:
 
             st.write(pd.DataFrame([comprobacion]))
 
-            diferencia = round(float(gasto_sel["Cargo/Abono"]) - total, 2)
+            diferencia = round(float(gasto_sel["Importe"]) - total, 2)
             if abs(diferencia) <= 0.01:
                 st.markdown(
                     f"<div class='success-box'>✅ Gasto comprobado correctamente. Diferencia: {diferencia}</div>",
