@@ -37,13 +37,37 @@ st.title("Comprobación de Caja Chica")
 file = st.file_uploader("Sube el estado de cuenta", type=["csv","xlsx"])
 if file:
     if file.name.endswith(".csv"):
-        df = pd.read_csv(file)
+        df_raw = pd.read_csv(file)
     else:
-        df = pd.read_excel(file)
+        df_raw = pd.read_excel(file)
+
+    # --- FILTRAR COLUMNAS POR WILDCARD ---
+    columnas_deseadas = {
+        "fecha": None,
+        "concepto": None,
+        "referencia": None,
+        "descripción": None,
+        "cargo": None,
+        "abono": None,
+        "retiro": None,
+        "depósito": None,
+        "saldo": None
+    }
+
+    for col in df_raw.columns:
+        col_lower = col.lower()
+        for clave in columnas_deseadas.keys():
+            if clave in col_lower and columnas_deseadas[clave] is None:
+                columnas_deseadas[clave] = col
+
+    columnas_finales = [c for c in columnas_deseadas.values() if c is not None]
+
+    df = df_raw[columnas_finales].copy()
+
+    # Agregar columna de selección
+    df.insert(0, "Seleccionar", False)
 
     st.subheader("Movimientos")
-    if "Seleccionar" not in df.columns:
-        df.insert(0, "Seleccionar", False)
 
     edited_df = st.data_editor(
         df,
@@ -51,10 +75,7 @@ if file:
         use_container_width=True,
         num_rows="fixed",
         column_config={
-            "Seleccionar": st.column_config.CheckboxColumn("Selección", default=False),
-            "Fecha": st.column_config.TextColumn("Fecha", disabled=True),
-            "Descripción": st.column_config.TextColumn("Descripción", disabled=True),
-            "Cargo": st.column_config.NumberColumn("Cargo", format="$%.2f", disabled=True)
+            "Seleccionar": st.column_config.CheckboxColumn("Selección", default=False)
         },
         key="data_editor_gastos"
     )
@@ -104,17 +125,15 @@ if file:
 
             st.write(pd.DataFrame([comprobacion]))
 
-            # Validación
-            diferencia = round(float(gasto_sel["Cargo"]) - total, 2)
+            diferencia = round(float(gasto_sel.iloc[1]) - total, 2)
             if abs(diferencia) <= 0.01:
                 st.markdown(f"<div class='success-box'>✅ Gasto comprobado correctamente. Diferencia: {diferencia}</div>", unsafe_allow_html=True)
 
-                # Botón Guardar y Concatenar
                 if st.button("Guardar y concatenar"):
                     combinado = {
-                        "Fecha Estado": gasto_sel["Fecha"],
-                        "Descripción Estado": gasto_sel["Descripción"],
-                        "Cargo Estado": gasto_sel["Cargo"],
+                        "Fecha Estado": gasto_sel.iloc[1],
+                        "Descripción Estado": gasto_sel.iloc[2],
+                        "Cargo Estado": gasto_sel.iloc[3],
                         "Fecha Factura": comprobacion["Fecha Factura"],
                         "UUID": comprobacion["UUID"],
                         "Concepto Factura": comprobacion["Concepto"],
@@ -128,7 +147,6 @@ if file:
             else:
                 st.markdown(f"<div class='error-box'>❌ Diferencia mayor a 1 centavo: {diferencia} pesos</div>", unsafe_allow_html=True)
 
-        # --- Comprobación manual ---
         st.markdown("### Comprobación manual (sin XML)")
         with st.form("manual_form"):
             fecha_factura = st.date_input("Fecha de factura", value=datetime.date.today())
@@ -142,9 +160,9 @@ if file:
 
             if guardar_manual:
                 combinado = {
-                    "Fecha Estado": gasto_sel["Fecha"],
-                    "Descripción Estado": gasto_sel["Descripción"],
-                    "Cargo Estado": gasto_sel["Cargo"],
+                    "Fecha Estado": gasto_sel.iloc[1],
+                    "Descripción Estado": gasto_sel.iloc[2],
+                    "Cargo Estado": gasto_sel.iloc[3],
                     "Fecha Factura": fecha_factura,
                     "UUID": uuid,
                     "Concepto Factura": concepto,
@@ -162,7 +180,6 @@ if st.session_state.concatenados:
     df_final = pd.DataFrame(st.session_state.concatenados)
     st.dataframe(df_final)
 
-    # Botón para descargar Excel
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df_final.to_excel(writer, index=False, sheet_name="Comprobaciones")
