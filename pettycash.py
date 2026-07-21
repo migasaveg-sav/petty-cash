@@ -4,11 +4,32 @@ import xml.etree.ElementTree as ET
 import datetime
 from io import BytesIO
 
+# Paleta estilo Quickel
+C_AZUL_MUY_OSCURO = "#1A4756"
+C_TEAL_VIVO = "#038191"
+C_CORAL_ALERTA = "#F84E65"
+C_CREMA_FONDO = "#ff9f1c"
+
 st.set_page_config(page_title="Comprobación Caja Chica", layout="wide")
 
 # Estado inicial
 if "concatenados" not in st.session_state:
     st.session_state.concatenados = []
+
+# Estilos CSS
+st.markdown(f"""
+<style>
+.stApp {{ background-color: {C_AZUL_MUY_OSCURO}; color: {C_CREMA_FONDO}; }}
+table, th, td {{ border: 1px solid #ccc; border-collapse: collapse; padding: 6px; }}
+th {{ background-color: {C_TEAL_VIVO}; color: white; }}
+.success-box {{
+    background-color: {C_TEAL_VIVO}; color: white; padding: 10px; border-radius: 5px;
+}}
+.error-box {{
+    background-color: {C_CORAL_ALERTA}; color: white; padding: 10px; border-radius: 5px;
+}}
+</style>
+""", unsafe_allow_html=True)
 
 st.title("Comprobación de Caja Chica")
 
@@ -86,7 +107,7 @@ if file:
             # Validación
             diferencia = round(float(gasto_sel["Cargo"]) - total, 2)
             if abs(diferencia) <= 0.01:
-                st.success(f"Gasto comprobado correctamente. Diferencia: {diferencia}")
+                st.markdown(f"<div class='success-box'>✅ Gasto comprobado correctamente. Diferencia: {diferencia}</div>", unsafe_allow_html=True)
 
                 # Botón Guardar y Concatenar
                 if st.button("Guardar y concatenar"):
@@ -104,6 +125,8 @@ if file:
                     }
                     st.session_state.concatenados.append(combinado)
                     st.success("Concatenado correctamente.")
+            else:
+                st.markdown(f"<div class='error-box'>❌ Diferencia mayor a 1 centavo: {diferencia} pesos</div>", unsafe_allow_html=True)
 
         # --- Comprobación manual ---
         st.markdown("### Comprobación manual (sin XML)")
