@@ -1,83 +1,109 @@
 import streamlit as st
 import pandas as pd
 import xml.etree.ElementTree as ET
+import datetime
+from io import BytesIO
+
+# Paleta de colores estilo Quickel
+C_AZUL_MUY_OSCURO = "#1A4756"
+C_TEAL_VIVO = "#038191"
+C_CORAL_ALERTA = "#F84E65"
+C_CREMA_FONDO = "#ff9f1c"
+
+st.set_page_config(page_title="Comprobación Caja Chica", layout="wide")
+
+st.markdown(f"""
+<style>
+.stApp {{ background-color: {C_AZUL_MUY_OSCURO}; color: {C_CREMA_FONDO}; }}
+table, th, td {{ border: 1px solid #ccc; border-collapse: collapse; padding: 6px; }}
+th {{ background-color: {C_TEAL_VIVO}; color: white; }}
+</style>
+""", unsafe_allow_html=True)
 
 st.title("Comprobación de Caja Chica")
 
-# --- Apartado 1: Estado de cuenta ---
-st.header("1. Estado de cuenta bancario")
-file = st.file_uploader("Sube el archivo del estado de cuenta", type=["csv","xlsx"])
-
+# --- 1. Estado de cuenta ---
+file = st.file_uploader("Sube el estado de cuenta", type=["csv","xlsx"])
 if file:
-    # Leer archivo
     if file.name.endswith(".csv"):
         df = pd.read_csv(file)
     else:
         df = pd.read_excel(file)
 
-    # Mostrar columnas detectadas
-    st.write("Columnas detectadas:", df.columns.tolist())
+    st.subheader("Movimientos")
+    st.write("Selecciona el gasto a comprobar:")
 
-    # Renombrar si es necesario (ajusta según tu archivo real)
-    df.rename(columns={
-        "Concepto":"Descripción",
-        "Importe":"Cargo",
-        "FECHA":"Fecha"
-    }, inplace=True)
+    # Añadir columna de selección
+    if "Seleccionar" not in df.columns:
+        df.insert(0, "Seleccionar", False)
 
-    # Mostrar tabla con estilo (contenida en cuadro)
-    st.markdown("### Movimientos")
-    st.dataframe(df.style.set_table_styles(
-        [{'selector': 'th', 'props': [('background-color', '#f0f0f0'),
-                                      ('border', '1px solid #ccc'),
-                                      ('padding', '5px')]},
-         {'selector': 'td', 'props': [('border', '1px solid #ccc'),
-                                      ('padding', '5px')]}]
-    ))
+    edited_df = st.data_editor(
+        df,
+        hide_index=True,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={
+            "Seleccionar": st.column_config.CheckboxColumn("Selección", default=False),
+            "Fecha": st.column_config.TextColumn("Fecha", disabled=True),
+            "Descripción": st.column_config.TextColumn("Descripción", disabled=True),
+            "Cargo": st.column_config.NumberColumn("Cargo", format="$%.2f", disabled=True)
+        },
+        key="data_editor_gastos"
+    )
 
-    # Selección de gasto
-    selected_index = st.selectbox("Selecciona el gasto a comprobar", df.index, format_func=lambda i: f"{df.loc[i,'Fecha']} | {df.loc[i,'Descripción']} | ${df.loc[i,'Cargo']}")
-    gasto_sel = df.loc[selected_index]
+    seleccionados = edited_df[edited_df["Seleccionar"] == True].index.tolist()
 
-    # --- Apartado 2: Comprobar gasto con XML ---
-    st.header("2. Comprobación de gasto")
-    xml_file = st.file_uploader("Sube el XML del CFDI", type=["xml"])
-    if xml_file:
-        tree = ET.parse(xml_file)
-        root = tree.getroot()
+    if seleccionados:
+        st.subheader("Comprobación de gasto")
+        gasto_sel = df.loc[seleccionados[0]]  # tomar el primero marcado
 
-        # Ejemplo de extracción (ajusta según Quickel)
-        uuid = root.attrib.get("UUID","")
-        fecha_factura = root.attrib.get("Fecha","")
-        concepto = root.attrib.get("Descripcion","")
-        emisor = root.attrib.get("Emisor","")
-        iva = root.attrib.get("IVA","")
-        monto_xml = float(root.attrib.get("Total","0"))
+        xml_file = st.file_uploader("Sube el XML del CFDI", type=["xml"])
+        if xml_file:
+            # --- Extracción estilo Quickel ---
+            tree = ET.parse(xml_file)
+            root = tree.getroot()
+            ns = {
+                'cfdi': 'http://www.sat.gob.mx/cfd/4',
+                'tfd': 'http://www.sat.gob.mx/TimbreFiscalDigital'
+            }
 
-        # Crear tabla nueva con datos del XML
-        comprobacion = pd.DataFrame([{
-            "Fecha Factura": fecha_factura,
-            "UUID": uuid,
-            "Concepto": concepto,
-            "Emisor": emisor,
-            "IVA": iva,
-            "Monto Total": monto_xml
-        }])
+            total = float(root.get('Total', 0))
+            fecha_factura = root.get('Fecha', str(datetime.date.today()))[:10]
+            timbre = root.find('.//tfd:TimbreFiscalDigital', ns)
+            uuid = timbre.get('UUID') if timbre is not None else "SIN-UUID"
+            emisor = root.find('.//cfdi:Emisor', ns)
+            rfc_emisor = emisor.get('Rfc', 'N/A') if emisor is not None else "N/A"
+            razon_social = emisor.get('Nombre', 'N/A') if emisor is not None else "N/A"
 
-        st.markdown("### Datos extraídos del XML")
-        st.dataframe(comprobacion.style.set_table_styles(
-            [{'selector': 'th', 'props': [('background-color', '#e0f7fa'),
-                                          ('border', '1px solid #ccc'),
-                                          ('padding', '5px')]},
-             {'selector': 'td', 'props': [('border', '1px solid #ccc'),
-                                          ('padding', '5px')]}]
-        ))
+            # IVA
+            valor_iva = 0.0
+            impuestos_globales = root.find('./cfdi:Impuestos', ns)
+            if impuestos_globales is not None:
+                for traslado in impuestos_globales.findall('.//cfdi:Traslados/cfdi:Traslado', ns):
+                    if traslado.get('Impuesto') == '002':
+                        valor_iva = float(traslado.get('Importe', 0))
 
-        # Validación de diferencias
-        monto_gasto = float(gasto_sel["Cargo"])
-        diferencia = round(monto_gasto - monto_xml, 2)
+            # Concepto
+            concepto_nodo = root.find('.//cfdi:Concepto', ns)
+            concepto = concepto_nodo.get('Descripcion', 'N/A') if concepto_nodo is not None else "N/A"
 
-        if abs(diferencia) <= 0.01:
-            st.success(f"Gasto comprobado correctamente. Diferencia: {diferencia}")
-        else:
-            st.error(f"Diferencia mayor a 1 centavo: {diferencia} pesos")
+            comprobacion = pd.DataFrame([{
+                "Fecha Factura": fecha_factura,
+                "UUID": uuid,
+                "Concepto": concepto,
+                "RFC Emisor": rfc_emisor,
+                "Razón Social": razon_social,
+                "IVA": valor_iva,
+                "Monto Total": total
+            }])
+
+            st.dataframe(comprobacion)
+
+            # Validación de diferencia
+            monto_gasto = float(gasto_sel["Cargo"])
+            diferencia = round(monto_gasto - total, 2)
+
+            if abs(diferencia) <= 0.01:
+                st.success(f"Gasto comprobado correctamente. Diferencia: {diferencia}")
+            else:
+                st.error(f"Diferencia mayor a 1 centavo: {diferencia} pesos")
