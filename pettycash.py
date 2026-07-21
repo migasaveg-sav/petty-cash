@@ -41,31 +41,60 @@ if file:
     else:
         df_raw = pd.read_excel(file)
 
-    # --- FILTRAR COLUMNAS POR WILDCARD ---
-    columnas_deseadas = {
-        "fecha": None,
-        "concepto": None,
-        "referencia": None,
-        "descripción": None,
-        "cargo": None,
-        "abono": None,
-        "retiro": None,
-        "depósito": None,
-        "saldo": None
-    }
+    # --- FILTRAR Y RENOMBRAR COLUMNAS POR WILDCARD ---
+    # Queremos terminar con estas columnas en el df:
+    # "Fecha", "Concepto / Referencia y/o Descripción",
+    # "Cargo /Abono", "Retiro / Depósito", "Saldo"
+
+    rename_map = {}      # original -> nombre estándar
+    selected_original = []  # nombres originales en el orden deseado
 
     for col in df_raw.columns:
         col_lower = col.lower()
-        for clave in columnas_deseadas.keys():
-            if clave in col_lower and columnas_deseadas[clave] is None:
-                columnas_deseadas[clave] = col
 
-    columnas_finales = [c for c in columnas_deseadas.values() if c is not None]
+        # Fecha
+        if "fecha" in col_lower and "fecha" not in rename_map.values():
+            rename_map[col] = "Fecha"
+            selected_original.append(col)
+            continue
 
-    df = df_raw[columnas_finales].copy()
+        # Concepto / Referencia y/o Descripción
+        if any(k in col_lower for k in ["concepto", "referencia", "descripción"]) and \
+           "Concepto / Referencia y/o Descripción" not in rename_map.values():
+            rename_map[col] = "Concepto / Referencia y/o Descripción"
+            selected_original.append(col)
+            continue
+
+        # Cargo /Abono
+        if any(k in col_lower for k in ["cargo", "abono"]) and \
+           "Cargo /Abono" not in rename_map.values():
+            rename_map[col] = "Cargo /Abono"
+            selected_original.append(col)
+            continue
+
+        # Retiro / Depósito
+        if any(k in col_lower for k in ["retiro", "depósito", "deposito"]) and \
+           "Retiro / Depósito" not in rename_map.values():
+            rename_map[col] = "Retiro / Depósito"
+            selected_original.append(col)
+            continue
+
+        # Saldo
+        if "saldo" in col_lower and "Saldo" not in rename_map.values():
+            rename_map[col] = "Saldo"
+            selected_original.append(col)
+            continue
+
+    # Crear df solo con las columnas encontradas y renombradas
+    if selected_original:
+        df = df_raw[selected_original].rename(columns=rename_map).copy()
+    else:
+        st.error("No se encontraron columnas que coincidan con los nombres esperados.")
+        st.stop()
 
     # Agregar columna de selección
-    df.insert(0, "Seleccionar", False)
+    if "Seleccionar" not in df.columns:
+        df.insert(0, "Seleccionar", False)
 
     st.subheader("Movimientos")
 
@@ -75,7 +104,20 @@ if file:
         use_container_width=True,
         num_rows="fixed",
         column_config={
-            "Seleccionar": st.column_config.CheckboxColumn("Selección", default=False)
+            "Seleccionar": st.column_config.CheckboxColumn("Selección", default=False),
+            "Fecha": st.column_config.TextColumn("Fecha", disabled=True),
+            "Concepto / Referencia y/o Descripción": st.column_config.TextColumn(
+                "Concepto / Referencia y/o Descripción", disabled=True
+            ),
+            "Cargo /Abono": st.column_config.NumberColumn(
+                "Cargo /Abono", format="$%.2f", disabled=True
+            ),
+            "Retiro / Depósito": st.column_config.NumberColumn(
+                "Retiro / Depósito", format="$%.2f", disabled=True
+            ),
+            "Saldo": st.column_config.NumberColumn(
+                "Saldo", format="$%.2f", disabled=True
+            ),
         },
         key="data_editor_gastos"
     )
@@ -125,15 +167,19 @@ if file:
 
             st.write(pd.DataFrame([comprobacion]))
 
-            diferencia = round(float(gasto_sel.iloc[1]) - total, 2)
+            # Usamos la columna estándar "Cargo /Abono" para comparar
+            diferencia = round(float(gasto_sel["Cargo /Abono"]) - total, 2)
             if abs(diferencia) <= 0.01:
-                st.markdown(f"<div class='success-box'>✅ Gasto comprobado correctamente. Diferencia: {diferencia}</div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='success-box'>✅ Gasto comprobado correctamente. Diferencia: {diferencia}</div>",
+                    unsafe_allow_html=True
+                )
 
                 if st.button("Guardar y concatenar"):
                     combinado = {
-                        "Fecha Estado": gasto_sel.iloc[1],
-                        "Descripción Estado": gasto_sel.iloc[2],
-                        "Cargo Estado": gasto_sel.iloc[3],
+                        "Fecha Estado": gasto_sel["Fecha"],
+                        "Descripción Estado": gasto_sel["Concepto / Referencia y/o Descripción"],
+                        "Cargo Estado": gasto_sel["Cargo /Abono"],
                         "Fecha Factura": comprobacion["Fecha Factura"],
                         "UUID": comprobacion["UUID"],
                         "Concepto Factura": comprobacion["Concepto"],
@@ -145,8 +191,12 @@ if file:
                     st.session_state.concatenados.append(combinado)
                     st.success("Concatenado correctamente.")
             else:
-                st.markdown(f"<div class='error-box'>❌ Diferencia mayor a 1 centavo: {diferencia} pesos</div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='error-box'>❌ Diferencia mayor a 1 centavo: {diferencia} pesos</div>",
+                    unsafe_allow_html=True
+                )
 
+        # --- Comprobación manual ---
         st.markdown("### Comprobación manual (sin XML)")
         with st.form("manual_form"):
             fecha_factura = st.date_input("Fecha de factura", value=datetime.date.today())
@@ -160,9 +210,9 @@ if file:
 
             if guardar_manual:
                 combinado = {
-                    "Fecha Estado": gasto_sel.iloc[1],
-                    "Descripción Estado": gasto_sel.iloc[2],
-                    "Cargo Estado": gasto_sel.iloc[3],
+                    "Fecha Estado": gasto_sel["Fecha"],
+                    "Descripción Estado": gasto_sel["Concepto / Referencia y/o Descripción"],
+                    "Cargo Estado": gasto_sel["Cargo /Abono"],
                     "Fecha Factura": fecha_factura,
                     "UUID": uuid,
                     "Concepto Factura": concepto,
