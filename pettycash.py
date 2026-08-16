@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import xml.etree.ElementTree as ET
 import datetime
+import json
 from io import BytesIO
 
 # ============================================================
@@ -16,17 +17,24 @@ C_VERDE_OK = "#2ECC71"
 
 st.set_page_config(page_title="Comprobación Caja Chica", layout="wide")
 
+MESES_ES = [
+    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+]
+
 # ============================================================
 # ESTADO DE SESIÓN
 # ============================================================
 def init_state():
     defaults = {
+        "banco": None,
         "bank_df": None,
         "bank_file_id": None,          # (nombre, tamaño) del archivo cargado, para detectar cambios
         "estados": {},                 # idx -> "pendiente" | "comprobado" | "no_necesario"
         "facturas_por_gasto": {},      # idx -> lista de dicts (facturas agregadas a ese gasto)
+        "clasificacion_por_gasto": {}, # idx -> {"categoria": str, "material": str}
         "selected_idx": None,
-        "concatenados": [],            # registros finales de gastos comprobados
+        "concatenados": [],            # registros finales de gastos comprobados (1 dict por gasto, con lista de facturas)
         "no_necesarios": [],           # registros de gastos marcados como no necesarios
         "factura_counter": 0,          # id incremental interno para poder quitar facturas
     }
@@ -78,7 +86,7 @@ th {{ background-color: {C_TEAL_VIVO}; color: white; }}
 st.title("💰 Comprobación de Caja Chica")
 
 # ============================================================
-# HELPERS
+# HELPERS GENERALES
 # ============================================================
 def money(x):
     try:
@@ -95,6 +103,32 @@ def status_label(estado):
     }.get(estado, estado)
 
 
+def mes_es(fecha_str):
+    """Convierte 'YYYY-MM-DD' (o similar) a 'Mes YYYY' en español."""
+    try:
+        f = pd.to_datetime(fecha_str)
+        return f"{MESES_ES[f.month - 1]} {f.year}"
+    except Exception:
+        return ""
+
+
+def next_factura_id():
+    st.session_state.factura_counter += 1
+    return st.session_state.factura_counter
+
+
+def sums_por_estado(df):
+    resumen = {}
+    for estado in ["pendiente", "comprobado", "no_necesario"]:
+        idxs = [i for i, e in st.session_state.estados.items() if e == estado]
+        sub = df.loc[df.index.intersection(idxs)]
+        resumen[estado] = {"count": len(idxs), "total": sub["Monto"].sum() if not sub.empty else 0.0}
+    return resumen
+
+
+# ============================================================
+# CARGA DE ESTADO DE CUENTA
+# ============================================================
 def get_column_map(banco):
     """Regresa el diccionario de wildcards -> nombre estándar para cada banco."""
     if banco == "Santander 011-1":
@@ -152,16 +186,38 @@ def load_bank_statement(file, banco):
     return df
 
 
+# ============================================================
+# LECTURA DE CFDI (soporta 3.3 y 4.0)
+# ============================================================
+CFDI_NS_POR_VERSION = {
+    "3": "http://www.sat.gob.mx/cfd/3",
+    "4": "http://www.sat.gob.mx/cfd/4",
+}
+TFD_NS = "http://www.sat.gob.mx/TimbreFiscalDigital"
+
+
+def detectar_namespace_cfdi(root):
+    """Detecta si el XML es CFDI 3.3 o 4.0 a partir del namespace del root."""
+    tag = root.tag
+    if tag.startswith("{"):
+        uri = tag[1:tag.index("}")]
+        if uri == CFDI_NS_POR_VERSION["3"]:
+            return CFDI_NS_POR_VERSION["3"]
+        if uri == CFDI_NS_POR_VERSION["4"]:
+            return CFDI_NS_POR_VERSION["4"]
+        return uri  # namespace no reconocido, se intenta igual
+    return CFDI_NS_POR_VERSION["4"]  # fallback
+
+
 def parse_cfdi(xml_bytes, filename):
-    """Extrae los datos relevantes de un CFDI. Regresa dict o lanza excepción."""
+    """Extrae los datos relevantes de un CFDI (3.3 o 4.0). Regresa dict o lanza excepción."""
     tree = ET.parse(BytesIO(xml_bytes))
     root = tree.getroot()
-    ns = {
-        "cfdi": "http://www.sat.gob.mx/cfd/4",
-        "tfd": "http://www.sat.gob.mx/TimbreFiscalDigital",
-    }
 
-    total = float(root.get("Total", 0))
+    cfdi_uri = detectar_namespace_cfdi(root)
+    ns = {"cfdi": cfdi_uri, "tfd": TFD_NS}
+
+    total = float(root.get("Total", 0) or 0)
     fecha_factura = root.get("Fecha", str(datetime.date.today()))[:10]
     timbre = root.find(".//tfd:TimbreFiscalDigital", ns)
     uuid = timbre.get("UUID") if timbre is not None else "SIN-UUID"
@@ -174,7 +230,7 @@ def parse_cfdi(xml_bytes, filename):
     if impuestos_globales is not None:
         for traslado in impuestos_globales.findall(".//cfdi:Traslados/cfdi:Traslado", ns):
             if traslado.get("Impuesto") == "002":
-                valor_iva += float(traslado.get("Importe", 0))
+                valor_iva += float(traslado.get("Importe", 0) or 0)
 
     conceptos = root.findall(".//cfdi:Concepto", ns)
     concepto = "; ".join(c.get("Descripcion", "") for c in conceptos) if conceptos else "N/A"
@@ -192,19 +248,78 @@ def parse_cfdi(xml_bytes, filename):
     }
 
 
-def next_factura_id():
-    st.session_state.factura_counter += 1
-    return st.session_state.factura_counter
+# ============================================================
+# GUARDADO / CARGA DE SESIÓN EN JSON
+# ============================================================
+def construir_sesion_json():
+    """Empaqueta todo el estado de trabajo (incluyendo el propio estado de cuenta) en un dict serializable."""
+    df = st.session_state.bank_df
+    return {
+        "version": 1,
+        "guardado_en": datetime.datetime.now().isoformat(timespec="seconds"),
+        "banco": st.session_state.banco,
+        "bank_file_id": st.session_state.bank_file_id,
+        "bank_df": df.to_dict(orient="split") if df is not None else None,
+        "estados": {str(k): v for k, v in st.session_state.estados.items()},
+        "facturas_por_gasto": {str(k): v for k, v in st.session_state.facturas_por_gasto.items()},
+        "clasificacion_por_gasto": {str(k): v for k, v in st.session_state.clasificacion_por_gasto.items()},
+        "concatenados": st.session_state.concatenados,
+        "no_necesarios": st.session_state.no_necesarios,
+        "factura_counter": st.session_state.factura_counter,
+    }
 
 
-def sums_por_estado(df):
-    resumen = {}
-    for estado in ["pendiente", "comprobado", "no_necesario"]:
-        idxs = [i for i, e in st.session_state.estados.items() if e == estado]
-        sub = df.loc[df.index.intersection(idxs)]
-        resumen[estado] = {"count": len(idxs), "total": sub["Monto"].sum() if not sub.empty else 0.0}
-    return resumen
+def cargar_sesion_json(data):
+    """Restaura el estado de la app a partir de un dict previamente generado por construir_sesion_json()."""
+    bank_df_data = data.get("bank_df")
+    if bank_df_data is not None:
+        st.session_state.bank_df = pd.DataFrame(
+            data=bank_df_data["data"],
+            columns=bank_df_data["columns"],
+            index=bank_df_data["index"],
+        )
+    else:
+        st.session_state.bank_df = None
 
+    st.session_state.banco = data.get("banco")
+    st.session_state.bank_file_id = tuple(data["bank_file_id"]) if data.get("bank_file_id") else None
+    st.session_state.estados = {int(k): v for k, v in data.get("estados", {}).items()}
+    st.session_state.facturas_por_gasto = {int(k): v for k, v in data.get("facturas_por_gasto", {}).items()}
+    st.session_state.clasificacion_por_gasto = {
+        int(k): v for k, v in data.get("clasificacion_por_gasto", {}).items()
+    }
+    st.session_state.concatenados = data.get("concatenados", [])
+    st.session_state.no_necesarios = data.get("no_necesarios", [])
+    st.session_state.factura_counter = data.get("factura_counter", 0)
+    st.session_state.selected_idx = None
+
+
+with st.expander("💾 Guardar o continuar un avance guardado", expanded=False):
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown("**Guardar avance actual**")
+        if st.session_state.bank_df is not None:
+            sesion_bytes = json.dumps(construir_sesion_json(), ensure_ascii=False, indent=2).encode("utf-8")
+            st.download_button(
+                "📥 Descargar avance (.json)",
+                data=sesion_bytes,
+                file_name=f"avance_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+            )
+        else:
+            st.caption("Sube un estado de cuenta primero para poder guardar avance.")
+    with colB:
+        st.markdown("**Continuar un avance guardado**")
+        json_file = st.file_uploader("Sube tu archivo .json de avance", type=["json"], key="json_uploader")
+        if json_file is not None:
+            if st.button("Cargar este avance", key="btn_cargar_json"):
+                try:
+                    data = json.loads(json_file.getvalue().decode("utf-8"))
+                    cargar_sesion_json(data)
+                    st.success("Avance restaurado correctamente.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo leer el archivo de avance: {e}")
 
 # ============================================================
 # 1. SELECCIÓN DE BANCO Y CARGA DE ESTADO DE CUENTA
@@ -221,9 +336,11 @@ if file:
     if st.session_state.bank_file_id != file_id:
         # archivo nuevo o distinto: reconstruir todo el estado
         st.session_state.bank_df = load_bank_statement(file, banco)
+        st.session_state.banco = banco
         st.session_state.bank_file_id = file_id
         st.session_state.estados = {i: "pendiente" for i in st.session_state.bank_df.index}
         st.session_state.facturas_por_gasto = {}
+        st.session_state.clasificacion_por_gasto = {}
         st.session_state.selected_idx = None
         st.session_state.concatenados = []
         st.session_state.no_necesarios = []
@@ -257,6 +374,12 @@ if df is not None:
             <div class="summary-count">{resumen['no_necesario']['count']}</div>
             <div class="summary-amount">{money(resumen['no_necesario']['total'])}</div>
         </div>""", unsafe_allow_html=True)
+
+    total_monto = sum(r["total"] for r in resumen.values())
+    monto_resuelto = resumen["comprobado"]["total"] + resumen["no_necesario"]["total"]
+    if total_monto > 0:
+        st.progress(min(monto_resuelto / total_monto, 1.0),
+                    text=f"Avance por monto: {money(monto_resuelto)} de {money(total_monto)}")
 
     st.write("")
 
@@ -331,13 +454,26 @@ if df is not None:
         c3.metric("Monto", money(monto_gasto))
         st.markdown("</div>", unsafe_allow_html=True)
 
+        # --- Clasificación (Categoría / Material) ---
+        st.markdown("##### 🏷️ Clasificación del gasto")
+        clasif = st.session_state.clasificacion_por_gasto.setdefault(idx, {"categoria": "", "material": ""})
+        cl1, cl2 = st.columns(2)
+        clasif["categoria"] = cl1.text_input(
+            "Categoría", value=clasif.get("categoria", ""), key=f"categoria_{idx}",
+            help="Por ahora es texto libre. Cuando subas tu catálogo de categorías/material, "
+                 "este campo se volverá una lista desplegable.",
+        )
+        clasif["material"] = cl2.text_input(
+            "Material", value=clasif.get("material", ""), key=f"material_{idx}",
+        )
+
         st.session_state.facturas_por_gasto.setdefault(idx, [])
         facturas = st.session_state.facturas_por_gasto[idx]
 
         # --- Agregar XML(s) ---
         st.markdown("##### 📎 Agregar facturas (puedes subir varios XML a la vez)")
         xml_files = st.file_uploader(
-            "Sube uno o más XML de CFDI",
+            "Sube uno o más XML de CFDI (soporta versión 3.3 y 4.0)",
             type=["xml"],
             accept_multiple_files=True,
             key=f"xml_uploader_{idx}",
@@ -348,7 +484,7 @@ if df is not None:
                 try:
                     datos = parse_cfdi(xf.getvalue(), xf.name)
                 except Exception as e:
-                    st.error(f"No se pudo leer el XML '{xf.name}': {e}")
+                    st.error(f"No se pudo leer el XML '{xf.name}': {type(e).__name__}: {e}")
                     continue
                 if datos["UUID"] in uuids_existentes and datos["UUID"] != "SIN-UUID":
                     continue  # ya agregada, evitar duplicado
@@ -420,20 +556,15 @@ if df is not None:
                     unsafe_allow_html=True,
                 )
                 if st.button("➕ Añadir a los registros", key=f"btn_guardar_{idx}", type="primary"):
-                    for f in facturas:
-                        st.session_state.concatenados.append({
-                            "Fecha Estado": gasto.get("Fecha", ""),
-                            "Descripción Estado": gasto.get("Descripción", ""),
-                            "Monto Estado": monto_gasto,
-                            "Fuente": f["Fuente"],
-                            "Fecha Factura": f["Fecha Factura"],
-                            "UUID": f["UUID"],
-                            "Concepto Factura": f["Concepto"],
-                            "RFC Emisor": f["RFC Emisor"],
-                            "Razón Social": f["Razón Social"],
-                            "IVA": f["IVA"],
-                            "Monto Factura": f["Monto Total"],
-                        })
+                    st.session_state.concatenados.append({
+                        "idx": idx,
+                        "Fecha Estado": gasto.get("Fecha", ""),
+                        "Descripción Estado": gasto.get("Descripción", ""),
+                        "Monto Estado": monto_gasto,
+                        "Categoria": clasif.get("categoria", ""),
+                        "Material": clasif.get("material", ""),
+                        "Facturas": facturas,  # se guarda la lista completa (anidada)
+                    })
                     st.session_state.estados[idx] = "comprobado"
                     st.session_state.facturas_por_gasto.pop(idx, None)
                     st.session_state.selected_idx = None
@@ -454,6 +585,8 @@ if df is not None:
                 "Fecha Estado": gasto.get("Fecha", ""),
                 "Descripción Estado": gasto.get("Descripción", ""),
                 "Monto Estado": monto_gasto,
+                "Categoria": clasif.get("categoria", ""),
+                "Material": clasif.get("material", ""),
             })
             st.session_state.estados[idx] = "no_necesario"
             st.session_state.facturas_por_gasto.pop(idx, None)
@@ -469,12 +602,38 @@ if df is not None:
 
     tab_comprobados, tab_no_necesarios = st.tabs(["✅ Comprobados", "🚫 No necesarios"])
 
+    def fila_excel_comprobado(no, registro):
+        facturas = registro["Facturas"]
+        suma_facturas = sum(f["Monto Total"] for f in facturas)
+        suma_iva = sum(f["IVA"] for f in facturas)
+        return {
+            "No": no,
+            "Bank date": registro["Fecha Estado"],
+            "Bank amt": registro["Monto Estado"],
+            "Category": registro.get("Categoria", ""),
+            "Material": registro.get("Material", ""),
+            "Concepto": "; ".join(f["Concepto"] for f in facturas if f.get("Concepto")),
+            "Month": mes_es(registro["Fecha Estado"]),
+            "UUID date": "; ".join(f["Fecha Factura"] for f in facturas),
+            "UUID": "; ".join(f["UUID"] for f in facturas),
+            "UUID amt": suma_facturas,
+            "IVA": suma_iva,
+            "Diff": round(float(registro["Monto Estado"]) - suma_facturas, 2),
+        }
+
+    df_comprobados_vista = None
+    if st.session_state.concatenados:
+        filas = [fila_excel_comprobado(n + 1, r) for n, r in enumerate(st.session_state.concatenados)]
+        df_comprobados_vista = pd.DataFrame(filas)
+
     with tab_comprobados:
-        if st.session_state.concatenados:
-            df_final = pd.DataFrame(st.session_state.concatenados)
+        if df_comprobados_vista is not None:
             st.dataframe(
-                df_final.style.format({"Monto Estado": money, "IVA": money, "Monto Factura": money}),
+                df_comprobados_vista.style.format(
+                    {"Bank amt": money, "UUID amt": money, "IVA": money, "Diff": money}
+                ),
                 use_container_width=True,
+                hide_index=True,
             )
         else:
             st.caption("Todavía no hay gastos comprobados.")
@@ -482,17 +641,47 @@ if df is not None:
     with tab_no_necesarios:
         if st.session_state.no_necesarios:
             df_nn = pd.DataFrame(st.session_state.no_necesarios)
-            st.dataframe(df_nn.style.format({"Monto Estado": money}), use_container_width=True)
+            st.dataframe(df_nn.style.format({"Monto Estado": money}), use_container_width=True, hide_index=True)
         else:
             st.caption("Todavía no hay gastos marcados como no necesarios.")
 
     if st.session_state.concatenados or st.session_state.no_necesarios:
         output = BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            if st.session_state.concatenados:
-                pd.DataFrame(st.session_state.concatenados).to_excel(writer, index=False, sheet_name="Comprobados")
+            workbook = writer.book
+
+            if df_comprobados_vista is not None:
+                columnas_finales = [
+                    "No", "Bank date", "Bank amt", "Category", "Material", "Concepto",
+                    "Month", "UUID date", "UUID", "UUID amt", "IVA", "Diff",
+                ]
+                df_export = df_comprobados_vista[columnas_finales].copy()
+                df_export.to_excel(writer, index=False, sheet_name="Comprobados")
+
+                ws = writer.sheets["Comprobados"]
+                money_fmt = workbook.add_format({"num_format": "$#,##0.00"})
+                bold_fmt = workbook.add_format({"bold": True})
+                for col_name in ["Bank amt", "UUID amt", "IVA", "Diff"]:
+                    col_idx = columnas_finales.index(col_name)
+                    ws.set_column(col_idx, col_idx, 14, money_fmt)
+
+                # Fila de totales
+                fila_total = len(df_export) + 1  # +1 por encabezado (0-index -> siguiente fila)
+                ws.write(fila_total, 0, "Total", bold_fmt)
+                for col_name in ["Bank amt", "UUID amt", "IVA", "Diff"]:
+                    col_idx = columnas_finales.index(col_name)
+                    ws.write(fila_total, col_idx, df_export[col_name].sum(), money_fmt)
+
+                ws.set_column(1, 1, 12)   # Bank date
+                ws.set_column(3, 4, 16)   # Category, Material
+                ws.set_column(5, 5, 30)   # Concepto
+                ws.set_column(7, 8, 22)   # UUID date, UUID
+
             if st.session_state.no_necesarios:
-                pd.DataFrame(st.session_state.no_necesarios).to_excel(writer, index=False, sheet_name="No necesarios")
+                pd.DataFrame(st.session_state.no_necesarios).to_excel(
+                    writer, index=False, sheet_name="No necesarios"
+                )
+
             df_pend = df[df.index.map(lambda i: st.session_state.estados.get(i) == "pendiente")]
             if not df_pend.empty:
                 df_pend.drop(columns=["Monto"], errors="ignore").to_excel(writer, index=False, sheet_name="Sin comprobar")
