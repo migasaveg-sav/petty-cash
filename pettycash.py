@@ -8,7 +8,7 @@ from io import BytesIO
 # ============================================================
 # PALETA DE COLORES — "Neutro Claro Ejecutivo"
 # ============================================================
-C_FONDO = "#A9A9A9"          # fondo general (tema claro)
+C_FONDO = "#DCDCDC"          # fondo general (tema claro)
 C_TARJETA = "#FFFFFF"        # fondo de tarjetas/paneles
 C_BORDE = "#D8DEE4"          # bordes sutiles
 C_TEXTO_OSCURO = "#1A1F26"   # texto principal sobre fondo claro
