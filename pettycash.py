@@ -6,14 +6,17 @@ import json
 from io import BytesIO
 
 # ============================================================
-# PALETA DE COLORES
+# PALETA DE COLORES — "Neutro Claro Ejecutivo"
 # ============================================================
-C_AZUL_MUY_OSCURO = "#1A4756"
-C_TEAL_VIVO = "#038191"
-C_CORAL_ALERTA = "#F84E65"
-C_AMARILLO_ACENTO = "#ff9f1c"
-C_GRIS_NEUTRO = "#5C7A89"
-C_VERDE_OK = "#2ECC71"
+C_FONDO = "#F4F5F7"          # fondo general (tema claro)
+C_TARJETA = "#FFFFFF"        # fondo de tarjetas/paneles
+C_BORDE = "#D8DEE4"          # bordes sutiles
+C_TEXTO_OSCURO = "#1A1F26"   # texto principal sobre fondo claro
+C_TEAL_VIVO = "#0E5C73"      # acento primario
+C_CORAL_ALERTA = "#C0392B"   # alerta / error
+C_AMARILLO_ACENTO = "#B8860B"  # acento secundario (dorado apagado)
+C_GRIS_NEUTRO = "#8A94A6"    # neutro
+C_VERDE_OK = "#2E8B57"       # éxito
 
 st.set_page_config(page_title="Comprobación Caja Chica", layout="wide")
 
@@ -52,13 +55,14 @@ init_state()
 # ============================================================
 st.markdown(f"""
 <style>
-.stApp {{ background-color: {C_AZUL_MUY_OSCURO}; color: white; }}
-table, th, td {{ border: 1px solid #ccc; border-collapse: collapse; padding: 6px; }}
+.stApp {{ background-color: {C_FONDO}; color: {C_TEXTO_OSCURO}; }}
+table, th, td {{ border: 1px solid {C_BORDE}; border-collapse: collapse; padding: 6px; }}
 th {{ background-color: {C_TEAL_VIVO}; color: white; }}
+td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
 
 .card {{
-    background-color: #234756; border-radius: 10px; padding: 16px 20px;
-    margin-bottom: 14px; border: 1px solid #2f5b6c;
+    background-color: {C_TARJETA}; border-radius: 10px; padding: 16px 20px;
+    margin-bottom: 14px; border: 1px solid {C_BORDE}; color: {C_TEXTO_OSCURO};
 }}
 .summary-box {{
     border-radius: 10px; padding: 14px 18px; text-align: center; color: white;
@@ -69,7 +73,7 @@ th {{ background-color: {C_TEAL_VIVO}; color: white; }}
 
 .box-pendiente {{ background-color: {C_GRIS_NEUTRO}; }}
 .box-comprobado {{ background-color: {C_TEAL_VIVO}; }}
-.box-no-necesario {{ background-color: {C_AMARILLO_ACENTO}; color: #1A4756; }}
+.box-no-necesario {{ background-color: {C_AMARILLO_ACENTO}; color: {C_TEXTO_OSCURO}; }}
 
 .success-box {{
     background-color: {C_VERDE_OK}; color: white; padding: 10px; border-radius: 6px; font-weight: 600;
@@ -82,7 +86,7 @@ th {{ background-color: {C_TEAL_VIVO}; color: white; }}
 }}
 .badge-pendiente {{ background-color: {C_GRIS_NEUTRO}; color: white; }}
 .badge-comprobado {{ background-color: {C_TEAL_VIVO}; color: white; }}
-.badge-no-necesario {{ background-color: {C_AMARILLO_ACENTO}; color: #1A4756; }}
+.badge-no-necesario {{ background-color: {C_AMARILLO_ACENTO}; color: {C_TEXTO_OSCURO}; }}
 </style>
 """, unsafe_allow_html=True)
 
