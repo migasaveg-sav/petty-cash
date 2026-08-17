@@ -33,6 +33,7 @@ def init_state():
         "estados": {},                 # idx -> "pendiente" | "comprobado" | "no_necesario"
         "facturas_por_gasto": {},      # idx -> lista de dicts (facturas agregadas a ese gasto)
         "clasificacion_por_gasto": {}, # idx -> {"categoria": str, "material": str}
+        "pool_facturas": [],           # facturas subidas en bloque, aún no asignadas a ningún gasto
         "selected_idx": None,
         "concatenados": [],            # registros finales de gastos comprobados (1 dict por gasto, con lista de facturas)
         "no_necesarios": [],           # registros de gastos marcados como no necesarios
@@ -115,6 +116,83 @@ def mes_es(fecha_str):
 def next_factura_id():
     st.session_state.factura_counter += 1
     return st.session_state.factura_counter
+
+
+def uuids_consumidos():
+    """UUIDs que ya quedaron asignados a un gasto (pendiente de guardar o ya guardado en el historial).
+    NO incluye el pool automático: una factura ahí sigue disponible, no está 'usada' todavía."""
+    usados = set()
+    for facs in st.session_state.facturas_por_gasto.values():
+        usados.update(f["UUID"] for f in facs if f["UUID"] != "SIN-UUID")
+    for reg in st.session_state.concatenados:
+        usados.update(f["UUID"] for f in reg["Facturas"] if f["UUID"] != "SIN-UUID")
+    return usados
+
+
+# Umbral para sugerir una coincidencia "a revisar": diferencia absoluta menor a este
+# monto O menor al 30% del gasto (lo que sea más laxo), para no inundar de sugerencias
+# absurdas cuando el monto no se parece en nada.
+UMBRAL_SUGERENCIA_ABS = 500.0
+UMBRAL_SUGERENCIA_PCT = 0.30
+
+
+def calcular_matches_automaticos(df, pendientes_idx, pool):
+    """
+    Para cada gasto pendiente (sin facturas ya asignadas manualmente), busca la factura
+    disponible en el pool cuyo monto esté más cercano. Regresa una lista de sugerencias:
+    {"idx": ..., "gasto": Series, "monto_gasto": float, "factura": dict, "diferencia": float, "tipo": "exacto"|"revision"}
+    Cada factura del pool se sugiere para un solo gasto (primero en llegar, primero en servir).
+    """
+    usados_pool_ids = set()
+    sugerencias = []
+    for idx in pendientes_idx:
+        if st.session_state.facturas_por_gasto.get(idx):
+            continue  # este gasto ya tiene facturas asignadas manualmente, se deja fuera del auto-match
+        gasto = df.loc[idx]
+        monto_gasto = float(gasto["Monto"])
+        disponibles = [f for f in pool if f["_id"] not in usados_pool_ids]
+        if not disponibles:
+            continue
+        mejor = min(disponibles, key=lambda f: abs(monto_gasto - f["Monto Total"]))
+        diferencia = round(monto_gasto - mejor["Monto Total"], 2)
+        umbral = max(UMBRAL_SUGERENCIA_ABS, monto_gasto * UMBRAL_SUGERENCIA_PCT)
+        if abs(diferencia) <= umbral:
+            tipo = "exacto" if abs(diferencia) <= 0.01 else "revision"
+            sugerencias.append({
+                "idx": idx, "gasto": gasto, "monto_gasto": monto_gasto,
+                "factura": mejor, "diferencia": diferencia, "tipo": tipo,
+            })
+            usados_pool_ids.add(mejor["_id"])
+    return sugerencias
+
+
+def aplicar_sugerencias(df_editado, sugerencias):
+    """Aplica las filas marcadas como 'Incluir' de la tabla editada: crea el registro comprobado,
+    actualiza estados y libera la factura del pool."""
+    aplicados = 0
+    for (_, fila), sug in zip(df_editado.iterrows(), sugerencias):
+        if not bool(fila["Incluir"]):
+            continue
+        idx = sug["idx"]
+        gasto = sug["gasto"]
+        factura = sug["factura"]
+        categoria = fila.get("Categoría", "")
+        material = fila.get("Material", "")
+        st.session_state.concatenados.append({
+            "idx": idx,
+            "Fecha Estado": gasto.get("Fecha", ""),
+            "Descripción Estado": gasto.get("Descripción", ""),
+            "Monto Estado": sug["monto_gasto"],
+            "Categoria": categoria,
+            "Material": material,
+            "Facturas": [factura],
+        })
+        st.session_state.estados[idx] = "comprobado"
+        st.session_state.facturas_por_gasto.pop(idx, None)
+        st.session_state.clasificacion_por_gasto[idx] = {"categoria": categoria, "material": material}
+        st.session_state.pool_facturas = [f for f in st.session_state.pool_facturas if f["_id"] != factura["_id"]]
+        aplicados += 1
+    return aplicados
 
 
 def sums_por_estado(df):
@@ -416,8 +494,129 @@ if df is not None:
     )
 
     # ========================================================
-    # 4. SELECCIÓN DE GASTO A TRABAJAR
+    # 4. EMPAREJAMIENTO AUTOMÁTICO DE FACTURAS (por monto)
     # ========================================================
+    st.divider()
+    st.subheader("🔁 Emparejamiento automático de facturas")
+    st.caption(
+        "Sube todos los XML del periodo de una vez. Buscamos, para cada gasto pendiente, "
+        "la factura cuyo monto esté más cercano. Las diferencias de 1 centavo o menos se pueden "
+        "aplicar directo; el resto necesita tu validación antes de agregarse."
+    )
+
+    xml_bulk = st.file_uploader(
+        "Sube uno o más XML de CFDI para emparejar automáticamente",
+        type=["xml"],
+        accept_multiple_files=True,
+        key="xml_bulk_uploader",
+    )
+    if xml_bulk:
+        usados = uuids_consumidos() | {f["UUID"] for f in st.session_state.pool_facturas if f["UUID"] != "SIN-UUID"}
+        agregadas, duplicadas, con_error = 0, 0, 0
+        for xf in xml_bulk:
+            try:
+                datos = parse_cfdi(xf.getvalue(), xf.name)
+            except Exception as e:
+                st.error(f"No se pudo leer el XML '{xf.name}': {type(e).__name__}: {e}")
+                con_error += 1
+                continue
+            if datos["UUID"] in usados and datos["UUID"] != "SIN-UUID":
+                duplicadas += 1
+                continue
+            datos["_id"] = next_factura_id()
+            st.session_state.pool_facturas.append(datos)
+            usados.add(datos["UUID"])
+            agregadas += 1
+        if agregadas:
+            st.success(f"{agregadas} factura(s) agregada(s) al grupo por emparejar.")
+        if duplicadas:
+            st.info(f"{duplicadas} factura(s) ya estaban en uso en la sesión y se omitieron.")
+
+    pendientes_idx_match = [i for i, e in st.session_state.estados.items() if e == "pendiente"]
+    sugerencias = calcular_matches_automaticos(df, pendientes_idx_match, st.session_state.pool_facturas)
+    sug_exactas = [s for s in sugerencias if s["tipo"] == "exacto"]
+    sug_revision = [s for s in sugerencias if s["tipo"] == "revision"]
+    ids_sugeridos = {s["factura"]["_id"] for s in sugerencias}
+
+    def _df_para_editor(lista_sugerencias, incluir_default):
+        return pd.DataFrame([{
+            "Incluir": incluir_default,
+            "Fecha gasto": str(s["gasto"].get("Fecha", "")),
+            "Descripción gasto": str(s["gasto"].get("Descripción", ""))[:40],
+            "Monto gasto": s["monto_gasto"],
+            "Factura (UUID)": s["factura"]["UUID"],
+            "RFC Emisor": s["factura"]["RFC Emisor"],
+            "Monto factura": s["factura"]["Monto Total"],
+            "Diferencia": s["diferencia"],
+            "Categoría": "",
+            "Material": "",
+        } for s in lista_sugerencias])
+
+    if sug_exactas:
+        st.markdown("##### ✅ Coincidencias exactas (diferencia ≤ $0.01)")
+        df_exactas = _df_para_editor(sug_exactas, incluir_default=True)
+        edited_exactas = st.data_editor(
+            df_exactas,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Factura (UUID)",
+                      "RFC Emisor", "Monto factura", "Diferencia"],
+            column_config={
+                "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
+                "Monto factura": st.column_config.NumberColumn(format="$%.2f"),
+                "Diferencia": st.column_config.NumberColumn(format="$%.2f"),
+            },
+            key="editor_exactas",
+        )
+        if st.button("➕ Aplicar coincidencias exactas seleccionadas", type="primary", key="btn_aplicar_exactas"):
+            n = aplicar_sugerencias(edited_exactas, sug_exactas)
+            if n:
+                st.success(f"{n} gasto(s) comprobado(s) automáticamente.")
+                st.rerun()
+            else:
+                st.warning("No marcaste ninguna fila con 'Incluir'.")
+
+    if sug_revision:
+        st.markdown("##### 🔍 Requieren tu validación (diferencia mayor a $0.01)")
+        df_revision = _df_para_editor(sug_revision, incluir_default=False)
+        edited_revision = st.data_editor(
+            df_revision,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Factura (UUID)",
+                      "RFC Emisor", "Monto factura", "Diferencia"],
+            column_config={
+                "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
+                "Monto factura": st.column_config.NumberColumn(format="$%.2f"),
+                "Diferencia": st.column_config.NumberColumn(format="$%.2f"),
+            },
+            key="editor_revision",
+        )
+        if st.button("➕ Aplicar coincidencias validadas", key="btn_aplicar_revision"):
+            n = aplicar_sugerencias(edited_revision, sug_revision)
+            if n:
+                st.success(f"{n} gasto(s) comprobado(s) tras validación.")
+                st.rerun()
+            else:
+                st.warning("Marca 'Incluir' en las filas que quieras confirmar antes de aplicar.")
+
+    pool_sin_match = [f for f in st.session_state.pool_facturas if f["_id"] not in ids_sugeridos]
+    if pool_sin_match:
+        with st.expander(f"📥 Facturas sin coincidencia sugerida ({len(pool_sin_match)}) — quedan disponibles para asignar manualmente"):
+            df_pool = pd.DataFrame(pool_sin_match).drop(columns=["_id"])
+            st.dataframe(
+                df_pool.style.format({"IVA": money, "Monto Total": money}),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(
+                "Estas facturas quedan en espera. Puedes asignarlas manualmente subiéndolas de nuevo "
+                "en el panel de 'Trabajar un gasto' de abajo (se evita el duplicado automáticamente)."
+            )
+
+    # ========================================================
+    # 5. SELECCIÓN DE GASTO A TRABAJAR
+    # ========================================================
+    st.divider()
     st.subheader("Trabajar un gasto")
 
     pendientes_idx = [i for i, e in st.session_state.estados.items() if e == "pendiente"]
@@ -479,7 +678,7 @@ if df is not None:
             key=f"xml_uploader_{idx}",
         )
         if xml_files:
-            uuids_existentes = {f["UUID"] for f in facturas}
+            uuids_existentes = {f["UUID"] for f in facturas} | uuids_consumidos()
             for xf in xml_files:
                 try:
                     datos = parse_cfdi(xf.getvalue(), xf.name)
@@ -487,10 +686,16 @@ if df is not None:
                     st.error(f"No se pudo leer el XML '{xf.name}': {type(e).__name__}: {e}")
                     continue
                 if datos["UUID"] in uuids_existentes and datos["UUID"] != "SIN-UUID":
-                    continue  # ya agregada, evitar duplicado
+                    continue  # ya agregada a este u otro gasto, evitar duplicado
                 datos["_id"] = next_factura_id()
                 facturas.append(datos)
                 uuids_existentes.add(datos["UUID"])
+                # si esta factura ya estaba libre en el pool automático, se retira de ahí
+                # para que no se sugiera de nuevo en el emparejamiento automático
+                if datos["UUID"] != "SIN-UUID":
+                    st.session_state.pool_facturas = [
+                        f for f in st.session_state.pool_facturas if f["UUID"] != datos["UUID"]
+                    ]
 
         # --- Agregar factura manual ---
         with st.expander("✏️ Agregar comprobación manual (sin XML)"):
