@@ -34,6 +34,8 @@ def init_state():
         "facturas_por_gasto": {},      # idx -> lista de dicts (facturas agregadas a ese gasto)
         "clasificacion_por_gasto": {}, # idx -> {"categoria": str, "material": str}
         "pool_facturas": [],           # facturas subidas en bloque, aún no asignadas a ningún gasto
+        "modo_trabajo": None,          # None | "auto" | "manual" -- qué panel de trabajo está activo
+        "tabla_expandida": True,       # controla si la tabla de movimientos se muestra o está colapsada
         "selected_idx": None,
         "concatenados": [],            # registros finales de gastos comprobados (1 dict por gasto, con lista de facturas)
         "no_necesarios": [],           # registros de gastos marcados como no necesarios
@@ -464,342 +466,375 @@ if df is not None:
     # ========================================================
     # 3. TABLA DE MOVIMIENTOS
     # ========================================================
-    st.subheader("Movimientos del estado de cuenta")
+    col_titulo, col_toggle = st.columns([10, 1])
+    with col_titulo:
+        st.subheader("Movimientos del estado de cuenta")
+    with col_toggle:
+        st.write("")
+        if st.button("🔽" if st.session_state.tabla_expandida else "▶️", key="btn_toggle_tabla",
+                     help="Colapsar/expandir la tabla"):
+            st.session_state.tabla_expandida = not st.session_state.tabla_expandida
+            st.rerun()
 
-    filtro_estado = st.radio(
-        "Filtrar por estado",
-        ["Todos", "Sin comprobar", "Comprobados", "No necesarios"],
-        horizontal=True,
-    )
-    busqueda = st.text_input("🔎 Buscar por descripción")
-
-    df_vista = df.copy()
-    df_vista["Estado"] = df_vista.index.map(lambda i: status_label(st.session_state.estados.get(i, "pendiente")))
-
-    if filtro_estado == "Sin comprobar":
-        df_vista = df_vista[df_vista.index.map(lambda i: st.session_state.estados.get(i) == "pendiente")]
-    elif filtro_estado == "Comprobados":
-        df_vista = df_vista[df_vista.index.map(lambda i: st.session_state.estados.get(i) == "comprobado")]
-    elif filtro_estado == "No necesarios":
-        df_vista = df_vista[df_vista.index.map(lambda i: st.session_state.estados.get(i) == "no_necesario")]
-
-    if busqueda and "Descripción" in df_vista.columns:
-        df_vista = df_vista[df_vista["Descripción"].astype(str).str.contains(busqueda, case=False, na=False)]
-
-    columnas_mostrar = [c for c in ["Estado", "Fecha", "Descripción", "Monto", "Saldo"] if c in df_vista.columns]
-    st.dataframe(
-        df_vista[columnas_mostrar].style.format({"Monto": money, "Saldo": money}),
-        use_container_width=True,
-        hide_index=False,
-    )
-
-    # ========================================================
-    # 4. EMPAREJAMIENTO AUTOMÁTICO DE FACTURAS (por monto)
-    # ========================================================
-    st.divider()
-    st.subheader("🔁 Emparejamiento automático de facturas")
-    st.caption(
-        "Sube todos los XML del periodo de una vez. Buscamos, para cada gasto pendiente, "
-        "la factura cuyo monto esté más cercano. Las diferencias de 1 centavo o menos se pueden "
-        "aplicar directo; el resto necesita tu validación antes de agregarse."
-    )
-
-    xml_bulk = st.file_uploader(
-        "Sube uno o más XML de CFDI para emparejar automáticamente",
-        type=["xml"],
-        accept_multiple_files=True,
-        key="xml_bulk_uploader",
-    )
-    if xml_bulk:
-        usados = uuids_consumidos() | {f["UUID"] for f in st.session_state.pool_facturas if f["UUID"] != "SIN-UUID"}
-        agregadas, duplicadas, con_error = 0, 0, 0
-        for xf in xml_bulk:
-            try:
-                datos = parse_cfdi(xf.getvalue(), xf.name)
-            except Exception as e:
-                st.error(f"No se pudo leer el XML '{xf.name}': {type(e).__name__}: {e}")
-                con_error += 1
-                continue
-            if datos["UUID"] in usados and datos["UUID"] != "SIN-UUID":
-                duplicadas += 1
-                continue
-            datos["_id"] = next_factura_id()
-            st.session_state.pool_facturas.append(datos)
-            usados.add(datos["UUID"])
-            agregadas += 1
-        if agregadas:
-            st.success(f"{agregadas} factura(s) agregada(s) al grupo por emparejar.")
-        if duplicadas:
-            st.info(f"{duplicadas} factura(s) ya estaban en uso en la sesión y se omitieron.")
-
-    pendientes_idx_match = [i for i, e in st.session_state.estados.items() if e == "pendiente"]
-    sugerencias = calcular_matches_automaticos(df, pendientes_idx_match, st.session_state.pool_facturas)
-    sug_exactas = [s for s in sugerencias if s["tipo"] == "exacto"]
-    sug_revision = [s for s in sugerencias if s["tipo"] == "revision"]
-    ids_sugeridos = {s["factura"]["_id"] for s in sugerencias}
-
-    def _df_para_editor(lista_sugerencias, incluir_default):
-        return pd.DataFrame([{
-            "Incluir": incluir_default,
-            "Fecha gasto": str(s["gasto"].get("Fecha", "")),
-            "Descripción gasto": str(s["gasto"].get("Descripción", ""))[:40],
-            "Monto gasto": s["monto_gasto"],
-            "Factura (UUID)": s["factura"]["UUID"],
-            "RFC Emisor": s["factura"]["RFC Emisor"],
-            "Monto factura": s["factura"]["Monto Total"],
-            "Diferencia": s["diferencia"],
-            "Categoría": "",
-            "Material": "",
-        } for s in lista_sugerencias])
-
-    if sug_exactas:
-        st.markdown("##### ✅ Coincidencias exactas (diferencia ≤ $0.01)")
-        df_exactas = _df_para_editor(sug_exactas, incluir_default=True)
-        edited_exactas = st.data_editor(
-            df_exactas,
-            use_container_width=True,
-            hide_index=True,
-            disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Factura (UUID)",
-                      "RFC Emisor", "Monto factura", "Diferencia"],
-            column_config={
-                "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
-                "Monto factura": st.column_config.NumberColumn(format="$%.2f"),
-                "Diferencia": st.column_config.NumberColumn(format="$%.2f"),
-            },
-            key="editor_exactas",
+    if st.session_state.tabla_expandida:
+        filtro_estado = st.radio(
+            "Filtrar por estado",
+            ["Todos", "Sin comprobar", "Comprobados", "No necesarios"],
+            horizontal=True,
         )
-        if st.button("➕ Aplicar coincidencias exactas seleccionadas", type="primary", key="btn_aplicar_exactas"):
-            n = aplicar_sugerencias(edited_exactas, sug_exactas)
-            if n:
-                st.success(f"{n} gasto(s) comprobado(s) automáticamente.")
-                st.rerun()
-            else:
-                st.warning("No marcaste ninguna fila con 'Incluir'.")
+        busqueda = st.text_input("🔎 Buscar por descripción")
 
-    if sug_revision:
-        st.markdown("##### 🔍 Requieren tu validación (diferencia mayor a $0.01)")
-        df_revision = _df_para_editor(sug_revision, incluir_default=False)
-        edited_revision = st.data_editor(
-            df_revision,
+        df_vista = df.copy()
+        df_vista["Estado"] = df_vista.index.map(lambda i: status_label(st.session_state.estados.get(i, "pendiente")))
+
+        if filtro_estado == "Sin comprobar":
+            df_vista = df_vista[df_vista.index.map(lambda i: st.session_state.estados.get(i) == "pendiente")]
+        elif filtro_estado == "Comprobados":
+            df_vista = df_vista[df_vista.index.map(lambda i: st.session_state.estados.get(i) == "comprobado")]
+        elif filtro_estado == "No necesarios":
+            df_vista = df_vista[df_vista.index.map(lambda i: st.session_state.estados.get(i) == "no_necesario")]
+
+        if busqueda and "Descripción" in df_vista.columns:
+            df_vista = df_vista[df_vista["Descripción"].astype(str).str.contains(busqueda, case=False, na=False)]
+
+        columnas_mostrar = [c for c in ["Estado", "Fecha", "Descripción", "Monto", "Saldo"] if c in df_vista.columns]
+        st.dataframe(
+            df_vista[columnas_mostrar].style.format({"Monto": money, "Saldo": money}),
             use_container_width=True,
-            hide_index=True,
-            disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Factura (UUID)",
-                      "RFC Emisor", "Monto factura", "Diferencia"],
-            column_config={
-                "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
-                "Monto factura": st.column_config.NumberColumn(format="$%.2f"),
-                "Diferencia": st.column_config.NumberColumn(format="$%.2f"),
-            },
-            key="editor_revision",
+            hide_index=False,
         )
-        if st.button("➕ Aplicar coincidencias validadas", key="btn_aplicar_revision"):
-            n = aplicar_sugerencias(edited_revision, sug_revision)
-            if n:
-                st.success(f"{n} gasto(s) comprobado(s) tras validación.")
-                st.rerun()
-            else:
-                st.warning("Marca 'Incluir' en las filas que quieras confirmar antes de aplicar.")
-
-    pool_sin_match = [f for f in st.session_state.pool_facturas if f["_id"] not in ids_sugeridos]
-    if pool_sin_match:
-        with st.expander(f"📥 Facturas sin coincidencia sugerida ({len(pool_sin_match)}) — quedan disponibles para asignar manualmente"):
-            df_pool = pd.DataFrame(pool_sin_match).drop(columns=["_id"])
-            st.dataframe(
-                df_pool.style.format({"IVA": money, "Monto Total": money}),
-                use_container_width=True, hide_index=True,
-            )
-            st.caption(
-                "Estas facturas quedan en espera. Puedes asignarlas manualmente subiéndolas de nuevo "
-                "en el panel de 'Trabajar un gasto' de abajo (se evita el duplicado automáticamente)."
-            )
-
-    # ========================================================
-    # 5. SELECCIÓN DE GASTO A TRABAJAR
-    # ========================================================
-    st.divider()
-    st.subheader("Trabajar un gasto")
-
-    pendientes_idx = [i for i, e in st.session_state.estados.items() if e == "pendiente"]
-
-    if not pendientes_idx:
-        st.info("No hay gastos pendientes por comprobar. 🎉")
     else:
-        opciones = {
-            i: f"#{i} · {df.loc[i, 'Fecha'] if 'Fecha' in df.columns else ''} · "
-               f"{df.loc[i, 'Descripción'] if 'Descripción' in df.columns else ''} · {money(df.loc[i, 'Monto'])}"
-            for i in pendientes_idx
-        }
-        idx_sel = st.selectbox(
-            "Selecciona el gasto que quieres comprobar",
-            options=list(opciones.keys()),
-            format_func=lambda i: opciones[i],
-            key="selector_gasto",
-        )
-        st.session_state.selected_idx = idx_sel
+        st.caption("Tabla colapsada. Da clic en ▶️ para volver a mostrarla.")
 
     # ========================================================
-    # 5. PANEL DE TRABAJO DEL GASTO SELECCIONADO
+    # 4. SELECTOR DE MODO DE TRABAJO
     # ========================================================
-    idx = st.session_state.selected_idx
-    if idx is not None and st.session_state.estados.get(idx) == "pendiente":
-        gasto = df.loc[idx]
-        monto_gasto = float(gasto["Monto"])
+    st.divider()
+    st.subheader("¿Cómo quieres trabajar?")
+    mb1, mb2 = st.columns(2)
+    with mb1:
+        if st.button("🔁 Emparejamiento automático de facturas", key="btn_modo_auto",
+                      type="primary" if st.session_state.modo_trabajo == "auto" else "secondary",
+                      use_container_width=True):
+            st.session_state.modo_trabajo = "auto"
+            st.rerun()
+    with mb2:
+        if st.button("✍️ Trabajar un gasto a la vez", key="btn_modo_manual",
+                      type="primary" if st.session_state.modo_trabajo == "manual" else "secondary",
+                      use_container_width=True):
+            st.session_state.modo_trabajo = "manual"
+            st.rerun()
 
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### 📌 Gasto seleccionado")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Fecha", str(gasto.get("Fecha", "")))
-        c2.metric("Descripción", str(gasto.get("Descripción", ""))[:30])
-        c3.metric("Monto", money(monto_gasto))
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        # --- Clasificación (Categoría / Material) ---
-        st.markdown("##### 🏷️ Clasificación del gasto")
-        clasif = st.session_state.clasificacion_por_gasto.setdefault(idx, {"categoria": "", "material": ""})
-        cl1, cl2 = st.columns(2)
-        clasif["categoria"] = cl1.text_input(
-            "Categoría", value=clasif.get("categoria", ""), key=f"categoria_{idx}",
-            help="Por ahora es texto libre. Cuando subas tu catálogo de categorías/material, "
-                 "este campo se volverá una lista desplegable.",
+    # ========================================================
+    # 4a. EMPAREJAMIENTO AUTOMÁTICO DE FACTURAS (por monto)
+    # ========================================================
+    if st.session_state.modo_trabajo == "auto":
+        st.subheader("🔁 Emparejamiento automático de facturas")
+        st.caption(
+            "Sube todos los XML del periodo de una vez. Buscamos, para cada gasto pendiente, "
+            "la factura cuyo monto esté más cercano. Las diferencias de 1 centavo o menos se pueden "
+            "aplicar directo; el resto necesita tu validación antes de agregarse."
         )
-        clasif["material"] = cl2.text_input(
-            "Material", value=clasif.get("material", ""), key=f"material_{idx}",
-        )
 
-        st.session_state.facturas_por_gasto.setdefault(idx, [])
-        facturas = st.session_state.facturas_por_gasto[idx]
-
-        # --- Agregar XML(s) ---
-        st.markdown("##### 📎 Agregar facturas (puedes subir varios XML a la vez)")
-        xml_files = st.file_uploader(
-            "Sube uno o más XML de CFDI (soporta versión 3.3 y 4.0)",
+        xml_bulk = st.file_uploader(
+            "Sube uno o más XML de CFDI para emparejar automáticamente",
             type=["xml"],
             accept_multiple_files=True,
-            key=f"xml_uploader_{idx}",
+            key="xml_bulk_uploader",
         )
-        if xml_files:
-            uuids_existentes = {f["UUID"] for f in facturas} | uuids_consumidos()
-            for xf in xml_files:
+        if xml_bulk:
+            usados = uuids_consumidos() | {f["UUID"] for f in st.session_state.pool_facturas if f["UUID"] != "SIN-UUID"}
+            agregadas, duplicadas, con_error = 0, 0, 0
+            for xf in xml_bulk:
                 try:
                     datos = parse_cfdi(xf.getvalue(), xf.name)
                 except Exception as e:
                     st.error(f"No se pudo leer el XML '{xf.name}': {type(e).__name__}: {e}")
+                    con_error += 1
                     continue
-                if datos["UUID"] in uuids_existentes and datos["UUID"] != "SIN-UUID":
-                    continue  # ya agregada a este u otro gasto, evitar duplicado
+                if datos["UUID"] in usados and datos["UUID"] != "SIN-UUID":
+                    duplicadas += 1
+                    continue
                 datos["_id"] = next_factura_id()
-                facturas.append(datos)
-                uuids_existentes.add(datos["UUID"])
-                # si esta factura ya estaba libre en el pool automático, se retira de ahí
-                # para que no se sugiera de nuevo en el emparejamiento automático
-                if datos["UUID"] != "SIN-UUID":
-                    st.session_state.pool_facturas = [
-                        f for f in st.session_state.pool_facturas if f["UUID"] != datos["UUID"]
-                    ]
+                st.session_state.pool_facturas.append(datos)
+                usados.add(datos["UUID"])
+                agregadas += 1
+            if agregadas:
+                st.success(f"{agregadas} factura(s) agregada(s) al grupo por emparejar.")
+            if duplicadas:
+                st.info(f"{duplicadas} factura(s) ya estaban en uso en la sesión y se omitieron.")
 
-        # --- Agregar factura manual ---
-        with st.expander("✏️ Agregar comprobación manual (sin XML)"):
-            with st.form(f"manual_form_{idx}", clear_on_submit=True):
-                mf_fecha = st.date_input("Fecha de factura", value=datetime.date.today())
-                mf_uuid = st.text_input("UUID")
-                mf_concepto = st.text_input("Concepto/Descripción")
-                mf_rfc = st.text_input("RFC Emisor")
-                mf_razon = st.text_input("Razón Social Emisor")
-                mf_iva = st.number_input("IVA", min_value=0.0, format="%.2f")
-                mf_monto = st.number_input("Monto Total", min_value=0.0, format="%.2f")
-                guardar_manual = st.form_submit_button("Agregar factura manual")
-                if guardar_manual:
-                    facturas.append({
-                        "_id": next_factura_id(),
-                        "Fuente": "Manual",
-                        "Fecha Factura": str(mf_fecha),
-                        "UUID": mf_uuid or "SIN-UUID",
-                        "Concepto": mf_concepto,
-                        "RFC Emisor": mf_rfc,
-                        "Razón Social": mf_razon,
-                        "IVA": mf_iva,
-                        "Monto Total": mf_monto,
-                    })
+        pendientes_idx_match = [i for i, e in st.session_state.estados.items() if e == "pendiente"]
+        sugerencias = calcular_matches_automaticos(df, pendientes_idx_match, st.session_state.pool_facturas)
+        sug_exactas = [s for s in sugerencias if s["tipo"] == "exacto"]
+        sug_revision = [s for s in sugerencias if s["tipo"] == "revision"]
+        ids_sugeridos = {s["factura"]["_id"] for s in sugerencias}
 
-        # --- Tabla de facturas agregadas a este gasto ---
-        st.markdown("##### 🧾 Facturas agregadas a este gasto")
-        if facturas:
-            df_facturas = pd.DataFrame(facturas)
-            df_mostrar = df_facturas.drop(columns=["_id"])
-            st.dataframe(
-                df_mostrar.style.format({"IVA": money, "Monto Total": money}),
+        def _df_para_editor(lista_sugerencias, incluir_default):
+            return pd.DataFrame([{
+                "Incluir": incluir_default,
+                "Fecha gasto": str(s["gasto"].get("Fecha", "")),
+                "Descripción gasto": str(s["gasto"].get("Descripción", ""))[:40],
+                "Monto gasto": s["monto_gasto"],
+                "Factura (UUID)": s["factura"]["UUID"],
+                "RFC Emisor": s["factura"]["RFC Emisor"],
+                "Monto factura": s["factura"]["Monto Total"],
+                "Diferencia": s["diferencia"],
+                "Categoría": "",
+                "Material": "",
+            } for s in lista_sugerencias])
+
+        if sug_exactas:
+            st.markdown("##### ✅ Coincidencias exactas (diferencia ≤ $0.01)")
+            df_exactas = _df_para_editor(sug_exactas, incluir_default=True)
+            edited_exactas = st.data_editor(
+                df_exactas,
                 use_container_width=True,
                 hide_index=True,
+                disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Factura (UUID)",
+                          "RFC Emisor", "Monto factura", "Diferencia"],
+                column_config={
+                    "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
+                    "Monto factura": st.column_config.NumberColumn(format="$%.2f"),
+                    "Diferencia": st.column_config.NumberColumn(format="$%.2f"),
+                },
+                key="editor_exactas",
             )
+            if st.button("➕ Aplicar coincidencias exactas seleccionadas", type="primary", key="btn_aplicar_exactas"):
+                n = aplicar_sugerencias(edited_exactas, sug_exactas)
+                if n:
+                    st.success(f"{n} gasto(s) comprobado(s) automáticamente.")
+                    st.rerun()
+                else:
+                    st.warning("No marcaste ninguna fila con 'Incluir'.")
 
-            quitar = st.multiselect(
-                "Quitar factura(s) de la lista",
-                options=[f["_id"] for f in facturas],
-                format_func=lambda fid: next(
-                    f"{f['Fuente']} · {f['UUID']} · {money(f['Monto Total'])}"
-                    for f in facturas if f["_id"] == fid
-                ),
-                key=f"quitar_{idx}",
+        if sug_revision:
+            st.markdown("##### 🔍 Requieren tu validación (diferencia mayor a $0.01)")
+            df_revision = _df_para_editor(sug_revision, incluir_default=False)
+            edited_revision = st.data_editor(
+                df_revision,
+                use_container_width=True,
+                hide_index=True,
+                disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Factura (UUID)",
+                          "RFC Emisor", "Monto factura", "Diferencia"],
+                column_config={
+                    "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
+                    "Monto factura": st.column_config.NumberColumn(format="$%.2f"),
+                    "Diferencia": st.column_config.NumberColumn(format="$%.2f"),
+                },
+                key="editor_revision",
             )
-            if quitar and st.button("Quitar seleccionadas", key=f"btn_quitar_{idx}"):
-                st.session_state.facturas_por_gasto[idx] = [f for f in facturas if f["_id"] not in quitar]
-                st.rerun()
+            if st.button("➕ Aplicar coincidencias validadas", key="btn_aplicar_revision"):
+                n = aplicar_sugerencias(edited_revision, sug_revision)
+                if n:
+                    st.success(f"{n} gasto(s) comprobado(s) tras validación.")
+                    st.rerun()
+                else:
+                    st.warning("Marca 'Incluir' en las filas que quieras confirmar antes de aplicar.")
 
-            suma_facturas = sum(f["Monto Total"] for f in facturas)
-            diferencia = round(monto_gasto - suma_facturas, 2)
-
-            st.write("")
-            cc1, cc2, cc3 = st.columns(3)
-            cc1.metric("Monto del gasto", money(monto_gasto))
-            cc2.metric("Suma de facturas", money(suma_facturas))
-            cc3.metric("Diferencia", money(diferencia))
-
-            if abs(diferencia) <= 0.01:
-                st.markdown(
-                    f"<div class='success-box'>✅ Gasto comprobado correctamente. "
-                    f"Diferencia: {money(diferencia)}</div>",
-                    unsafe_allow_html=True,
+        pool_sin_match = [f for f in st.session_state.pool_facturas if f["_id"] not in ids_sugeridos]
+        if pool_sin_match:
+            with st.expander(f"📥 Facturas sin coincidencia sugerida ({len(pool_sin_match)}) — quedan disponibles para asignar manualmente"):
+                df_pool = pd.DataFrame(pool_sin_match).drop(columns=["_id"])
+                st.dataframe(
+                    df_pool.style.format({"IVA": money, "Monto Total": money}),
+                    use_container_width=True, hide_index=True,
                 )
-                if st.button("➕ Añadir a los registros", key=f"btn_guardar_{idx}", type="primary"):
-                    st.session_state.concatenados.append({
-                        "idx": idx,
+                st.caption(
+                    "Estas facturas quedan en espera. Puedes asignarlas manualmente subiéndolas de nuevo "
+                    "en el panel de 'Trabajar un gasto' de abajo (se evita el duplicado automáticamente)."
+                )
+
+    if st.session_state.modo_trabajo == "manual":
+        # ========================================================
+        # 5. SELECCIÓN DE GASTO A TRABAJAR
+        # ========================================================
+        st.divider()
+        st.subheader("Trabajar un gasto")
+
+        pendientes_idx = [i for i, e in st.session_state.estados.items() if e == "pendiente"]
+
+        if not pendientes_idx:
+            st.info("No hay gastos pendientes por comprobar. 🎉")
+        else:
+            opciones = {
+                i: f"#{i} · {df.loc[i, 'Fecha'] if 'Fecha' in df.columns else ''} · "
+                   f"{df.loc[i, 'Descripción'] if 'Descripción' in df.columns else ''} · {money(df.loc[i, 'Monto'])}"
+                for i in pendientes_idx
+            }
+            idx_sel = st.selectbox(
+                "Selecciona el gasto que quieres comprobar",
+                options=list(opciones.keys()),
+                format_func=lambda i: opciones[i],
+                key="selector_gasto",
+            )
+            st.session_state.selected_idx = idx_sel
+
+        # ========================================================
+        # 5. PANEL DE TRABAJO DEL GASTO SELECCIONADO
+        # ========================================================
+        idx = st.session_state.selected_idx
+        if idx is not None and st.session_state.estados.get(idx) == "pendiente":
+            gasto = df.loc[idx]
+            monto_gasto = float(gasto["Monto"])
+
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            col_titulo_gasto, col_no_necesario = st.columns([4, 1])
+            with col_titulo_gasto:
+                st.markdown("#### 📌 Gasto seleccionado")
+            with col_no_necesario:
+                if st.button("🚫 No necesario", key=f"btn_no_necesario_{idx}", use_container_width=True):
+                    clasif_actual = st.session_state.clasificacion_por_gasto.get(idx, {"categoria": "", "material": ""})
+                    st.session_state.no_necesarios.append({
                         "Fecha Estado": gasto.get("Fecha", ""),
                         "Descripción Estado": gasto.get("Descripción", ""),
                         "Monto Estado": monto_gasto,
-                        "Categoria": clasif.get("categoria", ""),
-                        "Material": clasif.get("material", ""),
-                        "Facturas": facturas,  # se guarda la lista completa (anidada)
+                        "Categoria": clasif_actual.get("categoria", ""),
+                        "Material": clasif_actual.get("material", ""),
                     })
-                    st.session_state.estados[idx] = "comprobado"
+                    st.session_state.estados[idx] = "no_necesario"
                     st.session_state.facturas_por_gasto.pop(idx, None)
                     st.session_state.selected_idx = None
-                    st.success("Gasto añadido a los registros.")
+                    st.info("Gasto marcado como no necesario.")
                     st.rerun()
-            else:
-                st.markdown(
-                    f"<div class='error-box'>❌ La suma de facturas no coincide con el gasto. "
-                    f"Diferencia: {money(diferencia)}</div>",
-                    unsafe_allow_html=True,
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Fecha", str(gasto.get("Fecha", "")))
+            c2.metric("Descripción", str(gasto.get("Descripción", ""))[:30])
+            c3.metric("Monto", money(monto_gasto))
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            # --- Clasificación (Categoría / Material) ---
+            st.markdown("##### 🏷️ Clasificación del gasto")
+            clasif = st.session_state.clasificacion_por_gasto.setdefault(idx, {"categoria": "", "material": ""})
+            cl1, cl2 = st.columns(2)
+            clasif["categoria"] = cl1.text_input(
+                "Categoría", value=clasif.get("categoria", ""), key=f"categoria_{idx}",
+                help="Por ahora es texto libre. Cuando subas tu catálogo de categorías/material, "
+                     "este campo se volverá una lista desplegable.",
+            )
+            clasif["material"] = cl2.text_input(
+                "Material", value=clasif.get("material", ""), key=f"material_{idx}",
+            )
+
+            st.session_state.facturas_por_gasto.setdefault(idx, [])
+            facturas = st.session_state.facturas_por_gasto[idx]
+
+            # --- Agregar XML(s) ---
+            st.markdown("##### 📎 Agregar facturas (puedes subir varios XML a la vez)")
+            xml_files = st.file_uploader(
+                "Sube uno o más XML de CFDI (soporta versión 3.3 y 4.0)",
+                type=["xml"],
+                accept_multiple_files=True,
+                key=f"xml_uploader_{idx}",
+            )
+            if xml_files:
+                uuids_existentes = {f["UUID"] for f in facturas} | uuids_consumidos()
+                for xf in xml_files:
+                    try:
+                        datos = parse_cfdi(xf.getvalue(), xf.name)
+                    except Exception as e:
+                        st.error(f"No se pudo leer el XML '{xf.name}': {type(e).__name__}: {e}")
+                        continue
+                    if datos["UUID"] in uuids_existentes and datos["UUID"] != "SIN-UUID":
+                        continue  # ya agregada a este u otro gasto, evitar duplicado
+                    datos["_id"] = next_factura_id()
+                    facturas.append(datos)
+                    uuids_existentes.add(datos["UUID"])
+                    # si esta factura ya estaba libre en el pool automático, se retira de ahí
+                    # para que no se sugiera de nuevo en el emparejamiento automático
+                    if datos["UUID"] != "SIN-UUID":
+                        st.session_state.pool_facturas = [
+                            f for f in st.session_state.pool_facturas if f["UUID"] != datos["UUID"]
+                        ]
+
+            # --- Agregar factura manual ---
+            with st.expander("✏️ Agregar comprobación manual (sin XML)"):
+                with st.form(f"manual_form_{idx}", clear_on_submit=True):
+                    mf_fecha = st.date_input("Fecha de factura", value=datetime.date.today())
+                    mf_uuid = st.text_input("UUID")
+                    mf_concepto = st.text_input("Concepto/Descripción")
+                    mf_rfc = st.text_input("RFC Emisor")
+                    mf_razon = st.text_input("Razón Social Emisor")
+                    mf_iva = st.number_input("IVA", min_value=0.0, format="%.2f")
+                    mf_monto = st.number_input("Monto Total", min_value=0.0, format="%.2f")
+                    guardar_manual = st.form_submit_button("Agregar factura manual")
+                    if guardar_manual:
+                        facturas.append({
+                            "_id": next_factura_id(),
+                            "Fuente": "Manual",
+                            "Fecha Factura": str(mf_fecha),
+                            "UUID": mf_uuid or "SIN-UUID",
+                            "Concepto": mf_concepto,
+                            "RFC Emisor": mf_rfc,
+                            "Razón Social": mf_razon,
+                            "IVA": mf_iva,
+                            "Monto Total": mf_monto,
+                        })
+
+            # --- Tabla de facturas agregadas a este gasto ---
+            st.markdown("##### 🧾 Facturas agregadas a este gasto")
+            if facturas:
+                df_facturas = pd.DataFrame(facturas)
+                df_mostrar = df_facturas.drop(columns=["_id"])
+                st.dataframe(
+                    df_mostrar.style.format({"IVA": money, "Monto Total": money}),
+                    use_container_width=True,
+                    hide_index=True,
                 )
-        else:
-            st.caption("Aún no has agregado ninguna factura para este gasto.")
 
-        st.write("")
-        if st.button("🚫 Marcar como no necesario", key=f"btn_no_necesario_{idx}"):
-            st.session_state.no_necesarios.append({
-                "Fecha Estado": gasto.get("Fecha", ""),
-                "Descripción Estado": gasto.get("Descripción", ""),
-                "Monto Estado": monto_gasto,
-                "Categoria": clasif.get("categoria", ""),
-                "Material": clasif.get("material", ""),
-            })
-            st.session_state.estados[idx] = "no_necesario"
-            st.session_state.facturas_por_gasto.pop(idx, None)
-            st.session_state.selected_idx = None
-            st.info("Gasto marcado como no necesario.")
-            st.rerun()
+                quitar = st.multiselect(
+                    "Quitar factura(s) de la lista",
+                    options=[f["_id"] for f in facturas],
+                    format_func=lambda fid: next(
+                        f"{f['Fuente']} · {f['UUID']} · {money(f['Monto Total'])}"
+                        for f in facturas if f["_id"] == fid
+                    ),
+                    key=f"quitar_{idx}",
+                )
+                if quitar and st.button("Quitar seleccionadas", key=f"btn_quitar_{idx}"):
+                    st.session_state.facturas_por_gasto[idx] = [f for f in facturas if f["_id"] not in quitar]
+                    st.rerun()
 
-    # ========================================================
+                suma_facturas = sum(f["Monto Total"] for f in facturas)
+                diferencia = round(monto_gasto - suma_facturas, 2)
+
+                st.write("")
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.metric("Monto del gasto", money(monto_gasto))
+                cc2.metric("Suma de facturas", money(suma_facturas))
+                cc3.metric("Diferencia", money(diferencia))
+
+                if abs(diferencia) <= 0.01:
+                    st.markdown(
+                        f"<div class='success-box'>✅ Gasto comprobado correctamente. "
+                        f"Diferencia: {money(diferencia)}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("➕ Añadir a los registros", key=f"btn_guardar_{idx}", type="primary"):
+                        st.session_state.concatenados.append({
+                            "idx": idx,
+                            "Fecha Estado": gasto.get("Fecha", ""),
+                            "Descripción Estado": gasto.get("Descripción", ""),
+                            "Monto Estado": monto_gasto,
+                            "Categoria": clasif.get("categoria", ""),
+                            "Material": clasif.get("material", ""),
+                            "Facturas": facturas,  # se guarda la lista completa (anidada)
+                        })
+                        st.session_state.estados[idx] = "comprobado"
+                        st.session_state.facturas_por_gasto.pop(idx, None)
+                        st.session_state.selected_idx = None
+                        st.success("Gasto añadido a los registros.")
+                        st.rerun()
+                else:
+                    st.markdown(
+                        f"<div class='error-box'>❌ La suma de facturas no coincide con el gasto. "
+                        f"Diferencia: {money(diferencia)}</div>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("Aún no has agregado ninguna factura para este gasto.")
+
+        # ========================================================
     # 6. HISTORIAL Y DESCARGA
     # ========================================================
     st.divider()
