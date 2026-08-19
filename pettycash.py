@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import xml.etree.ElementTree as ET
 import datetime
 import json
@@ -8,10 +9,10 @@ from io import BytesIO
 # ============================================================
 # PALETA DE COLORES — "Neutro Claro Ejecutivo"
 # ============================================================
-C_FONDO = "#5F9EA0"          # fondo general (tema claro)
+C_FONDO = "#F4F5F7"          # fondo general (tema claro)
 C_TARJETA = "#FFFFFF"        # fondo de tarjetas/paneles
 C_BORDE = "#D8DEE4"          # bordes sutiles
-C_TEXTO_OSCURO = "#191970"   # texto principal sobre fondo claro
+C_TEXTO_OSCURO = "#1A1F26"   # texto principal sobre fondo claro
 C_TEAL_VIVO = "#0E5C73"      # acento primario
 C_CORAL_ALERTA = "#C0392B"   # alerta / error
 C_AMARILLO_ACENTO = "#B8860B"  # acento secundario (dorado apagado)
@@ -108,6 +109,12 @@ def status_label(estado):
         "comprobado": "✅ Comprobado",
         "no_necesario": "🚫 No necesario",
     }.get(estado, estado)
+
+
+def etiqueta_factura(f):
+    """Nombre para mostrar la factura, combinando el archivo/origen con su monto: 'archivo.xml · $1,234.00'."""
+    origen = f.get("Archivo") or f.get("Fuente", "Factura")
+    return f"{origen} · {money(f.get('Monto Total', 0))}"
 
 
 def mes_es(fecha_str):
@@ -265,6 +272,13 @@ def load_bank_statement(file, banco):
         df["Monto"] = pd.to_numeric(df["Cargo/Abono"], errors="coerce").fillna(0.0)
     else:
         df["Monto"] = 0.0
+    df["Monto"] = df["Monto"].astype(float)  # evita numpy.float64/int64 al serializar a JSON
+
+    # normaliza cualquier columna de fecha a texto 'YYYY-MM-DD' plano (evita Timestamps al serializar a JSON
+    # y además se ve más limpio en la interfaz que un datetime completo)
+    for col_fecha in ("Fecha",):
+        if col_fecha in df.columns:
+            df[col_fecha] = pd.to_datetime(df[col_fecha], errors="coerce").dt.strftime("%Y-%m-%d")
 
     df.reset_index(drop=True, inplace=True)
     return df
@@ -322,6 +336,7 @@ def parse_cfdi(xml_bytes, filename):
     return {
         "_id": None,  # se asigna al agregarlo
         "Fuente": f"XML: {filename}",
+        "Archivo": filename,
         "Fecha Factura": fecha_factura,
         "UUID": uuid,
         "Concepto": concepto,
@@ -335,6 +350,27 @@ def parse_cfdi(xml_bytes, filename):
 # ============================================================
 # GUARDADO / CARGA DE SESIÓN EN JSON
 # ============================================================
+def _json_default(obj):
+    """Convierte a tipos nativos cualquier valor que json.dumps no sepa serializar
+    (Timestamps/fechas de pandas, numpy.int64/float64, NaN, etc.)."""
+    if isinstance(obj, (pd.Timestamp, datetime.date, datetime.datetime)):
+        return obj.isoformat()
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return None if np.isnan(obj) else float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    try:
+        if pd.isna(obj):
+            return None
+    except (TypeError, ValueError):
+        pass
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def construir_sesion_json():
     """Empaqueta todo el estado de trabajo (incluyendo el propio estado de cuenta) en un dict serializable."""
     df = st.session_state.bank_df
@@ -383,7 +419,9 @@ with st.expander("💾 Guardar o continuar un avance guardado", expanded=False):
     with colA:
         st.markdown("**Guardar avance actual**")
         if st.session_state.bank_df is not None:
-            sesion_bytes = json.dumps(construir_sesion_json(), ensure_ascii=False, indent=2).encode("utf-8")
+            sesion_bytes = json.dumps(
+                construir_sesion_json(), ensure_ascii=False, indent=2, default=_json_default
+            ).encode("utf-8")
             st.download_button(
                 "📥 Descargar avance (.json)",
                 data=sesion_bytes,
@@ -530,6 +568,54 @@ if df is not None:
             st.rerun()
 
     # ========================================================
+    # 4b. PANEL DE XML SUBIDOS EN LA SESIÓN
+    # ========================================================
+    filas_panel_xml = []
+    for f in st.session_state.pool_facturas:
+        filas_panel_xml.append({
+            "Etiqueta": etiqueta_factura(f),
+            "UUID": f.get("UUID", ""),
+            "RFC Emisor": f.get("RFC Emisor", ""),
+            "Fecha Factura": f.get("Fecha Factura", ""),
+            "Estado": "🟡 En pool (sin asignar)",
+        })
+    for gasto_idx, facs in st.session_state.facturas_por_gasto.items():
+        for f in facs:
+            filas_panel_xml.append({
+                "Etiqueta": etiqueta_factura(f),
+                "UUID": f.get("UUID", ""),
+                "RFC Emisor": f.get("RFC Emisor", ""),
+                "Fecha Factura": f.get("Fecha Factura", ""),
+                "Estado": f"🔵 Asignada al gasto #{gasto_idx} (sin guardar)",
+            })
+    for reg in st.session_state.concatenados:
+        for f in reg["Facturas"]:
+            filas_panel_xml.append({
+                "Etiqueta": etiqueta_factura(f),
+                "UUID": f.get("UUID", ""),
+                "RFC Emisor": f.get("RFC Emisor", ""),
+                "Fecha Factura": f.get("Fecha Factura", ""),
+                "Estado": f"✅ Guardada (gasto #{reg['idx']})",
+            })
+
+    with st.expander(f"📎 Panel de XML subidos en la sesión ({len(filas_panel_xml)})", expanded=False):
+        if not filas_panel_xml:
+            st.caption("Todavía no se ha subido ningún XML en esta sesión.")
+        else:
+            filtro_panel = st.radio(
+                "Filtrar", ["Todos", "En pool", "Asignadas (sin guardar)", "Guardadas"],
+                horizontal=True, key="filtro_panel_xml",
+            )
+            df_panel = pd.DataFrame(filas_panel_xml)
+            if filtro_panel == "En pool":
+                df_panel = df_panel[df_panel["Estado"].str.startswith("🟡")]
+            elif filtro_panel == "Asignadas (sin guardar)":
+                df_panel = df_panel[df_panel["Estado"].str.startswith("🔵")]
+            elif filtro_panel == "Guardadas":
+                df_panel = df_panel[df_panel["Estado"].str.startswith("✅")]
+            st.dataframe(df_panel, use_container_width=True, hide_index=True)
+
+    # ========================================================
     # 4a. EMPAREJAMIENTO AUTOMÁTICO DE FACTURAS (por monto)
     # ========================================================
     if st.session_state.modo_trabajo == "auto":
@@ -580,6 +666,7 @@ if df is not None:
                 "Fecha gasto": str(s["gasto"].get("Fecha", "")),
                 "Descripción gasto": str(s["gasto"].get("Descripción", ""))[:40],
                 "Monto gasto": s["monto_gasto"],
+                "Etiqueta factura": etiqueta_factura(s["factura"]),
                 "Factura (UUID)": s["factura"]["UUID"],
                 "RFC Emisor": s["factura"]["RFC Emisor"],
                 "Monto factura": s["factura"]["Monto Total"],
@@ -595,7 +682,7 @@ if df is not None:
                 df_exactas,
                 use_container_width=True,
                 hide_index=True,
-                disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Factura (UUID)",
+                disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Etiqueta factura", "Factura (UUID)",
                           "RFC Emisor", "Monto factura", "Diferencia"],
                 column_config={
                     "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
@@ -619,7 +706,7 @@ if df is not None:
                 df_revision,
                 use_container_width=True,
                 hide_index=True,
-                disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Factura (UUID)",
+                disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Etiqueta factura", "Factura (UUID)",
                           "RFC Emisor", "Monto factura", "Diferencia"],
                 column_config={
                     "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
@@ -790,7 +877,7 @@ if df is not None:
                     "Quitar factura(s) de la lista",
                     options=[f["_id"] for f in facturas],
                     format_func=lambda fid: next(
-                        f"{f['Fuente']} · {f['UUID']} · {money(f['Monto Total'])}"
+                        f"{etiqueta_factura(f)} · {f['UUID']}"
                         for f in facturas if f["_id"] == fid
                     ),
                     key=f"quitar_{idx}",
