@@ -11,7 +11,7 @@ from io import BytesIO
 C_FONDO = "#5F9EA0"          # fondo general (tema claro)
 C_TARJETA = "#FFFFFF"        # fondo de tarjetas/paneles
 C_BORDE = "#D8DEE4"          # bordes sutiles
-C_TEXTO_OSCURO = "#A9A9A9"   # texto principal sobre fondo claro
+C_TEXTO_OSCURO = "#8B0000"   # texto principal sobre fondo claro
 C_TEAL_VIVO = "#0E5C73"      # acento primario
 C_CORAL_ALERTA = "#C0392B"   # alerta / error
 C_AMARILLO_ACENTO = "#B8860B"  # acento secundario (dorado apagado)
