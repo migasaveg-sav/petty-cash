@@ -44,7 +44,7 @@ from persistence import (
 # negro, para maximizar el contraste texto/fondo). Todos los pares
 # texto/fondo de abajo cumplen al menos 4.5:1 de contraste (WCAG AA).
 # ============================================================
-C_FONDO = "#C7E1EF"            # fondo general de la página (gris FB)
+C_FONDO = "#80BBDB"            # fondo general de la página (gris FB)
 C_TARJETA = "#FFFFFF"          # tarjetas y contenedores
 C_BORDE = "#CED0D4"            # bordes sutiles
 C_TEXTO_OSCURO = "#060E145"     # texto principal, casi negro (20:1 sobre blanco)
