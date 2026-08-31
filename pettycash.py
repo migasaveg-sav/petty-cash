@@ -1,23 +1,59 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import xml.etree.ElementTree as ET
+"""Comprobación de Caja Chica — interfaz Streamlit simplificada.
+
+Toda la lógica pesada (lectura de CFDI, lectura de estados de cuenta, emparejamiento
+automático, catálogos y persistencia) vive en módulos separados y probados con pytest
+(cfdi.py, bank.py, matching.py, catalog.py, persistence.py). Este archivo sólo arma
+la interfaz:
+
+  Barra lateral  -> configuración (banco, archivo, guardar/cargar avance, autoguardado, reset)
+  Pestaña Pendientes      -> tabla + emparejamiento automático + diálogo para trabajar un gasto
+  Pestaña Comprobados     -> historial editable (revertir)
+  Pestaña No necesarios   -> historial editable (revertir)
+  Pestaña Resumen         -> checksum de cuadre + descarga de Excel
+
+Para simplificar el flujo de trabajo, el panel gigante que antes vivía siempre visible
+en la página ahora se abre como una ventana modal (st.dialog) sólo cuando el usuario
+elige un gasto específico para trabajar.
+"""
+from __future__ import annotations
+
 import datetime
 import json
-from io import BytesIO
+
+import pandas as pd
+import streamlit as st
+
+from bank import BANCOS_DISPONIBLES, BankStatementError, cargar_estado_cuenta, columnas_disponibles_para_mapeo
+from catalog import CATEGORIAS_DEFAULT, MATERIALES_DEFAULT, agregar_valor, catalogo_inicial
+from cfdi import CFDIParseError, parse_cfdi
+from matching import calcular_matches_automaticos, checksum_reconciliacion, resumen_estados
+from persistence import (
+    CAMPOS_SESION,
+    autoguardar,
+    borrar_autoguardado,
+    cargar_sesion_dict,
+    hay_autoguardado,
+    restaurar_autoguardado,
+    sesion_a_json_bytes,
+    sesion_vacia,
+)
 
 # ============================================================
-# PALETA DE COLORES — "Neutro Claro Ejecutivo"
+# PALETA DE COLORES — inspirada en la interfaz de Facebook
+# (fondo gris claro + tarjetas blancas + azul de acento + texto casi
+# negro, para maximizar el contraste texto/fondo). Todos los pares
+# texto/fondo de abajo cumplen al menos 4.5:1 de contraste (WCAG AA).
 # ============================================================
-C_FONDO = "#5F9EA0"          # fondo general (tema claro)
-C_TARJETA = "#FFFFFF"        # fondo de tarjetas/paneles
-C_BORDE = "#D8DEE4"          # bordes sutiles
-C_TEXTO_OSCURO = "#191970"   # texto principal sobre fondo claro
-C_TEAL_VIVO = "#0E5C73"      # acento primario
-C_CORAL_ALERTA = "#C0392B"   # alerta / error
-C_AMARILLO_ACENTO = "#B8860B"  # acento secundario (dorado apagado)
-C_GRIS_NEUTRO = "#8A94A6"    # neutro
-C_VERDE_OK = "#2E8B57"       # éxito
+C_FONDO = "#C7E1EF"            # fondo general de la página (gris FB)
+C_TARJETA = "#FFFFFF"          # tarjetas y contenedores
+C_BORDE = "#CED0D4"            # bordes sutiles
+C_TEXTO_OSCURO = "#060E145"     # texto principal, casi negro (20:1 sobre blanco)
+C_TEXTO_SECUNDARIO = "#060E14" # texto secundario / captions (5.7:1 sobre blanco)
+C_AZUL_FB = "#166FE5"          # azul de acento (encabezados, botones, "comprobado")
+C_CORAL_ALERTA = "#D32F2F"     # rojo de error/alerta
+C_AMARILLO_ACENTO = "#B45309"  # ámbar de advertencia / "no necesario"
+C_GRIS_NEUTRO = "#4B4E53"      # gris oscuro para "pendiente" (8.3:1 con texto blanco)
+C_VERDE_OK = "#1E7B34"         # verde de éxito
 
 st.set_page_config(page_title="Comprobación Caja Chica", layout="wide")
 
@@ -26,28 +62,28 @@ MESES_ES = [
     "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
 ]
 
+AUTOSAVE_DB = "pettycash_autosave.db"
+
 # ============================================================
 # ESTADO DE SESIÓN
 # ============================================================
-def init_state():
-    defaults = {
-        "banco": None,
-        "bank_df": None,
-        "bank_file_id": None,          # (nombre, tamaño) del archivo cargado, para detectar cambios
-        "estados": {},                 # idx -> "pendiente" | "comprobado" | "no_necesario"
-        "facturas_por_gasto": {},      # idx -> lista de dicts (facturas agregadas a ese gasto)
-        "clasificacion_por_gasto": {}, # idx -> {"categoria": str, "material": str}
-        "pool_facturas": [],           # facturas subidas en bloque, aún no asignadas a ningún gasto
-        "modo_trabajo": None,          # None | "auto" | "manual" -- qué panel de trabajo está activo
-        "tabla_expandida": True,       # controla si la tabla de movimientos se muestra o está colapsada
-        "selected_idx": None,
-        "concatenados": [],            # registros finales de gastos comprobados (1 dict por gasto, con lista de facturas)
-        "no_necesarios": [],           # registros de gastos marcados como no necesarios
-        "factura_counter": 0,          # id incremental interno para poder quitar facturas
-    }
+def init_state() -> None:
+    defaults = sesion_vacia()
+    defaults.update({
+        "mostrar_mapeo_manual": False,
+        "confirmar_reset": False,
+        "autoguardado_activo": True,
+        "categorias": None,
+        "materiales": None,
+    })
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    if st.session_state.categorias is None:
+        st.session_state.categorias = catalogo_inicial(CATEGORIAS_DEFAULT)
+    if st.session_state.materiales is None:
+        st.session_state.materiales = catalogo_inicial(MATERIALES_DEFAULT)
+
 
 init_state()
 
@@ -58,8 +94,11 @@ st.markdown(f"""
 <style>
 .stApp {{ background-color: {C_FONDO}; color: {C_TEXTO_OSCURO}; }}
 table, th, td {{ border: 1px solid {C_BORDE}; border-collapse: collapse; padding: 6px; }}
-th {{ background-color: {C_TEAL_VIVO}; color: white; }}
+th {{ background-color: {C_AZUL_FB}; color: white; }}
 td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
+
+[data-testid="stCaptionContainer"], small {{ color: {C_TEXTO_SECUNDARIO} !important; }}
+[data-testid="stExpander"] summary {{ color: {C_TEXTO_OSCURO}; font-weight: 600; }}
 
 .card {{
     background-color: {C_TARJETA}; border-radius: 10px; padding: 16px 20px;
@@ -73,8 +112,8 @@ td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
 .summary-amount {{ font-size: 1.0rem; opacity: 0.95; }}
 
 .box-pendiente {{ background-color: {C_GRIS_NEUTRO}; }}
-.box-comprobado {{ background-color: {C_TEAL_VIVO}; }}
-.box-no-necesario {{ background-color: {C_AMARILLO_ACENTO}; color: {C_TEXTO_OSCURO}; }}
+.box-comprobado {{ background-color: {C_AZUL_FB}; }}
+.box-no-necesario {{ background-color: {C_AMARILLO_ACENTO}; }}
 
 .success-box {{
     background-color: {C_VERDE_OK}; color: white; padding: 10px; border-radius: 6px; font-weight: 600;
@@ -82,12 +121,9 @@ td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
 .error-box {{
     background-color: {C_CORAL_ALERTA}; color: white; padding: 10px; border-radius: 6px; font-weight: 600;
 }}
-.badge {{
-    padding: 2px 10px; border-radius: 12px; font-size: 0.8rem; font-weight: 600;
+.warn-box {{
+    background-color: {C_AMARILLO_ACENTO}; color: white; padding: 8px; border-radius: 6px; font-weight: 600;
 }}
-.badge-pendiente {{ background-color: {C_GRIS_NEUTRO}; color: white; }}
-.badge-comprobado {{ background-color: {C_TEAL_VIVO}; color: white; }}
-.badge-no-necesario {{ background-color: {C_AMARILLO_ACENTO}; color: {C_TEXTO_OSCURO}; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -96,14 +132,14 @@ st.title("💰 Comprobación de Caja Chica")
 # ============================================================
 # HELPERS GENERALES
 # ============================================================
-def money(x):
+def money(x) -> str:
     try:
         return f"${float(x):,.2f}"
     except (ValueError, TypeError):
         return "$0.00"
 
 
-def status_label(estado):
+def status_label(estado: str) -> str:
     return {
         "pendiente": "⏳ Sin comprobar",
         "comprobado": "✅ Comprobado",
@@ -111,14 +147,13 @@ def status_label(estado):
     }.get(estado, estado)
 
 
-def etiqueta_factura(f):
-    """Nombre para mostrar la factura, combinando el archivo/origen con su monto: 'archivo.xml · $1,234.00'."""
+def etiqueta_factura(f: dict) -> str:
     origen = f.get("Archivo") or f.get("Fuente", "Factura")
-    return f"{origen} · {money(f.get('Monto Total', 0))}"
+    marca = " ⚠️" if f.get("Incompleta") else ""
+    return f"{origen} · {money(f.get('Monto Total', 0))}{marca}"
 
 
-def mes_es(fecha_str):
-    """Convierte 'YYYY-MM-DD' (o similar) a 'Mes YYYY' en español."""
+def mes_es(fecha_str) -> str:
     try:
         f = pd.to_datetime(fecha_str)
         return f"{MESES_ES[f.month - 1]} {f.year}"
@@ -126,14 +161,14 @@ def mes_es(fecha_str):
         return ""
 
 
-def next_factura_id():
+def next_factura_id() -> int:
     st.session_state.factura_counter += 1
     return st.session_state.factura_counter
 
 
-def uuids_consumidos():
-    """UUIDs que ya quedaron asignados a un gasto (pendiente de guardar o ya guardado en el historial).
-    NO incluye el pool automático: una factura ahí sigue disponible, no está 'usada' todavía."""
+def uuids_consumidos() -> set:
+    """UUIDs ya asignados a un gasto (pendiente de guardar o ya guardado en historial).
+    No incluye el pool automático: una factura ahí sigue disponible."""
     usados = set()
     for facs in st.session_state.facturas_por_gasto.values():
         usados.update(f["UUID"] for f in facs if f["UUID"] != "SIN-UUID")
@@ -142,495 +177,459 @@ def uuids_consumidos():
     return usados
 
 
-# Umbral para sugerir una coincidencia "a revisar": diferencia absoluta menor a este
-# monto O menor al 30% del gasto (lo que sea más laxo), para no inundar de sugerencias
-# absurdas cuando el monto no se parece en nada.
-UMBRAL_SUGERENCIA_ABS = 500.0
-UMBRAL_SUGERENCIA_PCT = 0.30
+def _state_snapshot() -> dict:
+    snap = {"bank_df": st.session_state.get("bank_df")}
+    for campo in CAMPOS_SESION:
+        snap[campo] = st.session_state.get(campo)
+    return snap
 
 
-def calcular_matches_automaticos(df, pendientes_idx, pool):
-    """
-    Para cada gasto pendiente (sin facturas ya asignadas manualmente), busca la factura
-    disponible en el pool cuyo monto esté más cercano. Regresa una lista de sugerencias:
-    {"idx": ..., "gasto": Series, "monto_gasto": float, "factura": dict, "diferencia": float, "tipo": "exacto"|"revision"}
-    Cada factura del pool se sugiere para un solo gasto (primero en llegar, primero en servir).
-    """
-    usados_pool_ids = set()
-    sugerencias = []
-    for idx in pendientes_idx:
-        if st.session_state.facturas_por_gasto.get(idx):
-            continue  # este gasto ya tiene facturas asignadas manualmente, se deja fuera del auto-match
-        gasto = df.loc[idx]
-        monto_gasto = float(gasto["Monto"])
-        disponibles = [f for f in pool if f["_id"] not in usados_pool_ids]
-        if not disponibles:
-            continue
-        mejor = min(disponibles, key=lambda f: abs(monto_gasto - f["Monto Total"]))
-        diferencia = round(monto_gasto - mejor["Monto Total"], 2)
-        umbral = max(UMBRAL_SUGERENCIA_ABS, monto_gasto * UMBRAL_SUGERENCIA_PCT)
-        if abs(diferencia) <= umbral:
-            tipo = "exacto" if abs(diferencia) <= 0.01 else "revision"
-            sugerencias.append({
-                "idx": idx, "gasto": gasto, "monto_gasto": monto_gasto,
-                "factura": mejor, "diferencia": diferencia, "tipo": tipo,
-            })
-            usados_pool_ids.add(mejor["_id"])
-    return sugerencias
+def _restaurar_estado(restaurado: dict) -> None:
+    for k, v in restaurado.items():
+        st.session_state[k] = v
 
 
-def aplicar_sugerencias(df_editado, sugerencias):
-    """Aplica las filas marcadas como 'Incluir' de la tabla editada: crea el registro comprobado,
-    actualiza estados y libera la factura del pool."""
-    aplicados = 0
-    for (_, fila), sug in zip(df_editado.iterrows(), sugerencias):
-        if not bool(fila["Incluir"]):
-            continue
-        idx = sug["idx"]
-        gasto = sug["gasto"]
-        factura = sug["factura"]
-        categoria = fila.get("Categoría", "")
-        material = fila.get("Material", "")
-        st.session_state.concatenados.append({
+def _autoguardar_si_activo() -> None:
+    if st.session_state.autoguardado_activo and st.session_state.bank_df is not None:
+        try:
+            autoguardar(_state_snapshot(), db_path=AUTOSAVE_DB)
+        except Exception:
+            pass  # el autoguardado nunca debe interrumpir el flujo del usuario
+
+
+def _selector_catalogo(label: str, catalogo_key: str, valor_actual: str, widget_key: str) -> str:
+    """Selectbox respaldado por un catálogo en session_state, con opción de agregar
+    un valor nuevo sin salir del flujo."""
+    catalogo = st.session_state[catalogo_key]
+    agregar_opcion = "➕ Agregar nueva…"
+    opciones = [*catalogo, agregar_opcion]
+    idx_actual = catalogo.index(valor_actual) if valor_actual in catalogo else 0
+    elegido = st.selectbox(label, opciones, index=idx_actual, key=widget_key)
+    if elegido == agregar_opcion:
+        nuevo = st.text_input(f"Nuevo valor para «{label}»", key=f"{widget_key}_nuevo")
+        if st.button(f"Agregar a {label}", key=f"{widget_key}_btn_agregar", disabled=not nuevo.strip()):
+            st.session_state[catalogo_key] = agregar_valor(catalogo, nuevo)
+            st.rerun()
+        return valor_actual or ""
+    return elegido
+
+
+def _dialog(title: str, width: str = "large"):
+    """Decorador de diálogo modal, con respaldo si st.dialog no existe en la versión
+    de Streamlit instalada (se muestra inline en vez de en modal)."""
+    if hasattr(st, "dialog"):
+        return st.dialog(title, width=width)
+
+    def decorador(func):
+        def envoltura(*args, **kwargs):
+            st.divider()
+            st.markdown(f"#### {title}")
+            func(*args, **kwargs)
+        return envoltura
+    return decorador
+
+
+# ============================================================
+# BARRA LATERAL — CONFIGURACIÓN
+# ============================================================
+with st.sidebar:
+    st.markdown("## ⚙️ Configuración")
+
+    banco_idx = BANCOS_DISPONIBLES.index(st.session_state.banco) if st.session_state.banco in BANCOS_DISPONIBLES else 0
+    banco = st.selectbox("Banco", BANCOS_DISPONIBLES, index=banco_idx, key="banco_select")
+
+    file = st.file_uploader("Estado de cuenta (CSV o Excel)", type=["csv", "xlsx"], key="bank_uploader")
+
+    st.session_state.mostrar_mapeo_manual = st.checkbox(
+        "Mapear columnas manualmente",
+        value=st.session_state.mostrar_mapeo_manual,
+        help="Actívalo si el banco elegido no detecta bien las columnas del archivo.",
+    )
+
+    mapeo_manual = None
+    if st.session_state.mostrar_mapeo_manual and file is not None:
+        try:
+            cols_disponibles = columnas_disponibles_para_mapeo(file.getvalue(), file.name)
+            st.caption("Asigna cada columna del archivo a un campo estándar.")
+            estandar_opciones = ["(ignorar)", "Fecha", "Descripción", "Cargo", "Abono", "Importe", "Saldo"]
+            mapeo_manual = {}
+            for col in cols_disponibles:
+                elegido = st.selectbox(str(col), estandar_opciones, key=f"map_{col}")
+                if elegido != "(ignorar)":
+                    mapeo_manual[col] = elegido
+        except BankStatementError as e:
+            st.error(str(e))
+
+    if file is not None:
+        mapeo_hash = tuple(sorted(mapeo_manual.items())) if mapeo_manual else None
+        file_key = (file.name, file.size, banco, mapeo_hash)
+        if st.session_state.bank_file_id != file_key:
+            try:
+                nuevo_df = cargar_estado_cuenta(file.getvalue(), file.name, banco, mapeo_manual)
+            except BankStatementError as e:
+                st.error(f"No se pudo cargar el estado de cuenta: {e}")
+                nuevo_df = None
+            if nuevo_df is not None:
+                st.session_state.bank_df = nuevo_df
+                st.session_state.banco = banco
+                st.session_state.bank_file_id = file_key
+                st.session_state.estados = {i: "pendiente" for i in nuevo_df.index}
+                st.session_state.facturas_por_gasto = {}
+                st.session_state.clasificacion_por_gasto = {}
+                st.session_state.pool_facturas = []
+                st.session_state.concatenados = []
+                st.session_state.no_necesarios = []
+                st.success(f"Estado de cuenta cargado: {len(nuevo_df)} movimiento(s).")
+                _autoguardar_si_activo()
+                st.rerun()
+
+    st.divider()
+    st.markdown("### 💾 Guardar / continuar avance")
+    if st.session_state.bank_df is not None:
+        st.download_button(
+            "📥 Descargar avance (.json)",
+            data=sesion_a_json_bytes(_state_snapshot()),
+            file_name=f"avance_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    else:
+        st.caption("Sube un estado de cuenta primero para poder guardar avance.")
+
+    json_file = st.file_uploader("Subir avance (.json)", type=["json"], key="json_uploader")
+    if json_file is not None and st.button("Cargar este avance", use_container_width=True):
+        try:
+            data = json.loads(json_file.getvalue().decode("utf-8"))
+            _restaurar_estado(cargar_sesion_dict(data))
+            if st.session_state.categorias is None:
+                st.session_state.categorias = catalogo_inicial(CATEGORIAS_DEFAULT)
+            if st.session_state.materiales is None:
+                st.session_state.materiales = catalogo_inicial(MATERIALES_DEFAULT)
+            st.success("Avance restaurado correctamente.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"No se pudo leer el archivo de avance: {e}")
+
+    st.session_state.autoguardado_activo = st.toggle(
+        "Autoguardado local activo",
+        value=st.session_state.autoguardado_activo,
+        help="Guarda una copia de tu avance en este servidor con cada cambio, como red "
+             "de seguridad si cierras el navegador sin descargar el .json.",
+    )
+    autosave_info = hay_autoguardado(AUTOSAVE_DB)
+    if autosave_info:
+        st.caption(f"Último autoguardado: {autosave_info['guardado_en']}")
+        if st.session_state.bank_df is None and st.button("♻️ Restaurar último autoguardado", use_container_width=True):
+            restaurado = restaurar_autoguardado(AUTOSAVE_DB)
+            if restaurado:
+                _restaurar_estado(restaurado)
+                st.success("Avance restaurado desde autoguardado.")
+                st.rerun()
+
+    st.divider()
+    if st.session_state.confirmar_reset:
+        st.warning("¿Seguro que quieres borrar todo el avance actual? Esta acción no se puede deshacer.")
+        rc1, rc2 = st.columns(2)
+        if rc1.button("Sí, borrar todo", type="primary", use_container_width=True):
+            vacio = sesion_vacia()
+            _restaurar_estado(vacio)
+            st.session_state.categorias = catalogo_inicial(CATEGORIAS_DEFAULT)
+            st.session_state.materiales = catalogo_inicial(MATERIALES_DEFAULT)
+            st.session_state.confirmar_reset = False
+            borrar_autoguardado(AUTOSAVE_DB)
+            st.rerun()
+        if rc2.button("Cancelar", use_container_width=True):
+            st.session_state.confirmar_reset = False
+            st.rerun()
+    else:
+        if st.button("🔄 Reiniciar todo", use_container_width=True):
+            st.session_state.confirmar_reset = True
+            st.rerun()
+
+# ============================================================
+# CONTENIDO PRINCIPAL
+# ============================================================
+df = st.session_state.bank_df
+if df is None:
+    st.info("👈 Sube un estado de cuenta desde el panel de la izquierda para comenzar.")
+    st.stop()
+
+resumen = resumen_estados(df, st.session_state.estados)
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.markdown(f"""
+    <div class="summary-box box-pendiente">
+        <div class="summary-title">⏳ SIN COMPROBAR</div>
+        <div class="summary-count">{resumen['pendiente']['count']}</div>
+        <div class="summary-amount">{money(resumen['pendiente']['total'])}</div>
+    </div>""", unsafe_allow_html=True)
+with col2:
+    st.markdown(f"""
+    <div class="summary-box box-comprobado">
+        <div class="summary-title">✅ COMPROBADOS</div>
+        <div class="summary-count">{resumen['comprobado']['count']}</div>
+        <div class="summary-amount">{money(resumen['comprobado']['total'])}</div>
+    </div>""", unsafe_allow_html=True)
+with col3:
+    st.markdown(f"""
+    <div class="summary-box box-no-necesario">
+        <div class="summary-title">🚫 NO NECESARIOS</div>
+        <div class="summary-count">{resumen['no_necesario']['count']}</div>
+        <div class="summary-amount">{money(resumen['no_necesario']['total'])}</div>
+    </div>""", unsafe_allow_html=True)
+
+total_monto = sum(r["total"] for r in resumen.values())
+monto_resuelto = resumen["comprobado"]["total"] + resumen["no_necesario"]["total"]
+if total_monto > 0:
+    st.progress(min(monto_resuelto / total_monto, 1.0),
+                text=f"Avance por monto: {money(monto_resuelto)} de {money(total_monto)}")
+
+st.write("")
+
+tab_pendientes, tab_comprobados, tab_no_necesarios, tab_resumen = st.tabs(
+    ["⏳ Pendientes", "✅ Comprobados", "🚫 No necesarios", "📊 Resumen y descarga"]
+)
+
+
+# ============================================================
+# DIÁLOGO: TRABAJAR UN GASTO
+# ============================================================
+@_dialog("📌 Trabajar gasto")
+def dialog_trabajar_gasto(idx: int) -> None:
+    df_actual = st.session_state.bank_df
+    if idx not in df_actual.index or st.session_state.estados.get(idx) != "pendiente":
+        st.info("Este gasto ya no está pendiente (puede que ya se haya comprobado en otra pestaña).")
+        return
+
+    gasto = df_actual.loc[idx]
+    monto_gasto = abs(float(gasto["Monto"]))
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Fecha", str(gasto.get("Fecha", "")))
+    c2.metric("Descripción", str(gasto.get("Descripción", ""))[:30])
+    c3.metric("Monto", money(monto_gasto))
+
+    if st.button("🚫 Marcar como no necesario", key=f"btn_no_necesario_{idx}"):
+        clasif_actual = st.session_state.clasificacion_por_gasto.get(idx, {"categoria": "", "material": ""})
+        st.session_state.no_necesarios.append({
             "idx": idx,
             "Fecha Estado": gasto.get("Fecha", ""),
             "Descripción Estado": gasto.get("Descripción", ""),
-            "Monto Estado": sug["monto_gasto"],
-            "Categoria": categoria,
-            "Material": material,
-            "Facturas": [factura],
+            "Monto Estado": monto_gasto,
+            "Categoria": clasif_actual.get("categoria", ""),
+            "Material": clasif_actual.get("material", ""),
         })
-        st.session_state.estados[idx] = "comprobado"
+        st.session_state.estados[idx] = "no_necesario"
         st.session_state.facturas_por_gasto.pop(idx, None)
-        st.session_state.clasificacion_por_gasto[idx] = {"categoria": categoria, "material": material}
-        st.session_state.pool_facturas = [f for f in st.session_state.pool_facturas if f["_id"] != factura["_id"]]
-        aplicados += 1
-    return aplicados
+        _autoguardar_si_activo()
+        st.rerun()
 
-
-def sums_por_estado(df):
-    resumen = {}
-    for estado in ["pendiente", "comprobado", "no_necesario"]:
-        idxs = [i for i, e in st.session_state.estados.items() if e == estado]
-        sub = df.loc[df.index.intersection(idxs)]
-        resumen[estado] = {"count": len(idxs), "total": sub["Monto"].sum() if not sub.empty else 0.0}
-    return resumen
-
-
-# ============================================================
-# CARGA DE ESTADO DE CUENTA
-# ============================================================
-def get_column_map(banco):
-    """Regresa el diccionario de wildcards -> nombre estándar para cada banco."""
-    if banco == "Santander 011-1":
-        return {
-            "fecha": "Fecha",
-            "descripción": "Descripción",
-            "concepto": "Concepto",
-            "referencia": "Descripción",
-            "cargo": "Cargo/Abono",
-            "abono": "Cargo/Abono",
-            "importe": "Importe",
-            "monto": "Importe",
-            "valor": "Importe",
-            "saldo": "Saldo",
-        }
-    return None
-
-
-def load_bank_statement(file, banco):
-    if file.name.endswith(".csv"):
-        df_raw = pd.read_csv(file)
-    else:
-        df_raw = pd.read_excel(file)
-
-    columnas_deseadas = get_column_map(banco)
-    if columnas_deseadas is None:
-        st.warning(f"Las columnas para {banco} aún no están definidas. Por favor proporciónalas.")
-        st.stop()
-
-    rename_map = {}
-    selected_original = []
-    for col in df_raw.columns:
-        col_lower = col.lower()
-        for wildcard, nombre_estandar in columnas_deseadas.items():
-            if wildcard in col_lower and nombre_estandar not in rename_map.values():
-                rename_map[col] = nombre_estandar
-                selected_original.append(col)
-                break
-
-    if not selected_original:
-        st.error("No se encontraron columnas que coincidan con los nombres esperados.")
-        st.stop()
-
-    df = df_raw[selected_original].rename(columns=rename_map).copy()
-
-    # columna de monto a usar para comparar contra las facturas
-    if "Importe" in df.columns:
-        df["Monto"] = pd.to_numeric(df["Importe"], errors="coerce").fillna(0.0)
-    elif "Cargo/Abono" in df.columns:
-        df["Monto"] = pd.to_numeric(df["Cargo/Abono"], errors="coerce").fillna(0.0)
-    else:
-        df["Monto"] = 0.0
-    df["Monto"] = df["Monto"].astype(float)  # evita numpy.float64/int64 al serializar a JSON
-
-    # normaliza cualquier columna de fecha a texto 'YYYY-MM-DD' plano (evita Timestamps al serializar a JSON
-    # y además se ve más limpio en la interfaz que un datetime completo)
-    for col_fecha in ("Fecha",):
-        if col_fecha in df.columns:
-            df[col_fecha] = pd.to_datetime(df[col_fecha], errors="coerce").dt.strftime("%Y-%m-%d")
-
-    df.reset_index(drop=True, inplace=True)
-    return df
-
-
-# ============================================================
-# LECTURA DE CFDI (soporta 3.3 y 4.0)
-# ============================================================
-CFDI_NS_POR_VERSION = {
-    "3": "http://www.sat.gob.mx/cfd/3",
-    "4": "http://www.sat.gob.mx/cfd/4",
-}
-TFD_NS = "http://www.sat.gob.mx/TimbreFiscalDigital"
-
-
-def detectar_namespace_cfdi(root):
-    """Detecta si el XML es CFDI 3.3 o 4.0 a partir del namespace del root."""
-    tag = root.tag
-    if tag.startswith("{"):
-        uri = tag[1:tag.index("}")]
-        if uri == CFDI_NS_POR_VERSION["3"]:
-            return CFDI_NS_POR_VERSION["3"]
-        if uri == CFDI_NS_POR_VERSION["4"]:
-            return CFDI_NS_POR_VERSION["4"]
-        return uri  # namespace no reconocido, se intenta igual
-    return CFDI_NS_POR_VERSION["4"]  # fallback
-
-
-def parse_cfdi(xml_bytes, filename):
-    """Extrae los datos relevantes de un CFDI (3.3 o 4.0). Regresa dict o lanza excepción."""
-    tree = ET.parse(BytesIO(xml_bytes))
-    root = tree.getroot()
-
-    cfdi_uri = detectar_namespace_cfdi(root)
-    ns = {"cfdi": cfdi_uri, "tfd": TFD_NS}
-
-    total = float(root.get("Total", 0) or 0)
-    fecha_factura = root.get("Fecha", str(datetime.date.today()))[:10]
-    timbre = root.find(".//tfd:TimbreFiscalDigital", ns)
-    uuid = timbre.get("UUID") if timbre is not None else "SIN-UUID"
-    emisor = root.find(".//cfdi:Emisor", ns)
-    rfc_emisor = emisor.get("Rfc", "N/A") if emisor is not None else "N/A"
-    razon_social = emisor.get("Nombre", "N/A") if emisor is not None else "N/A"
-
-    valor_iva = 0.0
-    impuestos_globales = root.find("./cfdi:Impuestos", ns)
-    if impuestos_globales is not None:
-        for traslado in impuestos_globales.findall(".//cfdi:Traslados/cfdi:Traslado", ns):
-            if traslado.get("Impuesto") == "002":
-                valor_iva += float(traslado.get("Importe", 0) or 0)
-
-    conceptos = root.findall(".//cfdi:Concepto", ns)
-    concepto = "; ".join(c.get("Descripcion", "") for c in conceptos) if conceptos else "N/A"
-
-    return {
-        "_id": None,  # se asigna al agregarlo
-        "Fuente": f"XML: {filename}",
-        "Archivo": filename,
-        "Fecha Factura": fecha_factura,
-        "UUID": uuid,
-        "Concepto": concepto,
-        "RFC Emisor": rfc_emisor,
-        "Razón Social": razon_social,
-        "IVA": valor_iva,
-        "Monto Total": total,
-    }
-
-
-# ============================================================
-# GUARDADO / CARGA DE SESIÓN EN JSON
-# ============================================================
-def _json_default(obj):
-    """Convierte a tipos nativos cualquier valor que json.dumps no sepa serializar
-    (Timestamps/fechas de pandas, numpy.int64/float64, NaN, etc.)."""
-    if isinstance(obj, (pd.Timestamp, datetime.date, datetime.datetime)):
-        return obj.isoformat()
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return None if np.isnan(obj) else float(obj)
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    try:
-        if pd.isna(obj):
-            return None
-    except (TypeError, ValueError):
-        pass
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
-
-
-def construir_sesion_json():
-    """Empaqueta todo el estado de trabajo (incluyendo el propio estado de cuenta) en un dict serializable."""
-    df = st.session_state.bank_df
-    return {
-        "version": 1,
-        "guardado_en": datetime.datetime.now().isoformat(timespec="seconds"),
-        "banco": st.session_state.banco,
-        "bank_file_id": st.session_state.bank_file_id,
-        "bank_df": df.to_dict(orient="split") if df is not None else None,
-        "estados": {str(k): v for k, v in st.session_state.estados.items()},
-        "facturas_por_gasto": {str(k): v for k, v in st.session_state.facturas_por_gasto.items()},
-        "clasificacion_por_gasto": {str(k): v for k, v in st.session_state.clasificacion_por_gasto.items()},
-        "concatenados": st.session_state.concatenados,
-        "no_necesarios": st.session_state.no_necesarios,
-        "factura_counter": st.session_state.factura_counter,
-    }
-
-
-def cargar_sesion_json(data):
-    """Restaura el estado de la app a partir de un dict previamente generado por construir_sesion_json()."""
-    bank_df_data = data.get("bank_df")
-    if bank_df_data is not None:
-        st.session_state.bank_df = pd.DataFrame(
-            data=bank_df_data["data"],
-            columns=bank_df_data["columns"],
-            index=bank_df_data["index"],
+    st.markdown("##### 🏷️ Clasificación del gasto")
+    clasif = st.session_state.clasificacion_por_gasto.setdefault(idx, {"categoria": "", "material": ""})
+    cl1, cl2 = st.columns(2)
+    with cl1:
+        clasif["categoria"] = _selector_catalogo(
+            "Categoría", "categorias", clasif.get("categoria", ""), f"categoria_{idx}"
         )
-    else:
-        st.session_state.bank_df = None
+    with cl2:
+        clasif["material"] = _selector_catalogo(
+            "Material", "materiales", clasif.get("material", ""), f"material_{idx}"
+        )
 
-    st.session_state.banco = data.get("banco")
-    st.session_state.bank_file_id = tuple(data["bank_file_id"]) if data.get("bank_file_id") else None
-    st.session_state.estados = {int(k): v for k, v in data.get("estados", {}).items()}
-    st.session_state.facturas_por_gasto = {int(k): v for k, v in data.get("facturas_por_gasto", {}).items()}
-    st.session_state.clasificacion_por_gasto = {
-        int(k): v for k, v in data.get("clasificacion_por_gasto", {}).items()
-    }
-    st.session_state.concatenados = data.get("concatenados", [])
-    st.session_state.no_necesarios = data.get("no_necesarios", [])
-    st.session_state.factura_counter = data.get("factura_counter", 0)
-    st.session_state.selected_idx = None
+    st.session_state.facturas_por_gasto.setdefault(idx, [])
+    facturas = st.session_state.facturas_por_gasto[idx]
 
+    st.markdown("##### 📎 Agregar facturas (XML de CFDI, puedes subir varias a la vez)")
+    xml_files = st.file_uploader(
+        "Sube uno o más XML (CFDI 3.3 o 4.0)", type=["xml"], accept_multiple_files=True,
+        key=f"xml_uploader_{idx}",
+    )
+    if xml_files:
+        uuids_existentes = {f["UUID"] for f in facturas} | uuids_consumidos()
+        agregadas, duplicadas, con_error = 0, 0, 0
+        for xf in xml_files:
+            try:
+                datos = parse_cfdi(xf.getvalue(), xf.name)
+            except CFDIParseError as e:
+                st.error(f"No se pudo leer el XML '{xf.name}': {e}")
+                con_error += 1
+                continue
+            if datos["UUID"] in uuids_existentes and datos["UUID"] != "SIN-UUID":
+                duplicadas += 1
+                continue
+            datos["_id"] = next_factura_id()
+            facturas.append(datos)
+            uuids_existentes.add(datos["UUID"])
+            if datos["UUID"] != "SIN-UUID":
+                st.session_state.pool_facturas = [
+                    f for f in st.session_state.pool_facturas if f["UUID"] != datos["UUID"]
+                ]
+            if datos.get("Incompleta"):
+                st.warning(f"'{xf.name}' se agregó, pero está incompleta: {'; '.join(datos['Advertencias'])}")
+            agregadas += 1
+        if agregadas:
+            st.success(f"{agregadas} factura(s) agregada(s).")
+        if duplicadas:
+            st.info(f"{duplicadas} factura(s) ya estaban en uso y se omitieron.")
 
-with st.expander("💾 Guardar o continuar un avance guardado", expanded=False):
-    colA, colB = st.columns(2)
-    with colA:
-        st.markdown("**Guardar avance actual**")
-        if st.session_state.bank_df is not None:
-            sesion_bytes = json.dumps(
-                construir_sesion_json(), ensure_ascii=False, indent=2, default=_json_default
-            ).encode("utf-8")
-            st.download_button(
-                "📥 Descargar avance (.json)",
-                data=sesion_bytes,
-                file_name=f"avance_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.json",
-                mime="application/json",
-            )
-        else:
-            st.caption("Sube un estado de cuenta primero para poder guardar avance.")
-    with colB:
-        st.markdown("**Continuar un avance guardado**")
-        json_file = st.file_uploader("Sube tu archivo .json de avance", type=["json"], key="json_uploader")
-        if json_file is not None:
-            if st.button("Cargar este avance", key="btn_cargar_json"):
-                try:
-                    data = json.loads(json_file.getvalue().decode("utf-8"))
-                    cargar_sesion_json(data)
-                    st.success("Avance restaurado correctamente.")
+    with st.expander("✏️ Agregar comprobación manual (sin XML)"):
+        with st.form(f"manual_form_{idx}", clear_on_submit=True):
+            mf_fecha = st.date_input("Fecha de factura", value=datetime.date.today())
+            mf_uuid = st.text_input("UUID (opcional)")
+            mf_concepto = st.text_input("Concepto/Descripción")
+            mf_rfc = st.text_input("RFC Emisor")
+            mf_razon = st.text_input("Razón Social Emisor")
+            mf_iva = st.number_input("IVA", min_value=0.0, format="%.2f")
+            mf_monto = st.number_input("Monto Total", min_value=0.0, format="%.2f")
+            guardar_manual = st.form_submit_button("Agregar factura manual")
+            if guardar_manual:
+                uuid_final = mf_uuid.strip() or "SIN-UUID"
+                usados = {f["UUID"] for f in facturas} | uuids_consumidos()
+                if uuid_final != "SIN-UUID" and uuid_final in usados:
+                    st.error(f"El UUID '{uuid_final}' ya está en uso en otro gasto o factura de esta sesión.")
+                else:
+                    facturas.append({
+                        "_id": next_factura_id(),
+                        "Fuente": "Manual",
+                        "Archivo": "Manual",
+                        "Fecha Factura": str(mf_fecha),
+                        "UUID": uuid_final,
+                        "Concepto": mf_concepto,
+                        "RFC Emisor": mf_rfc,
+                        "Razón Social": mf_razon,
+                        "IVA": mf_iva,
+                        "IVA Retenido": 0.0,
+                        "ISR Retenido": 0.0,
+                        "Monto Total": mf_monto,
+                        "Incompleta": False,
+                        "Advertencias": [],
+                    })
                     st.rerun()
-                except Exception as e:
-                    st.error(f"No se pudo leer el archivo de avance: {e}")
 
-# ============================================================
-# 1. SELECCIÓN DE BANCO Y CARGA DE ESTADO DE CUENTA
-# ============================================================
-banco = st.selectbox(
-    "Selecciona el banco del estado de cuenta",
-    ["Santander 011-1", "BBVA 4546", "ICBC XXXX", "BBVA XXXX"],
-)
-
-file = st.file_uploader("Sube el estado de cuenta", type=["csv", "xlsx"])
-
-if file:
-    file_id = (file.name, file.size)
-    if st.session_state.bank_file_id != file_id:
-        # archivo nuevo o distinto: reconstruir todo el estado
-        st.session_state.bank_df = load_bank_statement(file, banco)
-        st.session_state.banco = banco
-        st.session_state.bank_file_id = file_id
-        st.session_state.estados = {i: "pendiente" for i in st.session_state.bank_df.index}
-        st.session_state.facturas_por_gasto = {}
-        st.session_state.clasificacion_por_gasto = {}
-        st.session_state.selected_idx = None
-        st.session_state.concatenados = []
-        st.session_state.no_necesarios = []
-
-df = st.session_state.bank_df
-
-# ============================================================
-# 2. PANEL RESUMEN SUPERIOR
-# ============================================================
-if df is not None:
-    resumen = sums_por_estado(df)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown(f"""
-        <div class="summary-box box-pendiente">
-            <div class="summary-title">⏳ GASTOS SIN COMPROBAR</div>
-            <div class="summary-count">{resumen['pendiente']['count']}</div>
-            <div class="summary-amount">{money(resumen['pendiente']['total'])}</div>
-        </div>""", unsafe_allow_html=True)
-    with col2:
-        st.markdown(f"""
-        <div class="summary-box box-comprobado">
-            <div class="summary-title">✅ GASTOS COMPROBADOS</div>
-            <div class="summary-count">{resumen['comprobado']['count']}</div>
-            <div class="summary-amount">{money(resumen['comprobado']['total'])}</div>
-        </div>""", unsafe_allow_html=True)
-    with col3:
-        st.markdown(f"""
-        <div class="summary-box box-no-necesario">
-            <div class="summary-title">🚫 GASTOS NO NECESARIOS</div>
-            <div class="summary-count">{resumen['no_necesario']['count']}</div>
-            <div class="summary-amount">{money(resumen['no_necesario']['total'])}</div>
-        </div>""", unsafe_allow_html=True)
-
-    total_monto = sum(r["total"] for r in resumen.values())
-    monto_resuelto = resumen["comprobado"]["total"] + resumen["no_necesario"]["total"]
-    if total_monto > 0:
-        st.progress(min(monto_resuelto / total_monto, 1.0),
-                    text=f"Avance por monto: {money(monto_resuelto)} de {money(total_monto)}")
-
-    st.write("")
-
-    # ========================================================
-    # 3. TABLA DE MOVIMIENTOS
-    # ========================================================
-    col_titulo, col_toggle = st.columns([10, 1])
-    with col_titulo:
-        st.subheader("Movimientos del estado de cuenta")
-    with col_toggle:
-        st.write("")
-        if st.button("🔽" if st.session_state.tabla_expandida else "▶️", key="btn_toggle_tabla",
-                     help="Colapsar/expandir la tabla"):
-            st.session_state.tabla_expandida = not st.session_state.tabla_expandida
-            st.rerun()
-
-    if st.session_state.tabla_expandida:
-        filtro_estado = st.radio(
-            "Filtrar por estado",
-            ["Todos", "Sin comprobar", "Comprobados", "No necesarios"],
-            horizontal=True,
-        )
-        busqueda = st.text_input("🔎 Buscar por descripción")
-
-        df_vista = df.copy()
-        df_vista["Estado"] = df_vista.index.map(lambda i: status_label(st.session_state.estados.get(i, "pendiente")))
-
-        if filtro_estado == "Sin comprobar":
-            df_vista = df_vista[df_vista.index.map(lambda i: st.session_state.estados.get(i) == "pendiente")]
-        elif filtro_estado == "Comprobados":
-            df_vista = df_vista[df_vista.index.map(lambda i: st.session_state.estados.get(i) == "comprobado")]
-        elif filtro_estado == "No necesarios":
-            df_vista = df_vista[df_vista.index.map(lambda i: st.session_state.estados.get(i) == "no_necesario")]
-
-        if busqueda and "Descripción" in df_vista.columns:
-            df_vista = df_vista[df_vista["Descripción"].astype(str).str.contains(busqueda, case=False, na=False)]
-
-        columnas_mostrar = [c for c in ["Estado", "Fecha", "Descripción", "Monto", "Saldo"] if c in df_vista.columns]
+    st.markdown("##### 🧾 Facturas agregadas a este gasto")
+    if facturas:
+        df_facturas = pd.DataFrame(facturas)
+        columnas_mostrar = [c for c in [
+            "Archivo", "UUID", "RFC Emisor", "Concepto", "Fecha Factura", "IVA", "Monto Total", "Incompleta"
+        ] if c in df_facturas.columns]
         st.dataframe(
-            df_vista[columnas_mostrar].style.format({"Monto": money, "Saldo": money}),
-            use_container_width=True,
-            hide_index=False,
+            df_facturas[columnas_mostrar].style.format({"IVA": money, "Monto Total": money}),
+            use_container_width=True, hide_index=True,
         )
-    else:
-        st.caption("Tabla colapsada. Da clic en ▶️ para volver a mostrarla.")
-
-    # ========================================================
-    # 4. SELECTOR DE MODO DE TRABAJO
-    # ========================================================
-    st.divider()
-    st.subheader("¿Cómo quieres trabajar?")
-    mb1, mb2 = st.columns(2)
-    with mb1:
-        if st.button("🔁 Emparejamiento automático de facturas", key="btn_modo_auto",
-                      type="primary" if st.session_state.modo_trabajo == "auto" else "secondary",
-                      use_container_width=True):
-            st.session_state.modo_trabajo = "auto"
-            st.rerun()
-    with mb2:
-        if st.button("✍️ Trabajar un gasto a la vez", key="btn_modo_manual",
-                      type="primary" if st.session_state.modo_trabajo == "manual" else "secondary",
-                      use_container_width=True):
-            st.session_state.modo_trabajo = "manual"
-            st.rerun()
-
-    # ========================================================
-    # 4b. PANEL DE XML SUBIDOS EN LA SESIÓN
-    # ========================================================
-    filas_panel_xml = []
-    for f in st.session_state.pool_facturas:
-        filas_panel_xml.append({
-            "Etiqueta": etiqueta_factura(f),
-            "UUID": f.get("UUID", ""),
-            "RFC Emisor": f.get("RFC Emisor", ""),
-            "Fecha Factura": f.get("Fecha Factura", ""),
-            "Estado": "🟡 En pool (sin asignar)",
-        })
-    for gasto_idx, facs in st.session_state.facturas_por_gasto.items():
-        for f in facs:
-            filas_panel_xml.append({
-                "Etiqueta": etiqueta_factura(f),
-                "UUID": f.get("UUID", ""),
-                "RFC Emisor": f.get("RFC Emisor", ""),
-                "Fecha Factura": f.get("Fecha Factura", ""),
-                "Estado": f"🔵 Asignada al gasto #{gasto_idx} (sin guardar)",
-            })
-    for reg in st.session_state.concatenados:
-        for f in reg["Facturas"]:
-            filas_panel_xml.append({
-                "Etiqueta": etiqueta_factura(f),
-                "UUID": f.get("UUID", ""),
-                "RFC Emisor": f.get("RFC Emisor", ""),
-                "Fecha Factura": f.get("Fecha Factura", ""),
-                "Estado": f"✅ Guardada (gasto #{reg['idx']})",
-            })
-
-    with st.expander(f"📎 Panel de XML subidos en la sesión ({len(filas_panel_xml)})", expanded=False):
-        if not filas_panel_xml:
-            st.caption("Todavía no se ha subido ningún XML en esta sesión.")
-        else:
-            filtro_panel = st.radio(
-                "Filtrar", ["Todos", "En pool", "Asignadas (sin guardar)", "Guardadas"],
-                horizontal=True, key="filtro_panel_xml",
+        if any(f.get("Incompleta") for f in facturas):
+            st.markdown(
+                "<div class='warn-box'>⚠️ Alguna factura de esta lista quedó incompleta al leer el XML "
+                "(revisa la columna 'Incompleta').</div>", unsafe_allow_html=True,
             )
-            df_panel = pd.DataFrame(filas_panel_xml)
-            if filtro_panel == "En pool":
-                df_panel = df_panel[df_panel["Estado"].str.startswith("🟡")]
-            elif filtro_panel == "Asignadas (sin guardar)":
-                df_panel = df_panel[df_panel["Estado"].str.startswith("🔵")]
-            elif filtro_panel == "Guardadas":
-                df_panel = df_panel[df_panel["Estado"].str.startswith("✅")]
-            st.dataframe(df_panel, use_container_width=True, hide_index=True)
 
-    # ========================================================
-    # 4a. EMPAREJAMIENTO AUTOMÁTICO DE FACTURAS (por monto)
-    # ========================================================
-    if st.session_state.modo_trabajo == "auto":
-        st.subheader("🔁 Emparejamiento automático de facturas")
-        st.caption(
-            "Sube todos los XML del periodo de una vez. Buscamos, para cada gasto pendiente, "
-            "la factura cuyo monto esté más cercano. Las diferencias de 1 centavo o menos se pueden "
-            "aplicar directo; el resto necesita tu validación antes de agregarse."
+        quitar = st.multiselect(
+            "Quitar factura(s) de la lista",
+            options=[f["_id"] for f in facturas],
+            format_func=lambda fid: next(f"{etiqueta_factura(f)} · {f['UUID']}" for f in facturas if f["_id"] == fid),
+            key=f"quitar_{idx}",
         )
+        if quitar and st.button("Quitar seleccionadas", key=f"btn_quitar_{idx}"):
+            st.session_state.facturas_por_gasto[idx] = [f for f in facturas if f["_id"] not in quitar]
+            st.rerun()
 
+        suma_facturas = sum(f["Monto Total"] for f in facturas)
+        diferencia = round(monto_gasto - suma_facturas, 2)
+
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric("Monto del gasto", money(monto_gasto))
+        cc2.metric("Suma de facturas", money(suma_facturas))
+        cc3.metric("Diferencia", money(diferencia))
+
+        if abs(diferencia) <= 0.01:
+            st.markdown(
+                f"<div class='success-box'>✅ Gasto comprobado correctamente. Diferencia: {money(diferencia)}</div>",
+                unsafe_allow_html=True,
+            )
+            if st.button("➕ Añadir a los registros", key=f"btn_guardar_{idx}", type="primary"):
+                st.session_state.concatenados.append({
+                    "idx": idx,
+                    "Fecha Estado": gasto.get("Fecha", ""),
+                    "Descripción Estado": gasto.get("Descripción", ""),
+                    "Monto Estado": monto_gasto,
+                    "Categoria": clasif.get("categoria", ""),
+                    "Material": clasif.get("material", ""),
+                    "Facturas": facturas,
+                })
+                st.session_state.estados[idx] = "comprobado"
+                st.session_state.facturas_por_gasto.pop(idx, None)
+                st.success("Gasto añadido a los registros.")
+                _autoguardar_si_activo()
+                st.rerun()
+        else:
+            st.markdown(
+                f"<div class='error-box'>❌ La suma de facturas no coincide con el gasto. "
+                f"Diferencia: {money(diferencia)}</div>", unsafe_allow_html=True,
+            )
+    else:
+        st.caption("Aún no has agregado ninguna factura para este gasto.")
+
+
+# ============================================================
+# PESTAÑA: PENDIENTES
+# ============================================================
+with tab_pendientes:
+    pendientes_idx = [i for i, e in st.session_state.estados.items() if e == "pendiente"]
+
+    if not pendientes_idx:
+        st.success("No hay gastos pendientes por comprobar. 🎉")
+    else:
+        busqueda = st.text_input("🔎 Buscar por descripción", key="busqueda_pendientes")
+        df_pend = df.loc[df.index.intersection(pendientes_idx)].copy()
+        if busqueda and "Descripción" in df_pend.columns:
+            df_pend = df_pend[df_pend["Descripción"].astype(str).str.contains(busqueda, case=False, na=False)]
+
+        columnas_mostrar = [c for c in ["Fecha", "Descripción", "Monto", "Saldo"] if c in df_pend.columns]
+
+        with st.expander(f"📋 Gastos pendientes ({len(df_pend)})", expanded=True):
+            if df_pend.empty:
+                st.caption("Ningún gasto coincide con la búsqueda.")
+            else:
+                st.caption("👆 Haz clic en una fila para seleccionar el gasto y luego pulsa «Abrir».")
+                evento_tabla = st.dataframe(
+                    df_pend[columnas_mostrar],
+                    use_container_width=True,
+                    hide_index=False,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="tabla_pendientes",
+                    column_config={
+                        "Monto": st.column_config.NumberColumn("Monto", format="$%.2f"),
+                        "Saldo": st.column_config.NumberColumn("Saldo", format="$%.2f"),
+                    },
+                )
+                filas_sel = evento_tabla.selection.rows if evento_tabla and evento_tabla.selection else []
+
+                if filas_sel:
+                    idx_sel = df_pend.index[filas_sel[0]]
+                    desc_sel = str(df_pend.loc[idx_sel, "Descripción"])[:50] if "Descripción" in df_pend.columns else ""
+                    fecha_sel = df_pend.loc[idx_sel, "Fecha"] if "Fecha" in df_pend.columns else ""
+                    col_info, col_btn = st.columns([4, 1])
+                    with col_info:
+                        st.markdown(
+                            f"**Seleccionado:** #{idx_sel} · {fecha_sel} · {desc_sel} · "
+                            f"{money(abs(df_pend.loc[idx_sel, 'Monto']))}"
+                        )
+                    with col_btn:
+                        if st.button("🔍 Abrir", use_container_width=True, key="btn_abrir_gasto", type="primary"):
+                            dialog_trabajar_gasto(idx_sel)
+                else:
+                    st.caption("Ningún gasto seleccionado todavía.")
+
+    st.divider()
+    with st.expander("🔁 Emparejamiento automático de facturas", expanded=False):
+        st.caption(
+            "Sube todos los XML del periodo de una vez. Para cada gasto pendiente sin facturas ya "
+            "asignadas manualmente, buscamos la factura disponible cuyo monto esté más cercano. Las "
+            "diferencias de 1 centavo o menos se pueden aplicar directo; el resto necesita tu validación."
+        )
         xml_bulk = st.file_uploader(
             "Sube uno o más XML de CFDI para emparejar automáticamente",
-            type=["xml"],
-            accept_multiple_files=True,
-            key="xml_bulk_uploader",
+            type=["xml"], accept_multiple_files=True, key="xml_bulk_uploader",
         )
         if xml_bulk:
             usados = uuids_consumidos() | {f["UUID"] for f in st.session_state.pool_facturas if f["UUID"] != "SIN-UUID"}
@@ -638,8 +637,8 @@ if df is not None:
             for xf in xml_bulk:
                 try:
                     datos = parse_cfdi(xf.getvalue(), xf.name)
-                except Exception as e:
-                    st.error(f"No se pudo leer el XML '{xf.name}': {type(e).__name__}: {e}")
+                except CFDIParseError as e:
+                    st.error(f"No se pudo leer el XML '{xf.name}': {e}")
                     con_error += 1
                     continue
                 if datos["UUID"] in usados and datos["UUID"] != "SIN-UUID":
@@ -655,7 +654,9 @@ if df is not None:
                 st.info(f"{duplicadas} factura(s) ya estaban en uso en la sesión y se omitieron.")
 
         pendientes_idx_match = [i for i, e in st.session_state.estados.items() if e == "pendiente"]
-        sugerencias = calcular_matches_automaticos(df, pendientes_idx_match, st.session_state.pool_facturas)
+        sugerencias = calcular_matches_automaticos(
+            df, pendientes_idx_match, st.session_state.pool_facturas, st.session_state.facturas_por_gasto
+        )
         sug_exactas = [s for s in sugerencias if s["tipo"] == "exacto"]
         sug_revision = [s for s in sugerencias if s["tipo"] == "revision"]
         ids_sugeridos = {s["factura"]["_id"] for s in sugerencias}
@@ -675,281 +676,219 @@ if df is not None:
                 "Material": "",
             } for s in lista_sugerencias])
 
+        def _aplicar_sugerencias_editadas(df_editado, sugerencias_orig):
+            filas = df_editado.reset_index(drop=True)
+            if len(filas) != len(sugerencias_orig):
+                st.error("La tabla de sugerencias cambió inesperadamente; vuelve a intentarlo.")
+                return 0
+            aplicados = 0
+            for i in range(len(sugerencias_orig)):
+                fila = filas.iloc[i]
+                if not bool(fila["Incluir"]):
+                    continue
+                sug = sugerencias_orig[i]
+                idx = sug["idx"]
+                factura = sug["factura"]
+                categoria = fila.get("Categoría", "") or ""
+                material = fila.get("Material", "") or ""
+                st.session_state.concatenados.append({
+                    "idx": idx,
+                    "Fecha Estado": sug["gasto"].get("Fecha", ""),
+                    "Descripción Estado": sug["gasto"].get("Descripción", ""),
+                    "Monto Estado": sug["monto_gasto"],
+                    "Categoria": categoria,
+                    "Material": material,
+                    "Facturas": [factura],
+                })
+                st.session_state.estados[idx] = "comprobado"
+                st.session_state.facturas_por_gasto.pop(idx, None)
+                st.session_state.clasificacion_por_gasto[idx] = {"categoria": categoria, "material": material}
+                st.session_state.pool_facturas = [
+                    f for f in st.session_state.pool_facturas if f["_id"] != factura["_id"]
+                ]
+                aplicados += 1
+            return aplicados
+
+        col_cfg = {
+            "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
+            "Monto factura": st.column_config.NumberColumn(format="$%.2f"),
+            "Diferencia": st.column_config.NumberColumn(format="$%.2f"),
+            "Categoría": st.column_config.SelectboxColumn(options=st.session_state.categorias),
+            "Material": st.column_config.SelectboxColumn(options=st.session_state.materiales),
+        }
+        cols_disabled = ["Fecha gasto", "Descripción gasto", "Monto gasto", "Etiqueta factura",
+                          "Factura (UUID)", "RFC Emisor", "Monto factura", "Diferencia"]
+
         if sug_exactas:
             st.markdown("##### ✅ Coincidencias exactas (diferencia ≤ $0.01)")
-            df_exactas = _df_para_editor(sug_exactas, incluir_default=True)
             edited_exactas = st.data_editor(
-                df_exactas,
-                use_container_width=True,
-                hide_index=True,
-                disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Etiqueta factura", "Factura (UUID)",
-                          "RFC Emisor", "Monto factura", "Diferencia"],
-                column_config={
-                    "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
-                    "Monto factura": st.column_config.NumberColumn(format="$%.2f"),
-                    "Diferencia": st.column_config.NumberColumn(format="$%.2f"),
-                },
-                key="editor_exactas",
+                _df_para_editor(sug_exactas, incluir_default=True), use_container_width=True, hide_index=True,
+                disabled=cols_disabled, column_config=col_cfg, key="editor_exactas",
             )
             if st.button("➕ Aplicar coincidencias exactas seleccionadas", type="primary", key="btn_aplicar_exactas"):
-                n = aplicar_sugerencias(edited_exactas, sug_exactas)
+                n = _aplicar_sugerencias_editadas(edited_exactas, sug_exactas)
                 if n:
                     st.success(f"{n} gasto(s) comprobado(s) automáticamente.")
+                    _autoguardar_si_activo()
                     st.rerun()
                 else:
                     st.warning("No marcaste ninguna fila con 'Incluir'.")
 
         if sug_revision:
             st.markdown("##### 🔍 Requieren tu validación (diferencia mayor a $0.01)")
-            df_revision = _df_para_editor(sug_revision, incluir_default=False)
             edited_revision = st.data_editor(
-                df_revision,
-                use_container_width=True,
-                hide_index=True,
-                disabled=["Fecha gasto", "Descripción gasto", "Monto gasto", "Etiqueta factura", "Factura (UUID)",
-                          "RFC Emisor", "Monto factura", "Diferencia"],
-                column_config={
-                    "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
-                    "Monto factura": st.column_config.NumberColumn(format="$%.2f"),
-                    "Diferencia": st.column_config.NumberColumn(format="$%.2f"),
-                },
-                key="editor_revision",
+                _df_para_editor(sug_revision, incluir_default=False), use_container_width=True, hide_index=True,
+                disabled=cols_disabled, column_config=col_cfg, key="editor_revision",
             )
             if st.button("➕ Aplicar coincidencias validadas", key="btn_aplicar_revision"):
-                n = aplicar_sugerencias(edited_revision, sug_revision)
+                n = _aplicar_sugerencias_editadas(edited_revision, sug_revision)
                 if n:
                     st.success(f"{n} gasto(s) comprobado(s) tras validación.")
+                    _autoguardar_si_activo()
                     st.rerun()
                 else:
                     st.warning("Marca 'Incluir' en las filas que quieras confirmar antes de aplicar.")
 
         pool_sin_match = [f for f in st.session_state.pool_facturas if f["_id"] not in ids_sugeridos]
         if pool_sin_match:
-            with st.expander(f"📥 Facturas sin coincidencia sugerida ({len(pool_sin_match)}) — quedan disponibles para asignar manualmente"):
-                df_pool = pd.DataFrame(pool_sin_match).drop(columns=["_id"])
-                st.dataframe(
-                    df_pool.style.format({"IVA": money, "Monto Total": money}),
-                    use_container_width=True, hide_index=True,
-                )
-                st.caption(
-                    "Estas facturas quedan en espera. Puedes asignarlas manualmente subiéndolas de nuevo "
-                    "en el panel de 'Trabajar un gasto' de abajo (se evita el duplicado automáticamente)."
-                )
-
-    if st.session_state.modo_trabajo == "manual":
-        # ========================================================
-        # 5. SELECCIÓN DE GASTO A TRABAJAR
-        # ========================================================
-        st.divider()
-        st.subheader("Trabajar un gasto")
-
-        pendientes_idx = [i for i, e in st.session_state.estados.items() if e == "pendiente"]
-
-        if not pendientes_idx:
-            st.info("No hay gastos pendientes por comprobar. 🎉")
-        else:
-            opciones = {
-                i: f"#{i} · {df.loc[i, 'Fecha'] if 'Fecha' in df.columns else ''} · "
-                   f"{df.loc[i, 'Descripción'] if 'Descripción' in df.columns else ''} · {money(df.loc[i, 'Monto'])}"
-                for i in pendientes_idx
-            }
-            idx_sel = st.selectbox(
-                "Selecciona el gasto que quieres comprobar",
-                options=list(opciones.keys()),
-                format_func=lambda i: opciones[i],
-                key="selector_gasto",
+            st.caption(f"📥 {len(pool_sin_match)} factura(s) sin coincidencia sugerida — quedan disponibles "
+                       "para asignar manualmente desde 'Abrir' en un gasto pendiente.")
+            df_pool = pd.DataFrame(pool_sin_match).drop(columns=["_id"])
+            cols_pool = [c for c in df_pool.columns if c != "Advertencias"]
+            st.dataframe(
+                df_pool[cols_pool].style.format({"IVA": money, "Monto Total": money}),
+                use_container_width=True, hide_index=True,
             )
-            st.session_state.selected_idx = idx_sel
 
-        # ========================================================
-        # 5. PANEL DE TRABAJO DEL GASTO SELECCIONADO
-        # ========================================================
-        idx = st.session_state.selected_idx
-        if idx is not None and st.session_state.estados.get(idx) == "pendiente":
-            gasto = df.loc[idx]
-            monto_gasto = float(gasto["Monto"])
 
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            col_titulo_gasto, col_no_necesario = st.columns([4, 1])
-            with col_titulo_gasto:
-                st.markdown("#### 📌 Gasto seleccionado")
-            with col_no_necesario:
-                if st.button("🚫 No necesario", key=f"btn_no_necesario_{idx}", use_container_width=True):
-                    clasif_actual = st.session_state.clasificacion_por_gasto.get(idx, {"categoria": "", "material": ""})
-                    st.session_state.no_necesarios.append({
-                        "Fecha Estado": gasto.get("Fecha", ""),
-                        "Descripción Estado": gasto.get("Descripción", ""),
-                        "Monto Estado": monto_gasto,
-                        "Categoria": clasif_actual.get("categoria", ""),
-                        "Material": clasif_actual.get("material", ""),
-                    })
-                    st.session_state.estados[idx] = "no_necesario"
-                    st.session_state.facturas_por_gasto.pop(idx, None)
-                    st.session_state.selected_idx = None
-                    st.info("Gasto marcado como no necesario.")
+# ============================================================
+# PESTAÑA: COMPROBADOS
+# ============================================================
+def _revertir_a_pendiente(idx: int, origen: str) -> None:
+    """Regresa un gasto ya resuelto (comprobado o no necesario) a estado pendiente,
+    para poder corregirlo. Las facturas que tenía asignadas quedan disponibles de
+    nuevo para editarlas en el diálogo del gasto."""
+    if origen == "comprobado":
+        registro = next((r for r in st.session_state.concatenados if r["idx"] == idx), None)
+        if registro is not None:
+            st.session_state.facturas_por_gasto[idx] = registro["Facturas"]
+            st.session_state.concatenados = [r for r in st.session_state.concatenados if r["idx"] != idx]
+    else:
+        st.session_state.no_necesarios = [r for r in st.session_state.no_necesarios if r.get("idx") != idx]
+    st.session_state.estados[idx] = "pendiente"
+    _autoguardar_si_activo()
+
+
+with tab_comprobados:
+    if st.session_state.concatenados:
+        busqueda_c = st.text_input("🔎 Buscar por descripción", key="busqueda_comprobados")
+        registros = st.session_state.concatenados
+        if busqueda_c:
+            registros = [
+                r for r in registros
+                if busqueda_c.lower() in str(r.get("Descripción Estado", "")).lower()
+            ]
+
+        for reg in registros:
+            facturas = reg["Facturas"]
+            suma_facturas = sum(f["Monto Total"] for f in facturas)
+            marca_incompleta = " ⚠️" if any(f.get("Incompleta") for f in facturas) else ""
+            with st.expander(
+                f"#{reg['idx']} · {reg.get('Fecha Estado', '')} · "
+                f"{str(reg.get('Descripción Estado', ''))[:40]} · {money(reg.get('Monto Estado', 0))}{marca_incompleta}"
+            ):
+                st.write(f"**Categoría:** {reg.get('Categoria', '') or '—'}  ·  **Material:** {reg.get('Material', '') or '—'}")
+                df_f = pd.DataFrame(facturas)
+                cols_f = [c for c in ["Archivo", "UUID", "RFC Emisor", "Concepto", "IVA", "Monto Total"] if c in df_f.columns]
+                st.dataframe(df_f[cols_f].style.format({"IVA": money, "Monto Total": money}),
+                             use_container_width=True, hide_index=True)
+                st.caption(f"Suma de facturas: {money(suma_facturas)}  ·  Diferencia: "
+                           f"{money(round(abs(reg.get('Monto Estado', 0)) - suma_facturas, 2))}")
+                if st.button("↩️ Revertir a pendiente", key=f"revertir_comp_{reg['idx']}"):
+                    _revertir_a_pendiente(reg["idx"], "comprobado")
                     st.rerun()
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Fecha", str(gasto.get("Fecha", "")))
-            c2.metric("Descripción", str(gasto.get("Descripción", ""))[:30])
-            c3.metric("Monto", money(monto_gasto))
-            st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.caption("Todavía no hay gastos comprobados.")
 
-            # --- Clasificación (Categoría / Material) ---
-            st.markdown("##### 🏷️ Clasificación del gasto")
-            clasif = st.session_state.clasificacion_por_gasto.setdefault(idx, {"categoria": "", "material": ""})
-            cl1, cl2 = st.columns(2)
-            clasif["categoria"] = cl1.text_input(
-                "Categoría", value=clasif.get("categoria", ""), key=f"categoria_{idx}",
-                help="Por ahora es texto libre. Cuando subas tu catálogo de categorías/material, "
-                     "este campo se volverá una lista desplegable.",
-            )
-            clasif["material"] = cl2.text_input(
-                "Material", value=clasif.get("material", ""), key=f"material_{idx}",
-            )
 
-            st.session_state.facturas_por_gasto.setdefault(idx, [])
-            facturas = st.session_state.facturas_por_gasto[idx]
+# ============================================================
+# PESTAÑA: NO NECESARIOS
+# ============================================================
+with tab_no_necesarios:
+    if st.session_state.no_necesarios:
+        busqueda_n = st.text_input("🔎 Buscar por descripción", key="busqueda_no_necesarios")
+        registros_nn = st.session_state.no_necesarios
+        if busqueda_n:
+            registros_nn = [
+                r for r in registros_nn
+                if busqueda_n.lower() in str(r.get("Descripción Estado", "")).lower()
+            ]
+        df_nn = pd.DataFrame(registros_nn)
+        cols_nn = [c for c in df_nn.columns if c != "idx"]
+        st.dataframe(df_nn[cols_nn].style.format({"Monto Estado": money}), use_container_width=True, hide_index=True)
 
-            # --- Agregar XML(s) ---
-            st.markdown("##### 📎 Agregar facturas (puedes subir varios XML a la vez)")
-            xml_files = st.file_uploader(
-                "Sube uno o más XML de CFDI (soporta versión 3.3 y 4.0)",
-                type=["xml"],
-                accept_multiple_files=True,
-                key=f"xml_uploader_{idx}",
-            )
-            if xml_files:
-                uuids_existentes = {f["UUID"] for f in facturas} | uuids_consumidos()
-                for xf in xml_files:
-                    try:
-                        datos = parse_cfdi(xf.getvalue(), xf.name)
-                    except Exception as e:
-                        st.error(f"No se pudo leer el XML '{xf.name}': {type(e).__name__}: {e}")
-                        continue
-                    if datos["UUID"] in uuids_existentes and datos["UUID"] != "SIN-UUID":
-                        continue  # ya agregada a este u otro gasto, evitar duplicado
-                    datos["_id"] = next_factura_id()
-                    facturas.append(datos)
-                    uuids_existentes.add(datos["UUID"])
-                    # si esta factura ya estaba libre en el pool automático, se retira de ahí
-                    # para que no se sugiera de nuevo en el emparejamiento automático
-                    if datos["UUID"] != "SIN-UUID":
-                        st.session_state.pool_facturas = [
-                            f for f in st.session_state.pool_facturas if f["UUID"] != datos["UUID"]
-                        ]
-
-            # --- Agregar factura manual ---
-            with st.expander("✏️ Agregar comprobación manual (sin XML)"):
-                with st.form(f"manual_form_{idx}", clear_on_submit=True):
-                    mf_fecha = st.date_input("Fecha de factura", value=datetime.date.today())
-                    mf_uuid = st.text_input("UUID")
-                    mf_concepto = st.text_input("Concepto/Descripción")
-                    mf_rfc = st.text_input("RFC Emisor")
-                    mf_razon = st.text_input("Razón Social Emisor")
-                    mf_iva = st.number_input("IVA", min_value=0.0, format="%.2f")
-                    mf_monto = st.number_input("Monto Total", min_value=0.0, format="%.2f")
-                    guardar_manual = st.form_submit_button("Agregar factura manual")
-                    if guardar_manual:
-                        facturas.append({
-                            "_id": next_factura_id(),
-                            "Fuente": "Manual",
-                            "Fecha Factura": str(mf_fecha),
-                            "UUID": mf_uuid or "SIN-UUID",
-                            "Concepto": mf_concepto,
-                            "RFC Emisor": mf_rfc,
-                            "Razón Social": mf_razon,
-                            "IVA": mf_iva,
-                            "Monto Total": mf_monto,
-                        })
-
-            # --- Tabla de facturas agregadas a este gasto ---
-            st.markdown("##### 🧾 Facturas agregadas a este gasto")
-            if facturas:
-                df_facturas = pd.DataFrame(facturas)
-                df_mostrar = df_facturas.drop(columns=["_id"])
-                st.dataframe(
-                    df_mostrar.style.format({"IVA": money, "Monto Total": money}),
-                    use_container_width=True,
-                    hide_index=True,
+        opciones_nn = {r["idx"]: f"#{r['idx']} · {str(r.get('Descripción Estado', ''))[:40]} · {money(r.get('Monto Estado', 0))}"
+                       for r in registros_nn if "idx" in r}
+        if opciones_nn:
+            col_sel_nn, col_btn_nn = st.columns([4, 1])
+            with col_sel_nn:
+                idx_revertir = st.selectbox(
+                    "Gasto a revertir a pendiente", options=list(opciones_nn.keys()),
+                    format_func=lambda i: opciones_nn[i], key="selector_revertir_nn",
                 )
-
-                quitar = st.multiselect(
-                    "Quitar factura(s) de la lista",
-                    options=[f["_id"] for f in facturas],
-                    format_func=lambda fid: next(
-                        f"{etiqueta_factura(f)} · {f['UUID']}"
-                        for f in facturas if f["_id"] == fid
-                    ),
-                    key=f"quitar_{idx}",
-                )
-                if quitar and st.button("Quitar seleccionadas", key=f"btn_quitar_{idx}"):
-                    st.session_state.facturas_por_gasto[idx] = [f for f in facturas if f["_id"] not in quitar]
-                    st.rerun()
-
-                suma_facturas = sum(f["Monto Total"] for f in facturas)
-                diferencia = round(monto_gasto - suma_facturas, 2)
-
+            with col_btn_nn:
                 st.write("")
-                cc1, cc2, cc3 = st.columns(3)
-                cc1.metric("Monto del gasto", money(monto_gasto))
-                cc2.metric("Suma de facturas", money(suma_facturas))
-                cc3.metric("Diferencia", money(diferencia))
+                st.write("")
+                if st.button("↩️ Revertir", use_container_width=True, key="btn_revertir_nn"):
+                    _revertir_a_pendiente(idx_revertir, "no_necesario")
+                    st.rerun()
+    else:
+        st.caption("Todavía no hay gastos marcados como no necesarios.")
 
-                if abs(diferencia) <= 0.01:
-                    st.markdown(
-                        f"<div class='success-box'>✅ Gasto comprobado correctamente. "
-                        f"Diferencia: {money(diferencia)}</div>",
-                        unsafe_allow_html=True,
-                    )
-                    if st.button("➕ Añadir a los registros", key=f"btn_guardar_{idx}", type="primary"):
-                        st.session_state.concatenados.append({
-                            "idx": idx,
-                            "Fecha Estado": gasto.get("Fecha", ""),
-                            "Descripción Estado": gasto.get("Descripción", ""),
-                            "Monto Estado": monto_gasto,
-                            "Categoria": clasif.get("categoria", ""),
-                            "Material": clasif.get("material", ""),
-                            "Facturas": facturas,  # se guarda la lista completa (anidada)
-                        })
-                        st.session_state.estados[idx] = "comprobado"
-                        st.session_state.facturas_por_gasto.pop(idx, None)
-                        st.session_state.selected_idx = None
-                        st.success("Gasto añadido a los registros.")
-                        st.rerun()
-                else:
-                    st.markdown(
-                        f"<div class='error-box'>❌ La suma de facturas no coincide con el gasto. "
-                        f"Diferencia: {money(diferencia)}</div>",
-                        unsafe_allow_html=True,
-                    )
-            else:
-                st.caption("Aún no has agregado ninguna factura para este gasto.")
 
-        # ========================================================
-    # 6. HISTORIAL Y DESCARGA
-    # ========================================================
+# ============================================================
+# PESTAÑA: RESUMEN Y DESCARGA
+# ============================================================
+with tab_resumen:
+    checksum = checksum_reconciliacion(df, st.session_state.estados, st.session_state.concatenados)
+    st.markdown("##### 🧮 Checksum de cuadre")
+    cs1, cs2 = st.columns(2)
+    cs1.metric("Total del estado de cuenta", money(checksum["total_estado_cuenta"]))
+    cs2.metric("Total repartido (pendiente + comprobado + no necesario)", money(checksum["total_por_estados"]))
+    if checksum["cuadra"]:
+        st.markdown("<div class='success-box'>✅ El total cuadra correctamente.</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='error-box'>❌ El total no cuadra. Revisa los movimientos.</div>", unsafe_allow_html=True)
+    if checksum["comprobados_descuadrados"]:
+        st.markdown("<div class='warn-box'>⚠️ Hay gastos comprobados cuya suma de facturas no coincide "
+                     "exactamente con el monto del gasto:</div>", unsafe_allow_html=True)
+        st.dataframe(pd.DataFrame(checksum["comprobados_descuadrados"]), use_container_width=True, hide_index=True)
+
     st.divider()
-    st.subheader("📊 Historial")
-
-    tab_comprobados, tab_no_necesarios = st.tabs(["✅ Comprobados", "🚫 No necesarios"])
+    st.markdown("##### 📥 Descargar Excel del historial")
 
     def fila_excel_comprobado(no, registro):
         facturas = registro["Facturas"]
         suma_facturas = sum(f["Monto Total"] for f in facturas)
-        suma_iva = sum(f["IVA"] for f in facturas)
+        suma_iva = sum(f.get("IVA", 0.0) for f in facturas)
+        suma_iva_ret = sum(f.get("IVA Retenido", 0.0) for f in facturas)
+        suma_isr_ret = sum(f.get("ISR Retenido", 0.0) for f in facturas)
         return {
             "No": no,
             "Bank date": registro["Fecha Estado"],
             "Bank amt": registro["Monto Estado"],
             "Category": registro.get("Categoria", ""),
             "Material": registro.get("Material", ""),
-            "Concepto": "; ".join(f["Concepto"] for f in facturas if f.get("Concepto")),
+            "Concepto": "; ".join(f.get("Concepto", "") for f in facturas if f.get("Concepto")),
             "Month": mes_es(registro["Fecha Estado"]),
-            "UUID date": "; ".join(f["Fecha Factura"] for f in facturas),
-            "UUID": "; ".join(f["UUID"] for f in facturas),
+            "UUID date": "; ".join(f.get("Fecha Factura", "") for f in facturas),
+            "UUID": "; ".join(f.get("UUID", "") for f in facturas),
             "UUID amt": suma_facturas,
             "IVA": suma_iva,
-            "Diff": round(float(registro["Monto Estado"]) - suma_facturas, 2),
+            "IVA Retenido": suma_iva_ret,
+            "ISR Retenido": suma_isr_ret,
+            "Diff": round(abs(float(registro["Monto Estado"])) - suma_facturas, 2),
+            "Incompleta": "Sí" if any(f.get("Incompleta") for f in facturas) else "",
         }
 
     df_comprobados_vista = None
@@ -957,65 +896,47 @@ if df is not None:
         filas = [fila_excel_comprobado(n + 1, r) for n, r in enumerate(st.session_state.concatenados)]
         df_comprobados_vista = pd.DataFrame(filas)
 
-    with tab_comprobados:
-        if df_comprobados_vista is not None:
-            st.dataframe(
-                df_comprobados_vista.style.format(
-                    {"Bank amt": money, "UUID amt": money, "IVA": money, "Diff": money}
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.caption("Todavía no hay gastos comprobados.")
-
-    with tab_no_necesarios:
-        if st.session_state.no_necesarios:
-            df_nn = pd.DataFrame(st.session_state.no_necesarios)
-            st.dataframe(df_nn.style.format({"Monto Estado": money}), use_container_width=True, hide_index=True)
-        else:
-            st.caption("Todavía no hay gastos marcados como no necesarios.")
-
     if st.session_state.concatenados or st.session_state.no_necesarios:
+        from io import BytesIO
         output = BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             workbook = writer.book
+            money_fmt = workbook.add_format({"num_format": "$#,##0.00"})
+            bold_fmt = workbook.add_format({"bold": True})
 
             if df_comprobados_vista is not None:
                 columnas_finales = [
-                    "No", "Bank date", "Bank amt", "Category", "Material", "Concepto",
-                    "Month", "UUID date", "UUID", "UUID amt", "IVA", "Diff",
+                    "No", "Bank date", "Bank amt", "Category", "Material", "Concepto", "Month",
+                    "UUID date", "UUID", "UUID amt", "IVA", "IVA Retenido", "ISR Retenido", "Diff", "Incompleta",
                 ]
                 df_export = df_comprobados_vista[columnas_finales].copy()
                 df_export.to_excel(writer, index=False, sheet_name="Comprobados")
-
                 ws = writer.sheets["Comprobados"]
-                money_fmt = workbook.add_format({"num_format": "$#,##0.00"})
-                bold_fmt = workbook.add_format({"bold": True})
-                for col_name in ["Bank amt", "UUID amt", "IVA", "Diff"]:
+                for col_name in ["Bank amt", "UUID amt", "IVA", "IVA Retenido", "ISR Retenido", "Diff"]:
                     col_idx = columnas_finales.index(col_name)
                     ws.set_column(col_idx, col_idx, 14, money_fmt)
-
-                # Fila de totales
-                fila_total = len(df_export) + 1  # +1 por encabezado (0-index -> siguiente fila)
+                fila_total = len(df_export) + 1
                 ws.write(fila_total, 0, "Total", bold_fmt)
-                for col_name in ["Bank amt", "UUID amt", "IVA", "Diff"]:
+                for col_name in ["Bank amt", "UUID amt", "IVA", "IVA Retenido", "ISR Retenido", "Diff"]:
                     col_idx = columnas_finales.index(col_name)
                     ws.write(fila_total, col_idx, df_export[col_name].sum(), money_fmt)
-
-                ws.set_column(1, 1, 12)   # Bank date
-                ws.set_column(3, 4, 16)   # Category, Material
-                ws.set_column(5, 5, 30)   # Concepto
-                ws.set_column(7, 8, 22)   # UUID date, UUID
+                ws.set_column(1, 1, 12)
+                ws.set_column(3, 4, 16)
+                ws.set_column(5, 5, 30)
+                ws.set_column(7, 8, 22)
 
             if st.session_state.no_necesarios:
-                pd.DataFrame(st.session_state.no_necesarios).to_excel(
+                cols_nn_export = [c for c in ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
+                                   if c in pd.DataFrame(st.session_state.no_necesarios).columns]
+                pd.DataFrame(st.session_state.no_necesarios)[cols_nn_export].to_excel(
                     writer, index=False, sheet_name="No necesarios"
                 )
 
-            df_pend = df[df.index.map(lambda i: st.session_state.estados.get(i) == "pendiente")]
-            if not df_pend.empty:
-                df_pend.drop(columns=["Monto"], errors="ignore").to_excel(writer, index=False, sheet_name="Sin comprobar")
+            df_pend_export = df[df.index.map(lambda i: st.session_state.estados.get(i) == "pendiente")]
+            if not df_pend_export.empty:
+                # a diferencia de la versión original, aquí SÍ se conserva la columna 'Monto'
+                # (antes se perdía en el Excel exportado).
+                df_pend_export.to_excel(writer, index=False, sheet_name="Sin comprobar")
 
         st.download_button(
             label="📥 Descargar Excel (todo el historial)",
@@ -1023,5 +944,5 @@ if df is not None:
             file_name=f"Comprobaciones_{datetime.datetime.now().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-else:
-    st.info("Sube un estado de cuenta para comenzar.")
+    else:
+        st.caption("Todavía no hay nada que exportar.")
