@@ -44,11 +44,11 @@ from persistence import (
 # negro, para maximizar el contraste texto/fondo). Todos los pares
 # texto/fondo de abajo cumplen al menos 4.5:1 de contraste (WCAG AA).
 # ============================================================
-C_FONDO = "#80BBDB"            # fondo general de la página (gris FB)
+C_FONDO = "#F0F2F5"            # fondo general de la página (gris FB)
 C_TARJETA = "#FFFFFF"          # tarjetas y contenedores
 C_BORDE = "#CED0D4"            # bordes sutiles
-C_TEXTO_OSCURO = "#060E145"     # texto principal, casi negro (20:1 sobre blanco)
-C_TEXTO_SECUNDARIO = "#060E14" # texto secundario / captions (5.7:1 sobre blanco)
+C_TEXTO_OSCURO = "#050505"     # texto principal, casi negro (20:1 sobre blanco)
+C_TEXTO_SECUNDARIO = "#65676B" # texto secundario / captions (5.7:1 sobre blanco)
 C_AZUL_FB = "#166FE5"          # azul de acento (encabezados, botones, "comprobado")
 C_CORAL_ALERTA = "#D32F2F"     # rojo de error/alerta
 C_AMARILLO_ACENTO = "#B45309"  # ámbar de advertencia / "no necesario"
@@ -195,6 +195,26 @@ def _autoguardar_si_activo() -> None:
             autoguardar(_state_snapshot(), db_path=AUTOSAVE_DB)
         except Exception:
             pass  # el autoguardado nunca debe interrumpir el flujo del usuario
+
+
+def _limpiar_seleccion_tabla_pendientes() -> None:
+    """Limpia la fila seleccionada en la tabla de 'Pendientes'.
+
+    Streamlit recuerda qué fila (por posición) estaba seleccionada entre una
+    ejecución y otra. Si un gasto se comprueba, se marca como no necesario o se
+    revierte, la tabla de pendientes cambia de tamaño y esa posición guardada ya
+    no corresponde al mismo gasto (o directamente deja de existir). Hay que
+    llamar esto justo antes de cualquier `st.rerun()` que pueda cambiar el
+    conjunto de gastos pendientes, para no dejar seleccionada la fila
+    equivocada -o provocar un IndexError-.
+
+    No basta con borrar la clave del `session_state`: el widget de tabla
+    conserva su propio estado visual en el navegador (el checkbox marcado
+    puede seguir viéndose aunque el backend ya no tenga nada seleccionado).
+    Por eso cambiamos también la versión, que forma parte de la `key` del
+    widget, para que Streamlit lo vuelva a montar desde cero."""
+    st.session_state.pop("tabla_pendientes", None)
+    st.session_state.tabla_pendientes_version = st.session_state.get("tabla_pendientes_version", 0) + 1
 
 
 def _selector_catalogo(label: str, catalogo_key: str, valor_actual: str, widget_key: str) -> str:
@@ -421,6 +441,7 @@ def dialog_trabajar_gasto(idx: int) -> None:
         })
         st.session_state.estados[idx] = "no_necesario"
         st.session_state.facturas_por_gasto.pop(idx, None)
+        _limpiar_seleccion_tabla_pendientes()
         _autoguardar_si_activo()
         st.rerun()
 
@@ -558,6 +579,7 @@ def dialog_trabajar_gasto(idx: int) -> None:
                 st.session_state.estados[idx] = "comprobado"
                 st.session_state.facturas_por_gasto.pop(idx, None)
                 st.success("Gasto añadido a los registros.")
+                _limpiar_seleccion_tabla_pendientes()
                 _autoguardar_si_activo()
                 st.rerun()
         else:
@@ -590,19 +612,24 @@ with tab_pendientes:
                 st.caption("Ningún gasto coincide con la búsqueda.")
             else:
                 st.caption("👆 Haz clic en una fila para seleccionar el gasto y luego pulsa «Abrir».")
+                version_tabla = st.session_state.get("tabla_pendientes_version", 0)
                 evento_tabla = st.dataframe(
                     df_pend[columnas_mostrar],
                     use_container_width=True,
                     hide_index=False,
                     on_select="rerun",
                     selection_mode="single-row",
-                    key="tabla_pendientes",
+                    key=f"tabla_pendientes_{version_tabla}",
                     column_config={
                         "Monto": st.column_config.NumberColumn("Monto", format="$%.2f"),
                         "Saldo": st.column_config.NumberColumn("Saldo", format="$%.2f"),
                     },
                 )
                 filas_sel = evento_tabla.selection.rows if evento_tabla and evento_tabla.selection else []
+                # Red de seguridad: si la tabla cambió de tamaño entre una ejecución y
+                # otra (se comprobó/revirtió un gasto, cambió la búsqueda, etc.) la
+                # posición seleccionada puede haber quedado obsoleta o fuera de rango.
+                filas_sel = [f for f in filas_sel if 0 <= f < len(df_pend)]
 
                 if filas_sel:
                     idx_sel = df_pend.index[filas_sel[0]]
@@ -729,6 +756,7 @@ with tab_pendientes:
                 n = _aplicar_sugerencias_editadas(edited_exactas, sug_exactas)
                 if n:
                     st.success(f"{n} gasto(s) comprobado(s) automáticamente.")
+                    _limpiar_seleccion_tabla_pendientes()
                     _autoguardar_si_activo()
                     st.rerun()
                 else:
@@ -744,6 +772,7 @@ with tab_pendientes:
                 n = _aplicar_sugerencias_editadas(edited_revision, sug_revision)
                 if n:
                     st.success(f"{n} gasto(s) comprobado(s) tras validación.")
+                    _limpiar_seleccion_tabla_pendientes()
                     _autoguardar_si_activo()
                     st.rerun()
                 else:
@@ -776,6 +805,7 @@ def _revertir_a_pendiente(idx: int, origen: str) -> None:
     else:
         st.session_state.no_necesarios = [r for r in st.session_state.no_necesarios if r.get("idx") != idx]
     st.session_state.estados[idx] = "pendiente"
+    _limpiar_seleccion_tabla_pendientes()
     _autoguardar_si_activo()
 
 
