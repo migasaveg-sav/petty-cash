@@ -25,6 +25,7 @@ import streamlit as st
 
 from bank import BANCOS_DISPONIBLES, BankStatementError, cargar_estado_cuenta, columnas_disponibles_para_mapeo
 from catalog import (
+    APLICANTES_DEFAULT,
     CATEGORIAS_DEFAULT,
     CATEGORIAS_SOLICITUD_DEFAULT,
     EMPLEADOS_DEFAULT,
@@ -51,16 +52,17 @@ from persistence import (
 # negro, para maximizar el contraste texto/fondo). Todos los pares
 # texto/fondo de abajo cumplen al menos 4.5:1 de contraste (WCAG AA).
 # ============================================================
-C_FONDO = "#ADD8E6"            # fondo general de la página (gris FB)
+C_FONDO = "#F0F2F5"            # fondo general de la página (gris FB)
 C_TARJETA = "#FFFFFF"          # tarjetas y contenedores
 C_BORDE = "#CED0D4"            # bordes sutiles
 C_TEXTO_OSCURO = "#050505"     # texto principal, casi negro (20:1 sobre blanco)
-C_TEXTO_SECUNDARIO = "#050505" # texto secundario / captions (5.7:1 sobre blanco)
+C_TEXTO_SECUNDARIO = "#65676B" # texto secundario / captions (5.7:1 sobre blanco)
 C_AZUL_FB = "#166FE5"          # azul de acento (encabezados, botones, "comprobado")
 C_CORAL_ALERTA = "#D32F2F"     # rojo de error/alerta
 C_AMARILLO_ACENTO = "#B45309"  # ámbar de advertencia / "no necesario"
 C_GRIS_NEUTRO = "#4B4E53"      # gris oscuro para "pendiente" (8.3:1 con texto blanco)
 C_VERDE_OK = "#1E7B34"         # verde de éxito
+C_BITACORA_HEADER = "#DC143C"  # encabezado de la bitácora de solicitudes (pedido por el usuario)
 
 st.set_page_config(page_title="Comprobación Caja Chica", layout="wide")
 
@@ -84,6 +86,7 @@ def init_state() -> None:
         "materiales": None,
         "categorias_solicitud": None,
         "empleados": None,
+        "aplicantes": None,
         "solicitud_en_proceso": None,
         "solicitud_form_version": 0,
     })
@@ -98,6 +101,8 @@ def init_state() -> None:
         st.session_state.categorias_solicitud = catalogo_inicial(CATEGORIAS_SOLICITUD_DEFAULT)
     if st.session_state.empleados is None:
         st.session_state.empleados = catalogo_inicial(EMPLEADOS_DEFAULT)
+    if st.session_state.aplicantes is None:
+        st.session_state.aplicantes = catalogo_inicial(APLICANTES_DEFAULT)
 
 
 init_state()
@@ -138,6 +143,10 @@ td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
 }}
 .warn-box {{
     background-color: {C_AMARILLO_ACENTO}; color: white; padding: 8px; border-radius: 6px; font-weight: 600;
+}}
+.bitacora-header {{
+    background-color: {C_BITACORA_HEADER}; color: white; font-weight: 700; padding: 6px 4px;
+    border-radius: 4px; text-align: center; font-size: 0.85rem;
 }}
 </style>
 """, unsafe_allow_html=True)
@@ -357,6 +366,8 @@ with st.sidebar:
                 st.session_state.categorias_solicitud = catalogo_inicial(CATEGORIAS_SOLICITUD_DEFAULT)
             if st.session_state.empleados is None:
                 st.session_state.empleados = catalogo_inicial(EMPLEADOS_DEFAULT)
+            if st.session_state.aplicantes is None:
+                st.session_state.aplicantes = catalogo_inicial(APLICANTES_DEFAULT)
             st.session_state.solicitud_en_proceso = None
             st.success("Avance restaurado correctamente.")
             st.rerun()
@@ -384,6 +395,8 @@ with st.sidebar:
                     st.session_state.categorias_solicitud = catalogo_inicial(CATEGORIAS_SOLICITUD_DEFAULT)
                 if st.session_state.empleados is None:
                     st.session_state.empleados = catalogo_inicial(EMPLEADOS_DEFAULT)
+                if st.session_state.aplicantes is None:
+                    st.session_state.aplicantes = catalogo_inicial(APLICANTES_DEFAULT)
                 st.session_state.solicitud_en_proceso = None
                 st.success("Avance restaurado desde autoguardado.")
                 st.rerun()
@@ -399,6 +412,7 @@ with st.sidebar:
             st.session_state.materiales = catalogo_inicial(MATERIALES_DEFAULT)
             st.session_state.categorias_solicitud = catalogo_inicial(CATEGORIAS_SOLICITUD_DEFAULT)
             st.session_state.empleados = catalogo_inicial(EMPLEADOS_DEFAULT)
+            st.session_state.aplicantes = catalogo_inicial(APLICANTES_DEFAULT)
             st.session_state.solicitud_en_proceso = None
             st.session_state.confirmar_reset = False
             borrar_autoguardado(AUTOSAVE_DB)
@@ -663,26 +677,92 @@ def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
 # ============================================================
 # BITÁCORA DE SOLICITUDES DE REEMBOLSO
 # ============================================================
-def _solicitudes_a_excel_bytes(solicitudes: list[dict]) -> bytes:
+def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -> bytes:
+    """Arma el Excel de la bitácora con el mismo formato/orden que la hoja "Details"
+    de la plantilla que compartió el usuario: columnas A-I son los datos de la
+    solicitud (No., Applicant, Category, Description, Linked Request No., Number of
+    Days, Total Number of People, Employee Name y Material -en el lugar donde la
+    plantilla trae "Client Name", que aquí no se captura-); columnas J-N son la
+    comprobación ya hecha con el estado de cuenta/XML (Payment Date, Expense Outflow
+    Amt, No., CFDI Folio, Reimbursement Cap); se agrega una columna "Status" extra al
+    final para saber de un vistazo qué sigue pendiente."""
     from io import BytesIO
 
-    columnas = [
-        "No", "Applicant", "Category", "Material", "Employee Name", "Request Number",
-        "Number of Days", "Number of People", "estado", "idx_vinculado",
+    def _comprobacion_de(sol: dict) -> dict:
+        if sol.get("estado") != "comprobado" or sol.get("idx_vinculado") is None:
+            return {}
+        registro = next((c for c in concatenados if c["idx"] == sol["idx_vinculado"]), None)
+        if registro is None:
+            return {}
+        facturas = registro.get("Facturas", [])
+        suma_facturas = round(sum(f.get("Monto Total", 0) or 0 for f in facturas), 2)
+        return {
+            "Payment Date": registro.get("Fecha Estado", ""),
+            "Expense Outflow Amt": round(abs(float(registro.get("Monto Estado", 0) or 0)), 2),
+            "Bank No": sol["No"],
+            "CFDI Folio": "; ".join(f.get("UUID", "") for f in facturas if f.get("UUID")),
+            "Reimbursement Cap": suma_facturas,
+        }
+
+    columnas_df = [
+        "No", "Applicant", "Category", "Description", "Linked Request No",
+        "Number of Days", "Total Number of People", "Employee Name", "Material",
+        "Payment Date", "Expense Outflow Amt", "Bank No", "CFDI Folio",
+        "Reimbursement Cap", "Status",
     ]
-    if solicitudes:
-        df_sol = pd.DataFrame(solicitudes)[columnas]
-    else:
-        df_sol = pd.DataFrame(columns=columnas)
-    df_sol = df_sol.rename(columns={"estado": "Status", "idx_vinculado": "Linked Bank Row"})
-    df_sol["Status"] = df_sol["Status"].map({"pendiente": "Pendiente", "comprobado": "Comprobado"}).fillna(df_sol["Status"])
+    encabezados = [
+        "No.", "Applicant", "Category", "Description", "Linked Request No.",
+        "Number of Days", "Total Number of People", "Employee Name", "Material",
+        "Payment Date", "Expense Outflow Amt", "No.", "CFDI Folio",
+        "Reimbursement Cap (With IVA)", "Status",
+    ]
+
+    filas = []
+    for sol in solicitudes:
+        fila = {
+            "No": sol.get("No"),
+            "Applicant": sol.get("Applicant") or "",
+            "Category": sol.get("Category") or "",
+            "Description": sol.get("Description") or "",
+            "Linked Request No": sol.get("Request Number") or "",
+            "Number of Days": sol.get("Number of Days", 0),
+            "Total Number of People": sol.get("Number of People", 0),
+            "Employee Name": sol.get("Employee Name") or "",
+            "Material": sol.get("Material") or "",
+            "Status": "Comprobado" if sol.get("estado") == "comprobado" else "Pendiente",
+        }
+        fila.update(_comprobacion_de(sol))
+        filas.append(fila)
+
+    df = pd.DataFrame(filas, columns=columnas_df) if filas else pd.DataFrame(columns=columnas_df)
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df_sol.to_excel(writer, index=False, sheet_name="Solicitudes")
-        ws = writer.sheets["Solicitudes"]
-        ws.set_column(1, 4, 20)
-        ws.set_column(5, 5, 18)
+        df.to_excel(writer, index=False, sheet_name="Details")
+        workbook = writer.book
+        ws = writer.sheets["Details"]
+
+        header_fmt = workbook.add_format({
+            "bold": True, "bg_color": C_BITACORA_HEADER, "font_color": "white",
+            "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True,
+        })
+        for col_idx, titulo in enumerate(encabezados):
+            ws.write(0, col_idx, titulo, header_fmt)
+
+        money_fmt = workbook.add_format({"num_format": "$#,##0.00"})
+        for nombre in ("Expense Outflow Amt", "Reimbursement Cap"):
+            col_idx = columnas_df.index(nombre)
+            ws.set_column(col_idx, col_idx, 20, money_fmt)
+
+        anchos = {
+            "No": 6, "Applicant": 14, "Category": 24, "Description": 26,
+            "Linked Request No": 24, "Number of Days": 12, "Total Number of People": 14,
+            "Employee Name": 24, "Material": 16, "Payment Date": 14, "Bank No": 8,
+            "CFDI Folio": 38, "Status": 12,
+        }
+        for nombre, ancho in anchos.items():
+            ws.set_column(columnas_df.index(nombre), columnas_df.index(nombre), ancho)
+
     return output.getvalue()
 
 
@@ -698,20 +778,24 @@ def _mostrar_seccion_solicitudes() -> None:
     with st.container(border=True):
         c1, c2, c3 = st.columns(3)
         with c1:
-            applicant = st.text_input("Applicant", key=f"sol_applicant_{v}")
+            applicant = _selector_catalogo("Applicant", "aplicantes", "", f"sol_applicant_{v}")
         with c2:
-            employee = _selector_catalogo("Employee name", "empleados", "", f"sol_employee_{v}")
-        with c3:
             category = _selector_catalogo("Category", "categorias_solicitud", "", f"sol_category_{v}")
+        with c3:
+            employee = _selector_catalogo("Employee name", "empleados", "", f"sol_employee_{v}")
 
-        c4, c5, c6, c7 = st.columns(4)
+        c4, c5, c6 = st.columns(3)
         with c4:
             material = _selector_catalogo("Material", "materiales", "", f"sol_material_{v}")
         with c5:
-            request_number = st.text_input("Request number", key=f"sol_request_{v}")
+            description = st.text_input("Description", key=f"sol_description_{v}")
         with c6:
-            number_of_days = st.number_input("Number of days", min_value=0, step=1, key=f"sol_days_{v}")
+            request_number = st.text_input("Request number", key=f"sol_request_{v}")
+
+        c7, c8, _c9 = st.columns(3)
         with c7:
+            number_of_days = st.number_input("Number of days", min_value=0, step=1, key=f"sol_days_{v}")
+        with c8:
             number_of_people = st.number_input("Number of people", min_value=0, step=1, key=f"sol_people_{v}")
 
         if st.button("➕ Agregar a la bitácora", key=f"sol_btn_guardar_{v}", type="primary"):
@@ -724,6 +808,7 @@ def _mostrar_seccion_solicitudes() -> None:
                     "No": nuevo_no,
                     "Applicant": applicant.strip(),
                     "Category": category,
+                    "Description": description.strip(),
                     "Material": material,
                     "Employee Name": employee,
                     "Request Number": request_number.strip(),
@@ -743,6 +828,8 @@ def _mostrar_seccion_solicitudes() -> None:
         return
 
     st.markdown("##### 🧾 Bitácora de solicitudes")
+    st.caption("Mismo orden de columnas que la hoja «Details» de la plantilla (Material ocupa el "
+               "lugar de «Client Name», que aquí no se captura).")
 
     if st.session_state.solicitud_en_proceso is not None:
         sol_activa = _solicitud_por_id(st.session_state.solicitud_en_proceso)
@@ -759,21 +846,27 @@ def _mostrar_seccion_solicitudes() -> None:
         else:
             st.session_state.solicitud_en_proceso = None
 
-    encabezados = st.columns([1, 2, 2.2, 1.6, 2, 1.8, 1, 1, 2])
-    for col, titulo in zip(encabezados, ["No", "Applicant", "Category", "Material", "Employee", "Request #", "Días", "Personas", ""]):
-        col.markdown(f"**{titulo}**")
+    anchos_bitacora = [0.7, 1.5, 1.9, 2.2, 1.6, 0.8, 0.9, 1.8, 1.3, 2]
+    titulos_bitacora = [
+        "No.", "Applicant", "Category", "Description", "Request #",
+        "Días", "Personas", "Employee", "Material", "",
+    ]
+    encabezados = st.columns(anchos_bitacora)
+    for col, titulo in zip(encabezados, titulos_bitacora):
+        col.markdown(f"<div class='bitacora-header'>{titulo}</div>", unsafe_allow_html=True)
 
     for sol in st.session_state.solicitudes:
-        cols = st.columns([1, 2, 2.2, 1.6, 2, 1.8, 1, 1, 2])
+        cols = st.columns(anchos_bitacora)
         cols[0].write(f"#{sol['No']}")
         cols[1].write(sol["Applicant"])
         cols[2].write(sol["Category"] or "—")
-        cols[3].write(sol["Material"] or "—")
-        cols[4].write(sol["Employee Name"] or "—")
-        cols[5].write(sol["Request Number"] or "—")
-        cols[6].write(sol["Number of Days"])
-        cols[7].write(sol["Number of People"])
-        with cols[8]:
+        cols[3].write(sol.get("Description") or "—")
+        cols[4].write(sol["Request Number"] or "—")
+        cols[5].write(sol["Number of Days"])
+        cols[6].write(sol["Number of People"])
+        cols[7].write(sol["Employee Name"] or "—")
+        cols[8].write(sol["Material"] or "—")
+        with cols[9]:
             if sol["estado"] == "comprobado":
                 st.caption(f"✅ Comprobado (#{sol['idx_vinculado']})")
             else:
@@ -783,9 +876,9 @@ def _mostrar_seccion_solicitudes() -> None:
                     st.rerun()
 
     st.download_button(
-        "📥 Descargar bitácora de solicitudes (Excel)",
-        data=_solicitudes_a_excel_bytes(st.session_state.solicitudes),
-        file_name=f"solicitudes_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        "📥 Descargar bitácora (formato Details, .xlsx)",
+        data=_bitacora_a_excel_bytes(st.session_state.solicitudes, st.session_state.concatenados),
+        file_name=f"bitacora_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="btn_descargar_solicitudes",
     )
