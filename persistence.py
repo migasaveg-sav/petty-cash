@@ -33,6 +33,10 @@ CAMPOS_SESION = [
     "factura_counter",
     "categorias",
     "materiales",
+    "solicitudes",
+    "solicitud_counter",
+    "categorias_solicitud",
+    "empleados",
 ]
 
 DB_DEFAULT_PATH = "pettycash_autosave.db"
@@ -113,6 +117,10 @@ def cargar_sesion_dict(data: dict[str, Any]) -> dict[str, Any]:
     resultado["factura_counter"] = data.get("factura_counter", 0)
     resultado["categorias"] = data.get("categorias")
     resultado["materiales"] = data.get("materiales")
+    resultado["solicitudes"] = data.get("solicitudes", [])
+    resultado["solicitud_counter"] = data.get("solicitud_counter", 0)
+    resultado["categorias_solicitud"] = data.get("categorias_solicitud")
+    resultado["empleados"] = data.get("empleados")
     resultado["selected_idx"] = None
     return resultado
 
@@ -133,6 +141,10 @@ def sesion_vacia() -> dict[str, Any]:
         "factura_counter": 0,
         "categorias": None,
         "materiales": None,
+        "solicitudes": [],
+        "solicitud_counter": 0,
+        "categorias_solicitud": None,
+        "empleados": None,
         "selected_idx": None,
     }
 
