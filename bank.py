@@ -15,6 +15,7 @@ A diferencia de la versión original, este módulo:
 """
 from __future__ import annotations
 
+import re
 from io import BytesIO
 from typing import Any
 
@@ -113,6 +114,121 @@ def _limpiar_comillas_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _corregir_mojibake(texto: Any) -> Any:
+    """Corrige texto UTF-8 que fue interpretado por error como Latin-1/cp1252 y
+    reescrito así (patrón típico: 'DÃ­a' en vez de 'Día'). Pasa de largo si no
+    detecta ese patrón, o si el intento de reparación falla."""
+    if not isinstance(texto, str) or ("Ã" not in texto and "Â" not in texto):
+        return texto
+    try:
+        return texto.encode("latin-1").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return texto
+
+
+# Fecha al inicio de la línea (DD-MM-AAAA o DD/MM/AAAA) seguida del resto del texto.
+_PATRON_FILA_CONCATENADA = re.compile(r"^\s*(\d{2}[-/]\d{2}[-/]\d{4})\s+(.*\S)\s*$")
+# Un importe con dos decimales, con o sin separador de miles.
+_PATRON_IMPORTE = re.compile(r"-?[\d,]+\.\d{2}")
+
+
+def _es_texto_concatenado(df_crudo: pd.DataFrame) -> bool:
+    """Detecta el caso de un estado de cuenta exportado como una sola columna de
+    texto libre, con fecha/concepto/cargo/abono/saldo pegados en cada celda y
+    separados sólo por espacios (típico cuando el estado de cuenta se genera a
+    partir de un PDF, p. ej. algunos exportes de BBVA)."""
+    if df_crudo.shape[1] != 1:
+        return False
+    encabezado = _corregir_mojibake(str(df_crudo.columns[0])).lower()
+    campos_esperados = (
+        ("concepto" in encabezado or "referencia" in encabezado)
+        and ("cargo" in encabezado or "abono" in encabezado)
+        and "saldo" in encabezado
+    )
+    if not campos_esperados:
+        return False
+    col = df_crudo.iloc[:, 0].dropna().astype(str)
+    if col.empty:
+        return False
+    proporcion_con_fecha = col.map(lambda v: bool(_PATRON_FILA_CONCATENADA.match(v))).mean()
+    return proporcion_con_fecha > 0.5
+
+
+def _parsear_fila_texto_concatenado(linea: str) -> dict[str, Any] | None:
+    """Separa una línea 'DD-MM-AAAA   concepto largo...   85.10   282.36' en sus
+    partes. No se puede usar la posición del carácter como si fueran columnas de
+    ancho fijo: el texto no viene monoespaciado, así que el concepto cambia de
+    longitud entre filas y desplaza todo lo que sigue. En vez de eso se toman
+    los últimos DOS números de la línea (importe y saldo) y todo lo anterior a
+    esos números, después de la fecha, es el concepto."""
+    m = _PATRON_FILA_CONCATENADA.match(linea)
+    if not m:
+        return None
+    fecha_str, resto = m.groups()
+    numeros = list(_PATRON_IMPORTE.finditer(resto))
+    if len(numeros) < 2:
+        return None
+    importe_match, saldo_match = numeros[-2], numeros[-1]
+    concepto = resto[: importe_match.start()].strip()
+    try:
+        importe_abs = float(importe_match.group().replace(",", ""))
+        saldo = float(saldo_match.group().replace(",", ""))
+    except ValueError:
+        return None
+    fecha = pd.to_datetime(fecha_str, dayfirst=True, errors="coerce")
+    if pd.isna(fecha) or not concepto:
+        return None
+    return {"Fecha": fecha, "Descripción": concepto, "_ImporteAbs": importe_abs, "Saldo": saldo}
+
+
+def _clasificar_cargo_abono(filas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Determina si cada importe es Cargo (egreso, negativo) o Abono (ingreso,
+    positivo) comparando el saldo de cada fila contra el de la fila siguiente.
+
+    El estado de cuenta concatenado no distingue Cargo de Abono por columna (esa
+    información se perdió al aplanar el texto), así que se reconstruye con
+    aritmética: como el archivo viene del movimiento más reciente al más
+    antiguo (como lo exporta el banco), el saldo ANTES de la fila `i` es el
+    saldo de la fila `i + 1`. Si `saldo[i] - saldo[i+1]` coincide en magnitud
+    con el importe de la fila, ese signo es el correcto. La última fila (el
+    movimiento más antiguo del archivo) no tiene una fila siguiente con la que
+    comparar; se asume Cargo (el caso más común en caja chica) y conviene
+    revisarla a mano si no aplica."""
+    n = len(filas)
+    for i in range(n):
+        importe_abs = filas[i]["_ImporteAbs"]
+        if i + 1 < n:
+            delta = filas[i]["Saldo"] - filas[i + 1]["Saldo"]
+            filas[i]["Monto"] = delta if abs(abs(delta) - importe_abs) <= 0.02 else -importe_abs
+        else:
+            filas[i]["Monto"] = -importe_abs
+    return filas
+
+
+def _procesar_texto_concatenado(df_crudo: pd.DataFrame) -> pd.DataFrame:
+    """Convierte el DataFrame de una sola columna (ver `_es_texto_concatenado`)
+    en el mismo formato normalizado que produce `cargar_estado_cuenta`."""
+    lineas = df_crudo.iloc[:, 0].dropna().astype(str)
+    filas: list[dict[str, Any]] = []
+    for linea in lineas:
+        fila = _parsear_fila_texto_concatenado(_corregir_mojibake(linea))
+        if fila is not None:
+            filas.append(fila)
+
+    if not filas:
+        raise BankStatementError(
+            "No se pudo separar el texto concatenado en fecha/concepto/importe/saldo. "
+            "Revisa que cada fila tenga el formato 'DD-MM-AAAA  CONCEPTO  IMPORTE  SALDO'."
+        )
+
+    filas = _clasificar_cargo_abono(filas)
+    df = pd.DataFrame(filas)
+    df["Fecha"] = df["Fecha"].dt.strftime("%Y-%m-%d")
+    df = df.drop(columns=["_ImporteAbs"])[["Fecha", "Descripción", "Monto", "Saldo"]]
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
 def _leer_crudo(file_bytes: bytes, filename: str) -> pd.DataFrame:
     """Lee el archivo crudo (sin mapear columnas) como DataFrame, probando varias
     codificaciones si es CSV."""
@@ -201,6 +317,10 @@ def cargar_estado_cuenta(
     df_crudo = _leer_crudo(file_bytes, filename)
     if df_crudo.empty:
         raise BankStatementError("El archivo no contiene filas.")
+
+    if mapeo_manual is None and _es_texto_concatenado(df_crudo):
+        return _procesar_texto_concatenado(df_crudo)
+
     df_crudo = _limpiar_comillas_df(df_crudo)
 
     plantilla = PLANTILLAS_BANCO.get(banco, PLANTILLAS_BANCO["Genérico (detectar automáticamente)"])
