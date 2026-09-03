@@ -24,7 +24,14 @@ import pandas as pd
 import streamlit as st
 
 from bank import BANCOS_DISPONIBLES, BankStatementError, cargar_estado_cuenta, columnas_disponibles_para_mapeo
-from catalog import CATEGORIAS_DEFAULT, MATERIALES_DEFAULT, agregar_valor, catalogo_inicial
+from catalog import (
+    CATEGORIAS_DEFAULT,
+    CATEGORIAS_SOLICITUD_DEFAULT,
+    EMPLEADOS_DEFAULT,
+    MATERIALES_DEFAULT,
+    agregar_valor,
+    catalogo_inicial,
+)
 from cfdi import CFDIParseError, parse_cfdi
 from matching import calcular_matches_automaticos, checksum_reconciliacion, resumen_estados
 from persistence import (
@@ -75,6 +82,10 @@ def init_state() -> None:
         "autoguardado_activo": True,
         "categorias": None,
         "materiales": None,
+        "categorias_solicitud": None,
+        "empleados": None,
+        "solicitud_en_proceso": None,
+        "solicitud_form_version": 0,
     })
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -83,6 +94,10 @@ def init_state() -> None:
         st.session_state.categorias = catalogo_inicial(CATEGORIAS_DEFAULT)
     if st.session_state.materiales is None:
         st.session_state.materiales = catalogo_inicial(MATERIALES_DEFAULT)
+    if st.session_state.categorias_solicitud is None:
+        st.session_state.categorias_solicitud = catalogo_inicial(CATEGORIAS_SOLICITUD_DEFAULT)
+    if st.session_state.empleados is None:
+        st.session_state.empleados = catalogo_inicial(EMPLEADOS_DEFAULT)
 
 
 init_state()
@@ -164,6 +179,19 @@ def mes_es(fecha_str) -> str:
 def next_factura_id() -> int:
     st.session_state.factura_counter += 1
     return st.session_state.factura_counter
+
+
+def next_solicitud_id() -> int:
+    st.session_state.solicitud_counter += 1
+    return st.session_state.solicitud_counter
+
+
+def _limpiar_formulario_solicitud() -> None:
+    """Fuerza a Streamlit a remontar los widgets del formulario de solicitudes desde
+    cero tras guardar uno (mismo truco que `_limpiar_seleccion_tabla_pendientes`:
+    los widgets normales no tienen `clear_on_submit` fuera de un st.form, así que
+    cambiamos la versión que forma parte de su `key`)."""
+    st.session_state.solicitud_form_version = st.session_state.get("solicitud_form_version", 0) + 1
 
 
 def uuids_consumidos() -> set:
@@ -325,6 +353,11 @@ with st.sidebar:
                 st.session_state.categorias = catalogo_inicial(CATEGORIAS_DEFAULT)
             if st.session_state.materiales is None:
                 st.session_state.materiales = catalogo_inicial(MATERIALES_DEFAULT)
+            if st.session_state.categorias_solicitud is None:
+                st.session_state.categorias_solicitud = catalogo_inicial(CATEGORIAS_SOLICITUD_DEFAULT)
+            if st.session_state.empleados is None:
+                st.session_state.empleados = catalogo_inicial(EMPLEADOS_DEFAULT)
+            st.session_state.solicitud_en_proceso = None
             st.success("Avance restaurado correctamente.")
             st.rerun()
         except Exception as e:
@@ -343,6 +376,15 @@ with st.sidebar:
             restaurado = restaurar_autoguardado(AUTOSAVE_DB)
             if restaurado:
                 _restaurar_estado(restaurado)
+                if st.session_state.categorias is None:
+                    st.session_state.categorias = catalogo_inicial(CATEGORIAS_DEFAULT)
+                if st.session_state.materiales is None:
+                    st.session_state.materiales = catalogo_inicial(MATERIALES_DEFAULT)
+                if st.session_state.categorias_solicitud is None:
+                    st.session_state.categorias_solicitud = catalogo_inicial(CATEGORIAS_SOLICITUD_DEFAULT)
+                if st.session_state.empleados is None:
+                    st.session_state.empleados = catalogo_inicial(EMPLEADOS_DEFAULT)
+                st.session_state.solicitud_en_proceso = None
                 st.success("Avance restaurado desde autoguardado.")
                 st.rerun()
 
@@ -355,6 +397,9 @@ with st.sidebar:
             _restaurar_estado(vacio)
             st.session_state.categorias = catalogo_inicial(CATEGORIAS_DEFAULT)
             st.session_state.materiales = catalogo_inicial(MATERIALES_DEFAULT)
+            st.session_state.categorias_solicitud = catalogo_inicial(CATEGORIAS_SOLICITUD_DEFAULT)
+            st.session_state.empleados = catalogo_inicial(EMPLEADOS_DEFAULT)
+            st.session_state.solicitud_en_proceso = None
             st.session_state.confirmar_reset = False
             borrar_autoguardado(AUTOSAVE_DB)
             st.rerun()
@@ -414,12 +459,27 @@ tab_pendientes, tab_comprobados, tab_no_necesarios, tab_resumen = st.tabs(
 # ============================================================
 # DIÁLOGO: TRABAJAR UN GASTO
 # ============================================================
+def _solicitud_por_id(solicitud_id):
+    if solicitud_id is None:
+        return None
+    return next((s for s in st.session_state.solicitudes if s["id"] == solicitud_id), None)
+
+
 @_dialog("📌 Trabajar gasto")
-def dialog_trabajar_gasto(idx: int) -> None:
+def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
     df_actual = st.session_state.bank_df
     if idx not in df_actual.index or st.session_state.estados.get(idx) != "pendiente":
         st.info("Este gasto ya no está pendiente (puede que ya se haya comprobado en otra pestaña).")
         return
+
+    sol = _solicitud_por_id(solicitud_id)
+    if sol is not None:
+        st.markdown(
+            f"<div class='card'>🔗 <strong>Vinculado a la solicitud #{sol['No']}</strong> — "
+            f"{sol['Applicant']} · {sol['Category']} · {sol['Employee Name']} · "
+            f"Request {sol['Request Number'] or '—'}</div>",
+            unsafe_allow_html=True,
+        )
 
     gasto = df_actual.loc[idx]
     monto_gasto = abs(float(gasto["Monto"]))
@@ -441,6 +501,10 @@ def dialog_trabajar_gasto(idx: int) -> None:
         })
         st.session_state.estados[idx] = "no_necesario"
         st.session_state.facturas_por_gasto.pop(idx, None)
+        if sol is not None:
+            # este movimiento no era el correcto para la solicitud; la dejamos
+            # pendiente para que se pueda volver a vincular con otro gasto.
+            st.session_state.solicitud_en_proceso = None
         _limpiar_seleccion_tabla_pendientes()
         _autoguardar_si_activo()
         st.rerun()
@@ -575,9 +639,14 @@ def dialog_trabajar_gasto(idx: int) -> None:
                     "Categoria": clasif.get("categoria", ""),
                     "Material": clasif.get("material", ""),
                     "Facturas": facturas,
+                    "Solicitud": sol,
                 })
                 st.session_state.estados[idx] = "comprobado"
                 st.session_state.facturas_por_gasto.pop(idx, None)
+                if sol is not None:
+                    sol["estado"] = "comprobado"
+                    sol["idx_vinculado"] = idx
+                    st.session_state.solicitud_en_proceso = None
                 st.success("Gasto añadido a los registros.")
                 _limpiar_seleccion_tabla_pendientes()
                 _autoguardar_si_activo()
@@ -592,9 +661,143 @@ def dialog_trabajar_gasto(idx: int) -> None:
 
 
 # ============================================================
+# BITÁCORA DE SOLICITUDES DE REEMBOLSO
+# ============================================================
+def _solicitudes_a_excel_bytes(solicitudes: list[dict]) -> bytes:
+    from io import BytesIO
+
+    columnas = [
+        "No", "Applicant", "Category", "Material", "Employee Name", "Request Number",
+        "Number of Days", "Number of People", "estado", "idx_vinculado",
+    ]
+    if solicitudes:
+        df_sol = pd.DataFrame(solicitudes)[columnas]
+    else:
+        df_sol = pd.DataFrame(columns=columnas)
+    df_sol = df_sol.rename(columns={"estado": "Status", "idx_vinculado": "Linked Bank Row"})
+    df_sol["Status"] = df_sol["Status"].map({"pendiente": "Pendiente", "comprobado": "Comprobado"}).fillna(df_sol["Status"])
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df_sol.to_excel(writer, index=False, sheet_name="Solicitudes")
+        ws = writer.sheets["Solicitudes"]
+        ws.set_column(1, 4, 20)
+        ws.set_column(5, 5, 18)
+    return output.getvalue()
+
+
+def _mostrar_seccion_solicitudes() -> None:
+    st.markdown("### 📝 Nueva solicitud de reembolso")
+    st.caption(
+        "Registra aquí cada gasto conforme se va realizando, antes de tener el estado de cuenta "
+        "o la factura. Queda guardado en la bitácora de abajo; cuando el movimiento ya aparezca "
+        "en el estado de cuenta, usa su botón «🔗 Comprobar gasto» para vincularlo y adjuntar la "
+        "factura, igual que con cualquier otro gasto pendiente."
+    )
+    v = st.session_state.solicitud_form_version
+    with st.container(border=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            applicant = st.text_input("Applicant", key=f"sol_applicant_{v}")
+        with c2:
+            employee = _selector_catalogo("Employee name", "empleados", "", f"sol_employee_{v}")
+        with c3:
+            category = _selector_catalogo("Category", "categorias_solicitud", "", f"sol_category_{v}")
+
+        c4, c5, c6, c7 = st.columns(4)
+        with c4:
+            material = _selector_catalogo("Material", "materiales", "", f"sol_material_{v}")
+        with c5:
+            request_number = st.text_input("Request number", key=f"sol_request_{v}")
+        with c6:
+            number_of_days = st.number_input("Number of days", min_value=0, step=1, key=f"sol_days_{v}")
+        with c7:
+            number_of_people = st.number_input("Number of people", min_value=0, step=1, key=f"sol_people_{v}")
+
+        if st.button("➕ Agregar a la bitácora", key=f"sol_btn_guardar_{v}", type="primary"):
+            if not applicant.strip():
+                st.error("«Applicant» es obligatorio.")
+            else:
+                nuevo_no = next_solicitud_id()
+                st.session_state.solicitudes.append({
+                    "id": nuevo_no,
+                    "No": nuevo_no,
+                    "Applicant": applicant.strip(),
+                    "Category": category,
+                    "Material": material,
+                    "Employee Name": employee,
+                    "Request Number": request_number.strip(),
+                    "Number of Days": int(number_of_days),
+                    "Number of People": int(number_of_people),
+                    "estado": "pendiente",
+                    "idx_vinculado": None,
+                })
+                _limpiar_formulario_solicitud()
+                _autoguardar_si_activo()
+                st.success(f"Solicitud #{nuevo_no} agregada a la bitácora.")
+                st.rerun()
+
+    if not st.session_state.solicitudes:
+        st.caption("Todavía no hay solicitudes registradas en la bitácora.")
+        st.divider()
+        return
+
+    st.markdown("##### 🧾 Bitácora de solicitudes")
+
+    if st.session_state.solicitud_en_proceso is not None:
+        sol_activa = _solicitud_por_id(st.session_state.solicitud_en_proceso)
+        if sol_activa is not None:
+            st.markdown(
+                f"<div class='warn-box'>🔗 Vinculando la solicitud #{sol_activa['No']} "
+                f"({sol_activa['Applicant']} · {sol_activa['Category']}): selecciona su gasto en la "
+                f"tabla de «Gastos pendientes» de abajo y pulsa «Abrir».</div>",
+                unsafe_allow_html=True,
+            )
+            if st.button("Cancelar vinculación", key="btn_cancelar_vinculacion"):
+                st.session_state.solicitud_en_proceso = None
+                st.rerun()
+        else:
+            st.session_state.solicitud_en_proceso = None
+
+    encabezados = st.columns([1, 2, 2.2, 1.6, 2, 1.8, 1, 1, 2])
+    for col, titulo in zip(encabezados, ["No", "Applicant", "Category", "Material", "Employee", "Request #", "Días", "Personas", ""]):
+        col.markdown(f"**{titulo}**")
+
+    for sol in st.session_state.solicitudes:
+        cols = st.columns([1, 2, 2.2, 1.6, 2, 1.8, 1, 1, 2])
+        cols[0].write(f"#{sol['No']}")
+        cols[1].write(sol["Applicant"])
+        cols[2].write(sol["Category"] or "—")
+        cols[3].write(sol["Material"] or "—")
+        cols[4].write(sol["Employee Name"] or "—")
+        cols[5].write(sol["Request Number"] or "—")
+        cols[6].write(sol["Number of Days"])
+        cols[7].write(sol["Number of People"])
+        with cols[8]:
+            if sol["estado"] == "comprobado":
+                st.caption(f"✅ Comprobado (#{sol['idx_vinculado']})")
+            else:
+                ya_vinculando_otra = st.session_state.solicitud_en_proceso not in (None, sol["id"])
+                if st.button("🔗 Comprobar gasto", key=f"btn_comprobar_sol_{sol['id']}", disabled=ya_vinculando_otra):
+                    st.session_state.solicitud_en_proceso = sol["id"]
+                    st.rerun()
+
+    st.download_button(
+        "📥 Descargar bitácora de solicitudes (Excel)",
+        data=_solicitudes_a_excel_bytes(st.session_state.solicitudes),
+        file_name=f"solicitudes_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="btn_descargar_solicitudes",
+    )
+    st.divider()
+
+
+# ============================================================
 # PESTAÑA: PENDIENTES
 # ============================================================
 with tab_pendientes:
+    _mostrar_seccion_solicitudes()
+
     pendientes_idx = [i for i, e in st.session_state.estados.items() if e == "pendiente"]
 
     if not pendientes_idx:
@@ -643,7 +846,7 @@ with tab_pendientes:
                         )
                     with col_btn:
                         if st.button("🔍 Abrir", use_container_width=True, key="btn_abrir_gasto", type="primary"):
-                            dialog_trabajar_gasto(idx_sel)
+                            dialog_trabajar_gasto(idx_sel, solicitud_id=st.session_state.solicitud_en_proceso)
                 else:
                     st.caption("Ningún gasto seleccionado todavía.")
 
@@ -802,6 +1005,12 @@ def _revertir_a_pendiente(idx: int, origen: str) -> None:
         if registro is not None:
             st.session_state.facturas_por_gasto[idx] = registro["Facturas"]
             st.session_state.concatenados = [r for r in st.session_state.concatenados if r["idx"] != idx]
+            sol = registro.get("Solicitud")
+            if sol is not None:
+                sol_actual = _solicitud_por_id(sol["id"])
+                if sol_actual is not None:
+                    sol_actual["estado"] = "pendiente"
+                    sol_actual["idx_vinculado"] = None
     else:
         st.session_state.no_necesarios = [r for r in st.session_state.no_necesarios if r.get("idx") != idx]
     st.session_state.estados[idx] = "pendiente"
