@@ -688,20 +688,31 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
     final para saber de un vistazo qué sigue pendiente."""
     from io import BytesIO
 
-    def _comprobacion_de(sol: dict) -> dict:
+    def _facturas_vinculadas(sol: dict) -> list[dict]:
+        """Facturas del gasto vinculado a esta solicitud (o [] si sigue pendiente)."""
         if sol.get("estado") != "comprobado" or sol.get("idx_vinculado") is None:
-            return {}
+            return []
         registro = next((c for c in concatenados if c["idx"] == sol["idx_vinculado"]), None)
         if registro is None:
+            return []
+        return registro.get("Facturas", []) or []
+
+    def _comprobacion_de(sol: dict, factura: dict | None, primera: bool) -> dict:
+        """Una FACTURA por fila (antes: todos los UUID de un gasto concatenados en una
+        sola celda «CFDI Folio» con '; '.join). Payment Date/Expense Outflow Amt/el
+        No. del banco sólo van en la primera fila del grupo (igual que en la hoja
+        «Comprobados»), CFDI Folio y Reimbursement Cap son siempre por factura."""
+        if factura is None:
             return {}
-        facturas = registro.get("Facturas", [])
-        suma_facturas = round(sum(f.get("Monto Total", 0) or 0 for f in facturas), 2)
+        registro = next((c for c in concatenados if c["idx"] == sol["idx_vinculado"]), None)
         return {
-            "Payment Date": registro.get("Fecha Estado", ""),
-            "Expense Outflow Amt": round(abs(float(registro.get("Monto Estado", 0) or 0)), 2),
-            "Bank No": sol["No"],
-            "CFDI Folio": "; ".join(f.get("UUID", "") for f in facturas if f.get("UUID")),
-            "Reimbursement Cap": suma_facturas,
+            "Payment Date": (registro.get("Fecha Estado", "") if registro else "") if primera else None,
+            "Expense Outflow Amt": (
+                round(abs(float(registro.get("Monto Estado", 0) or 0)), 2) if registro else None
+            ) if primera else None,
+            "Bank No": sol["No"] if primera else None,
+            "CFDI Folio": factura.get("UUID", ""),
+            "Reimbursement Cap": round(factura.get("Monto Total", 0) or 0, 2),
         }
 
     columnas_df = [
@@ -719,20 +730,23 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
 
     filas = []
     for sol in solicitudes:
-        fila = {
-            "No": sol.get("No"),
-            "Applicant": sol.get("Applicant") or "",
-            "Category": sol.get("Category") or "",
-            "Description": sol.get("Description") or "",
-            "Linked Request No": sol.get("Request Number") or "",
-            "Number of Days": sol.get("Number of Days", 0),
-            "Total Number of People": sol.get("Number of People", 0),
-            "Employee Name": sol.get("Employee Name") or "",
-            "Material": sol.get("Material") or "",
-            "Status": "Comprobado" if sol.get("estado") == "comprobado" else "Pendiente",
-        }
-        fila.update(_comprobacion_de(sol))
-        filas.append(fila)
+        facturas = _facturas_vinculadas(sol)
+        for i, factura in enumerate([*facturas] or [None]):
+            primera = i == 0
+            fila = {
+                "No": sol.get("No") if primera else None,
+                "Applicant": (sol.get("Applicant") or "") if primera else "",
+                "Category": (sol.get("Category") or "") if primera else "",
+                "Description": (sol.get("Description") or "") if primera else "",
+                "Linked Request No": (sol.get("Request Number") or "") if primera else "",
+                "Number of Days": sol.get("Number of Days", 0) if primera else None,
+                "Total Number of People": sol.get("Number of People", 0) if primera else None,
+                "Employee Name": (sol.get("Employee Name") or "") if primera else "",
+                "Material": (sol.get("Material") or "") if primera else "",
+                "Status": ("Comprobado" if sol.get("estado") == "comprobado" else "Pendiente") if primera else "",
+            }
+            fila.update(_comprobacion_de(sol, factura, primera))
+            filas.append(fila)
 
     df = pd.DataFrame(filas, columns=columnas_df) if filas else pd.DataFrame(columns=columnas_df)
 
@@ -1199,33 +1213,44 @@ with tab_resumen:
     st.divider()
     st.markdown("##### 📥 Descargar Excel del historial")
 
-    def fila_excel_comprobado(no, registro):
-        facturas = registro["Facturas"]
-        suma_facturas = sum(f["Monto Total"] for f in facturas)
-        suma_iva = sum(f.get("IVA", 0.0) for f in facturas)
-        suma_iva_ret = sum(f.get("IVA Retenido", 0.0) for f in facturas)
-        suma_isr_ret = sum(f.get("ISR Retenido", 0.0) for f in facturas)
-        return {
-            "No": no,
-            "Bank date": registro["Fecha Estado"],
-            "Bank amt": registro["Monto Estado"],
-            "Category": registro.get("Categoria", ""),
-            "Material": registro.get("Material", ""),
-            "Concepto": "; ".join(f.get("Concepto", "") for f in facturas if f.get("Concepto")),
-            "Month": mes_es(registro["Fecha Estado"]),
-            "UUID date": "; ".join(f.get("Fecha Factura", "") for f in facturas),
-            "UUID": "; ".join(f.get("UUID", "") for f in facturas),
-            "UUID amt": suma_facturas,
-            "IVA": suma_iva,
-            "IVA Retenido": suma_iva_ret,
-            "ISR Retenido": suma_isr_ret,
-            "Diff": round(abs(float(registro["Monto Estado"])) - suma_facturas, 2),
-            "Incompleta": "Sí" if any(f.get("Incompleta") for f in facturas) else "",
-        }
+    def filas_excel_comprobado(concatenados):
+        """Una fila POR FACTURA (antes: una fila por gasto con los UUID/Concepto de
+        varias facturas concatenados en una sola celda con '; '.join, ilegible en
+        Excel). Los datos del gasto/movimiento bancario (No., Bank date, Bank amt,
+        Category, Material, Month, Diff, Incompleta) sólo se escriben en la primera
+        fila de cada grupo y se dejan en blanco en las siguientes -mismo No.- para que
+        se vea de un vistazo qué facturas pertenecen al mismo gasto (agrupado por
+        número progresivo) sin duplicar esos montos si alguien suma la columna."""
+        filas = []
+        for no, registro in enumerate(concatenados, start=1):
+            facturas = registro["Facturas"] or [{}]
+            suma_facturas = sum(f.get("Monto Total", 0.0) or 0.0 for f in facturas)
+            diff = round(abs(float(registro["Monto Estado"])) - suma_facturas, 2)
+            incompleta = "Sí" if any(f.get("Incompleta") for f in facturas) else ""
+            for i, f in enumerate(facturas):
+                primera = i == 0
+                filas.append({
+                    "No": no if primera else None,
+                    "Bank date": registro["Fecha Estado"] if primera else None,
+                    "Bank amt": registro["Monto Estado"] if primera else None,
+                    "Category": registro.get("Categoria", "") if primera else "",
+                    "Material": registro.get("Material", "") if primera else "",
+                    "Concepto": f.get("Concepto", ""),
+                    "Month": mes_es(registro["Fecha Estado"]) if primera else "",
+                    "UUID date": f.get("Fecha Factura", ""),
+                    "UUID": f.get("UUID", ""),
+                    "UUID amt": f.get("Monto Total", 0.0),
+                    "IVA": f.get("IVA", 0.0),
+                    "IVA Retenido": f.get("IVA Retenido", 0.0),
+                    "ISR Retenido": f.get("ISR Retenido", 0.0),
+                    "Diff": diff if primera else None,
+                    "Incompleta": incompleta if primera else "",
+                })
+        return filas
 
     df_comprobados_vista = None
     if st.session_state.concatenados:
-        filas = [fila_excel_comprobado(n + 1, r) for n, r in enumerate(st.session_state.concatenados)]
+        filas = filas_excel_comprobado(st.session_state.concatenados)
         df_comprobados_vista = pd.DataFrame(filas)
 
     if st.session_state.concatenados or st.session_state.no_necesarios:
