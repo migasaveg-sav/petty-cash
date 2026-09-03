@@ -39,10 +39,57 @@ CATEGORIAS_SOLICITUD_DEFAULT = [
     "Returned by Employee",
 ]
 
-# Lista de empleados para la bitácora de solicitudes. Empieza vacía a propósito:
-# el usuario indicó que la compartirá más adelante; mientras tanto se puede ir
-# llenando sobre la marcha con "➕ Agregar nueva…" en el propio formulario.
-EMPLEADOS_DEFAULT: list[str] = []
+# Catálogo de "Applicant" para la bitácora de solicitudes, tomado de la hoja
+# "Applicant" del Excel de plantilla que compartió el usuario.
+APLICANTES_DEFAULT = [
+    "Ximena",
+    "Antonieta",
+    "Karen",
+]
+
+# Catálogo de "Employee name" para la bitácora de solicitudes, tomado de la hoja
+# "Employee name" del Excel de plantilla (se quitaron los tabs finales de cada
+# nombre que traía el archivo original).
+EMPLEADOS_DEFAULT = [
+    "ADRIAN NUNEZ XIMENA JOCELYN",
+    "AGUILAR HERRERA AXEL",
+    "ALVAREZ HERNANDEZ ANGEL ADRIAN",
+    "ALVAREZ MORENO NOEMI MARINA",
+    "Antonieta Guevara Tapia",
+    "ARANDA UC NORKA YAMILE",
+    "ARRIAGA SEGOVIA OLAM YHOSHUA",
+    "CARDOZA CARDOZA MARIA CRISTINA",
+    "CERRITOS HERNANDEZ JORGE",
+    "CHAVEZ PEREZ GABRIELA",
+    "CHEN KUAN CHANG",
+    "CORTES MORALES ISAAC ALFONSO",
+    "CRUZ LINO JOSE DANIEL",
+    "DANIEL CHAVEZ IBARRA",
+    "DE HARO GRIMALDO MARIA DE LOS ANGELES",
+    "ERNESTO FONSECA RIOS",
+    "FONSECA RIOS ERNESTO",
+    "GARCIA LOPEZ MONSERRAT",
+    "GUTIERREZ RIOS KAREN SAMANETH",
+    "HEREDIA MARQUEZ MIGUEL ANGEL",
+    "HUGO ARMANDO AHUMADA ARMENTA",
+    "JUAREZ RUIZ LUIS ARTURO",
+    "LIU LETIAN",
+    "LOPEZ HERNANDEZ NORMA LESLIE",
+    "LUNA MARTAGON OMAR",
+    "MARQUEZ CRUZ MARIA GUADALUPE",
+    "ROGELIO GONZALEZ MORALES",
+    "SHANCHEZ VEGA MIGUEL ANGEL",
+    "SHENG YONG",
+    "WANG CHAO",
+    "X TIAN GESI",
+    "YU CHEN",
+    "Yuping Deng Luna",
+    "ZHANG PEI",
+    "ZHANG YONGWEN",
+    "ZHAO YING",
+    "ZUNYA FENG",
+    "GUTIERREZ CENTENO XAVIER HUMBERTO",
+]
 
 
 def agregar_valor(catalogo: list[str], valor: str) -> list[str]:
