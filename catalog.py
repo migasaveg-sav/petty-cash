@@ -22,6 +22,28 @@ MATERIALES_DEFAULT = [
     "N/A",
 ]
 
+# Catálogo de "Category" para la bitácora de solicitudes de reembolso, tomado tal
+# cual de la hoja "Categories" del Excel de plantilla que compartió el usuario.
+CATEGORIAS_SOLICITUD_DEFAULT = [
+    "Office Supplies",
+    "Office Utilities (Water & Electricity & Internet)",
+    "Cleaning Expenses",
+    "Accommodation",
+    "Flight",
+    "Car Rental",
+    "Car Rental Gas",
+    "Travel Meal",
+    "Client Entertainment",
+    "Others",
+    "Reimbursement Inflow",
+    "Returned by Employee",
+]
+
+# Lista de empleados para la bitácora de solicitudes. Empieza vacía a propósito:
+# el usuario indicó que la compartirá más adelante; mientras tanto se puede ir
+# llenando sobre la marcha con "➕ Agregar nueva…" en el propio formulario.
+EMPLEADOS_DEFAULT: list[str] = []
+
 
 def agregar_valor(catalogo: list[str], valor: str) -> list[str]:
     """Regresa una copia del catálogo con `valor` agregado si no existía ya
