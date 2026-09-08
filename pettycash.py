@@ -47,21 +47,26 @@ from persistence import (
 )
 
 # ============================================================
-# PALETA DE COLORES — inspirada en la interfaz de Facebook
-# (fondo gris claro + tarjetas blancas + azul de acento + texto casi
-# negro, para maximizar el contraste texto/fondo). Todos los pares
-# texto/fondo de abajo cumplen al menos 4.5:1 de contraste (WCAG AA).
+# PALETA DE COLORES — corporativa, a partir de la paleta que compartió el
+# usuario (#4A5E76 / #2B2F43 / #BDC3C2 / #FFFFFF / #F4794A): fondo claro,
+# cuadros/tarjetas oscuros (azul marino), acento naranja para acciones
+# primarias. Todos los pares texto/fondo de abajo se verificaron en ≥4.5:1
+# de contraste (WCAG AA) -incluido el naranja, que con texto blanco encima
+# sólo daba 2.7:1: se usa con texto azul marino (4.83:1) en su lugar-.
 # ============================================================
-C_FONDO = "#ADD8E6"            # fondo general de la página (gris FB)
-C_TARJETA = "#FFFFFF"          # tarjetas y contenedores
-C_BORDE = "#CED0D4"            # bordes sutiles
-C_TEXTO_OSCURO = "#050505"     # texto principal, casi negro (20:1 sobre blanco)
-C_TEXTO_SECUNDARIO = "#050505" # texto secundario / captions (5.7:1 sobre blanco)
-C_AZUL_FB = "#166FE5"          # azul de acento (encabezados, botones, "comprobado")
-C_CORAL_ALERTA = "#D32F2F"     # rojo de error/alerta
-C_AMARILLO_ACENTO = "#B45309"  # ámbar de advertencia / "no necesario"
-C_GRIS_NEUTRO = "#4B4E53"      # gris oscuro para "pendiente" (8.3:1 con texto blanco)
-C_VERDE_OK = "#1E7B34"         # verde de éxito
+C_FONDO = "#F2F4F5"            # fondo general de la página (gris muy claro)
+C_TARJETA = "#FFFFFF"          # superficies claras puntuales
+C_BORDE = "#BDC3C2"            # bordes sobre fondo claro
+C_TEXTO_OSCURO = "#2B2F43"     # texto principal sobre fondo claro (12:1)
+C_TEXTO_SECUNDARIO = "#5B6472" # texto secundario / captions (5.4:1)
+C_NAVY = "#2B2F43"             # azul marino oscuro — cuadros, tarjetas, sidebar (13.2:1 con blanco)
+C_SLATE = "#4A5E76"            # azul grisáceo — estados secundarios (6.7:1 con blanco)
+C_ACENTO = "#F4794A"           # naranja de acento — botones primarios, foco, pestaña activa
+C_CORAL_ALERTA = "#C0392B"     # rojo de error/alerta (5.4:1 con blanco)
+C_AMARILLO_ACENTO = "#B45309"  # ámbar de advertencia / "no necesario" (5.0:1 con blanco)
+C_GRIS_NEUTRO = C_SLATE        # (alias retrocompatible) gris/azul para "pendiente"
+C_AZUL_FB = C_NAVY             # (alias retrocompatible) antiguo azul de acento -> navy
+C_VERDE_OK = "#1F7A5C"         # verde corporativo de éxito (5.25:1 con blanco)
 C_BITACORA_HEADER = "#DC143C"  # encabezado de la bitácora de solicitudes (pedido por el usuario)
 
 st.set_page_config(page_title="Comprobación Caja Chica", layout="wide")
@@ -113,16 +118,83 @@ init_state()
 st.markdown(f"""
 <style>
 .stApp {{ background-color: {C_FONDO}; color: {C_TEXTO_OSCURO}; }}
+h1, h2, h3, h4, h5 {{ color: {C_NAVY}; }}
 table, th, td {{ border: 1px solid {C_BORDE}; border-collapse: collapse; padding: 6px; }}
-th {{ background-color: {C_AZUL_FB}; color: white; }}
+th {{ background-color: {C_NAVY}; color: white; }}
 td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
 
 [data-testid="stCaptionContainer"], small {{ color: {C_TEXTO_SECUNDARIO} !important; }}
-[data-testid="stExpander"] summary {{ color: {C_TEXTO_OSCURO}; font-weight: 600; }}
+
+[data-testid="stMetricValue"] {{ color: {C_NAVY}; font-weight: 700; }}
+[data-testid="stMetricLabel"] {{ color: {C_TEXTO_SECUNDARIO}; }}
+
+/* -------- Pestañas -------- */
+[data-baseweb="tab-list"] {{ border-bottom: 2px solid {C_BORDE}; gap: 4px; }}
+[data-baseweb="tab"] {{ color: {C_TEXTO_SECUNDARIO}; font-weight: 600; }}
+[data-baseweb="tab"][aria-selected="true"] {{ color: {C_NAVY}; }}
+[data-baseweb="tab-highlight"] {{ background-color: {C_ACENTO} !important; height: 3px !important; }}
+
+/* -------- Expander (p.ej. "Gastos pendientes") con encabezado oscuro -------- */
+[data-testid="stExpander"] {{
+    border: 1px solid {C_BORDE}; border-radius: 8px; overflow: hidden; background-color: {C_TARJETA};
+}}
+[data-testid="stExpander"] summary {{
+    background-color: {C_NAVY}; color: #FFFFFF !important; font-weight: 600; padding: 10px 14px;
+}}
+[data-testid="stExpander"] summary svg {{ fill: #FFFFFF; }}
+[data-testid="stExpander"] summary:hover {{ background-color: {C_SLATE}; }}
+
+/* -------- Botones -------- */
+.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
+    background-color: {C_NAVY}; color: #FFFFFF; border: 1px solid {C_NAVY};
+    border-radius: 6px; font-weight: 600;
+}}
+.stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {{
+    background-color: {C_ACENTO}; color: {C_NAVY}; border-color: {C_ACENTO};
+}}
+.stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{
+    background-color: {C_ACENTO}; color: {C_NAVY}; border: 1px solid {C_ACENTO}; font-weight: 700;
+}}
+.stButton > button[kind="primary"]:hover, .stFormSubmitButton > button[kind="primary"]:hover {{
+    background-color: {C_NAVY}; color: {C_ACENTO}; border-color: {C_NAVY};
+}}
+
+/* -------- Barra lateral: panel de navegación oscuro -------- */
+section[data-testid="stSidebar"] {{ background-color: {C_NAVY}; }}
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {{ color: #FFFFFF; }}
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+section[data-testid="stSidebar"] small {{ color: #C7CCD6 !important; }}
+section[data-testid="stSidebar"] hr {{ border-color: {C_SLATE}; }}
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary {{ background-color: {C_SLATE}; }}
+section[data-testid="stSidebar"] .stButton > button,
+section[data-testid="stSidebar"] .stDownloadButton > button {{
+    background-color: {C_SLATE}; color: #FFFFFF; border: 1px solid {C_SLATE};
+}}
+section[data-testid="stSidebar"] .stButton > button:hover,
+section[data-testid="stSidebar"] .stDownloadButton > button:hover {{
+    background-color: {C_ACENTO}; color: {C_NAVY}; border-color: {C_ACENTO};
+}}
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] {{
+    background-color: {C_SLATE}; border: 1px dashed #8993A8; border-radius: 8px;
+}}
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] * {{ color: #FFFFFF !important; }}
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button {{
+    background-color: {C_NAVY}; color: #FFFFFF; border: 1px solid #8993A8;
+}}
+section[data-testid="stSidebar"] [data-testid="stFileUploaderFile"] {{
+    background-color: {C_SLATE}; color: #FFFFFF; border-radius: 6px;
+}}
+section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{ color: #FFFFFF; font-weight: 600; }}
 
 .card {{
-    background-color: {C_TARJETA}; border-radius: 10px; padding: 16px 20px;
-    margin-bottom: 14px; border: 1px solid {C_BORDE}; color: {C_TEXTO_OSCURO};
+    background-color: {C_NAVY}; border-radius: 10px; padding: 16px 20px;
+    margin-bottom: 14px; border: 1px solid {C_SLATE}; color: #FFFFFF;
 }}
 .summary-box {{
     border-radius: 10px; padding: 14px 18px; text-align: center; color: white;
@@ -131,8 +203,8 @@ td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
 .summary-count {{ font-size: 1.6rem; font-weight: 700; }}
 .summary-amount {{ font-size: 1.0rem; opacity: 0.95; }}
 
-.box-pendiente {{ background-color: {C_GRIS_NEUTRO}; }}
-.box-comprobado {{ background-color: {C_AZUL_FB}; }}
+.box-pendiente {{ background-color: {C_SLATE}; }}
+.box-comprobado {{ background-color: {C_NAVY}; }}
 .box-no-necesario {{ background-color: {C_AMARILLO_ACENTO}; }}
 
 .success-box {{
