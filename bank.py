@@ -26,8 +26,43 @@ import pandas as pd
 # ============================================================
 # Todas comparten la misma forma; se puede agregar un banco nuevo sin tocar código,
 # nada más añadiendo una entrada aquí (o el usuario puede mapear a mano en la UI).
+#
+# Cada plantilla lleva además, al final, los sinónimos de `_SINONIMOS_UNIVERSALES`
+# (ver abajo): algunas cuentas (p. ej. tarjetas corporativas administradas en
+# inglés) exportan encabezados como "Date"/"Concept" sin importar qué banco haya
+# elegido la persona en el selector, y antes esas columnas se perdían por
+# completo si el wildcard español no aparecía en ningún lado de la plantilla
+# elegida (quedaban fuera de rename_map y el DataFrame resultante ni siquiera
+# tenía columna "Fecha" o "Descripción").
+_SINONIMOS_UNIVERSALES: dict[str, str] = {
+    "date": "Fecha",
+    "concept": "Descripción",
+    "description": "Descripción",
+    "memo": "Descripción",
+    "débito": "Cargo",
+    "debito": "Cargo",
+    "charge": "Cargo",
+    "debit": "Cargo",
+    "crédito": "Abono",
+    "credito": "Abono",
+    "credit": "Abono",
+    "deposit": "Abono",
+    "amount": "Importe",
+    "balance": "Saldo",
+}
+
+
+def _con_sinonimos_universales(plantilla: dict[str, str]) -> dict[str, str]:
+    """Agrega `_SINONIMOS_UNIVERSALES` al final de una plantilla de banco, sin
+    pisar ninguna entrada que la plantilla ya traiga."""
+    combinada = dict(plantilla)
+    for wildcard, nombre_estandar in _SINONIMOS_UNIVERSALES.items():
+        combinada.setdefault(wildcard, nombre_estandar)
+    return combinada
+
+
 PLANTILLAS_BANCO: dict[str, dict[str, str]] = {
-    "Santander 011-1": {
+    "Santander 011-1": _con_sinonimos_universales({
         "fecha": "Fecha",
         "descripción": "Descripción",
         "descripcion": "Descripción",
@@ -39,8 +74,8 @@ PLANTILLAS_BANCO: dict[str, dict[str, str]] = {
         "monto": "Importe",
         "valor": "Importe",
         "saldo": "Saldo",
-    },
-    "BBVA": {
+    }),
+    "BBVA": _con_sinonimos_universales({
         "fecha": "Fecha",
         "descripción": "Descripción",
         "descripcion": "Descripción",
@@ -50,8 +85,8 @@ PLANTILLAS_BANCO: dict[str, dict[str, str]] = {
         "importe": "Importe",
         "monto": "Importe",
         "saldo": "Saldo",
-    },
-    "ICBC": {
+    }),
+    "ICBC": _con_sinonimos_universales({
         "fecha": "Fecha",
         "descripción": "Descripción",
         "descripcion": "Descripción",
@@ -61,8 +96,8 @@ PLANTILLAS_BANCO: dict[str, dict[str, str]] = {
         "importe": "Importe",
         "monto": "Importe",
         "saldo": "Saldo",
-    },
-    "Genérico (detectar automáticamente)": {
+    }),
+    "Genérico (detectar automáticamente)": _con_sinonimos_universales({
         "fecha": "Fecha",
         "descripción": "Descripción",
         "descripcion": "Descripción",
@@ -78,8 +113,27 @@ PLANTILLAS_BANCO: dict[str, dict[str, str]] = {
         "monto": "Importe",
         "valor": "Importe",
         "saldo": "Saldo",
-    },
+    }),
 }
+
+# Palabras que indican "cargo" (egreso) o "abono" (ingreso) dentro de un encabezado,
+# usadas para detectar una sola columna que combina ambos conceptos (ver
+# `_es_columna_combinada_cargo_abono`). Van aparte de PLANTILLAS_BANCO porque esta
+# detección aplica sin importar el banco/plantilla elegida.
+_PALABRAS_CARGO = ("cargo", "débito", "debito", "charge", "debit")
+_PALABRAS_ABONO = ("abono", "crédito", "credito", "credit", "deposit")
+
+
+def _es_columna_combinada_cargo_abono(col_lower: str) -> bool:
+    """Detecta un encabezado que mezcla cargo Y abono en una sola columna
+    (p. ej. "Cargo/abono", "Charge/Credit"): el importe ya viene con signo
+    (negativo = cargo, positivo = abono), así que debe tratarse como 'Importe'
+    y NO como 'Cargo' solo, porque de lo contrario se le aplicaría valor
+    absoluto y cualquier abono (depósito/reembolso) se registraría como
+    negativo por error."""
+    tiene_cargo = any(p in col_lower for p in _PALABRAS_CARGO)
+    tiene_abono = any(p in col_lower for p in _PALABRAS_ABONO)
+    return tiene_cargo and tiene_abono
 
 BANCOS_DISPONIBLES = list(PLANTILLAS_BANCO.keys())
 
@@ -263,6 +317,9 @@ def detectar_mapa_columnas(
     rename_map: dict[str, str] = {}
     for col in columnas_originales:
         col_lower = str(col).strip().lower()
+        if _es_columna_combinada_cargo_abono(col_lower) and "Importe" not in rename_map.values():
+            rename_map[col] = "Importe"
+            continue
         for wildcard, nombre_estandar in plantilla.items():
             if wildcard in col_lower and nombre_estandar not in rename_map.values():
                 rename_map[col] = nombre_estandar
