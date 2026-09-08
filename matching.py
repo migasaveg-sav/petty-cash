@@ -23,36 +23,60 @@ def calcular_matches_automaticos(
     facturas_por_gasto: dict[int, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     """
-    Para cada gasto pendiente (sin facturas ya asignadas manualmente), busca la factura
-    disponible en el pool cuyo monto esté más cercano. Regresa una lista de sugerencias:
+    Busca, entre todos los gastos pendientes (sin facturas ya asignadas manualmente) y
+    todas las facturas disponibles en el pool, la mejor asignación global posible por
+    monto. Regresa una lista de sugerencias:
     {"idx", "gasto", "monto_gasto", "factura", "diferencia", "tipo": "exacto"|"revision"}
-    Cada factura del pool se sugiere para un solo gasto (primero en llegar, primero en servir).
+    Cada factura del pool se sugiere para un solo gasto, y cada gasto recibe a lo más
+    una sugerencia.
+
+    La asignación se hace por "mejor par primero" (se ordenan TODAS las combinaciones
+    gasto-factura candidatas por qué tan cerca está su monto, de menor a mayor
+    diferencia, y se van tomando en ese orden mientras ambos lados sigan libres) en vez
+    de recorrer los gastos en el orden en que vienen y quedarse con la factura más
+    cercana todavía disponible en ese momento. La diferencia importa: con el orden de
+    llegada, un gasto sin factura real (o con una coincidencia mediocre) puede "robarse"
+    la factura que en realidad es un match exacto de un gasto que se procesa después,
+    dejando ambos mal emparejados. Ordenar por calidad de coincidencia primero asegura
+    que los matches exactos (diferencia 0) siempre se asignen antes que cualquier
+    coincidencia "a revisar", sin importar en qué posición aparezca cada gasto.
 
     `facturas_por_gasto` se recibe como parámetro (en vez de leerse de st.session_state)
     para que esta función se pueda probar sin Streamlit.
     """
-    usados_pool_ids: set[Any] = set()
-    sugerencias: list[dict[str, Any]] = []
+    candidatos: list[tuple[float, int, dict[str, Any], float]] = []
     for idx in pendientes_idx:
         if facturas_por_gasto.get(idx):
             continue  # este gasto ya tiene facturas asignadas manualmente
         if idx not in df.index:
             continue
-        gasto = df.loc[idx]
-        monto_gasto = abs(float(gasto["Monto"]))
-        disponibles = [f for f in pool if f["_id"] not in usados_pool_ids]
-        if not disponibles:
-            continue
-        mejor = min(disponibles, key=lambda f: abs(monto_gasto - abs(f["Monto Total"])))
-        diferencia = round(monto_gasto - abs(mejor["Monto Total"]), 2)
+        monto_gasto = abs(float(df.loc[idx, "Monto"]))
         umbral = max(UMBRAL_SUGERENCIA_ABS, monto_gasto * UMBRAL_SUGERENCIA_PCT)
-        if abs(diferencia) <= umbral:
-            tipo = "exacto" if abs(diferencia) <= 0.01 else "revision"
-            sugerencias.append({
-                "idx": idx, "gasto": gasto, "monto_gasto": monto_gasto,
-                "factura": mejor, "diferencia": diferencia, "tipo": tipo,
-            })
-            usados_pool_ids.add(mejor["_id"])
+        for factura in pool:
+            diferencia_abs = abs(monto_gasto - abs(factura["Monto Total"]))
+            if diferencia_abs <= umbral:
+                candidatos.append((diferencia_abs, idx, factura, monto_gasto))
+
+    # Orden estable: a igualdad de diferencia, respeta el orden original de
+    # pendientes_idx/pool para que el resultado sea determinista.
+    candidatos.sort(key=lambda c: c[0])
+
+    usados_idx: set[int] = set()
+    usados_pool_ids: set[Any] = set()
+    sugerencias: list[dict[str, Any]] = []
+    for diferencia_abs, idx, factura, monto_gasto in candidatos:
+        if idx in usados_idx or factura["_id"] in usados_pool_ids:
+            continue
+        diferencia = round(monto_gasto - abs(factura["Monto Total"]), 2)
+        tipo = "exacto" if abs(diferencia) <= 0.01 else "revision"
+        sugerencias.append({
+            "idx": idx, "gasto": df.loc[idx], "monto_gasto": monto_gasto,
+            "factura": factura, "diferencia": diferencia, "tipo": tipo,
+        })
+        usados_idx.add(idx)
+        usados_pool_ids.add(factura["_id"])
+
+    sugerencias.sort(key=lambda s: pendientes_idx.index(s["idx"]))
     return sugerencias
 
 
