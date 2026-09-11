@@ -126,14 +126,37 @@ _PALABRAS_ABONO = ("abono", "crédito", "credito", "credit", "deposit")
 
 def _es_columna_combinada_cargo_abono(col_lower: str) -> bool:
     """Detecta un encabezado que mezcla cargo Y abono en una sola columna
-    (p. ej. "Cargo/abono", "Charge/Credit"): el importe ya viene con signo
-    (negativo = cargo, positivo = abono), así que debe tratarse como 'Importe'
-    y NO como 'Cargo' solo, porque de lo contrario se le aplicaría valor
-    absoluto y cualquier abono (depósito/reembolso) se registraría como
-    negativo por error."""
+    (p. ej. "Cargo/abono", "Charge/Credit"). Ojo: esto NO implica por sí solo
+    que la columna traiga el monto firmado — algunos bancos (ver
+    `_signo_desde_bandera`) usan un encabezado así sólo como bandera de
+    dirección ("-"/"+") y ponen el monto real en una columna 'Importe'
+    aparte. `detectar_mapa_columnas` decide cuál es cuál mirando si ya existe
+    una columna de importe inequívoca entre las demás."""
     tiene_cargo = any(p in col_lower for p in _PALABRAS_CARGO)
     tiene_abono = any(p in col_lower for p in _PALABRAS_ABONO)
     return tiene_cargo and tiene_abono
+
+
+# Tokens que indican dirección (no monto) cuando "Cargo/Abono" viene como columna
+# de bandera separada de una columna 'Importe' real con la magnitud (ver
+# `_signo_desde_bandera` y el caso especial en `_construir_columna_monto`).
+_BANDERAS_CARGO = {"-", "cargo", "debito", "débito"}
+_BANDERAS_ABONO = {"+", "abono", "credito", "crédito"}
+
+
+def _signo_desde_bandera(valor: Any) -> float | None:
+    """Traduce una bandera de dirección ("-", "+", "cargo", "abono", ...) a
+    -1.0/+1.0. Regresa None si el valor no es ninguna bandera reconocida (p. ej.
+    porque en realidad es un monto numérico, no una bandera) — el llamador usa
+    ese None para decidir que esta columna no es de banderas."""
+    if valor is None:
+        return None
+    v = str(valor).strip().lower()
+    if v in _BANDERAS_CARGO:
+        return -1.0
+    if v in _BANDERAS_ABONO:
+        return 1.0
+    return None
 
 BANCOS_DISPONIBLES = list(PLANTILLAS_BANCO.keys())
 
@@ -313,11 +336,31 @@ def detectar_mapa_columnas(
 ) -> dict[str, str]:
     """Regresa {columna_original: nombre_estándar} usando coincidencia de wildcard
     (substring, sin distinguir mayúsculas) contra la plantilla. Cada nombre estándar
-    se usa a lo más una vez (la primera columna que coincide gana)."""
+    se usa a lo más una vez (la primera columna que coincide gana).
+
+    Caso especial: una columna con encabezado tipo "Cargo/Abono" (mezcla ambas
+    palabras) normalmente SÍ trae el monto ya firmado (negativo/positivo) en una
+    sola columna, así que se mapea directo a 'Importe' en vez de 'Cargo' (que le
+    aplicaría valor absoluto más adelante y perdería el signo de cualquier abono).
+    Pero si YA existe, entre las demás columnas del archivo, una columna de
+    importe inequívoca (coincide con un wildcard como "importe"/"monto"/"valor"),
+    esa "Cargo/Abono" se trata como lo que probablemente es: sólo una bandera de
+    dirección ("-"/"+") que acompaña al monto real de la otra columna, y se mapea
+    normal (a 'Cargo', vía la plantilla) — el signo se reconstruye después en
+    `_construir_columna_monto` a partir de esa bandera."""
+    columnas_lower = {col: str(col).strip().lower() for col in columnas_originales}
+    combinadas = {col for col, cl in columnas_lower.items() if _es_columna_combinada_cargo_abono(cl)}
+    wildcards_importe = {w for w, estandar in plantilla.items() if estandar == "Importe"}
+    hay_importe_real = any(
+        any(w in columnas_lower[col] for w in wildcards_importe)
+        for col in columnas_originales
+        if col not in combinadas
+    )
+
     rename_map: dict[str, str] = {}
     for col in columnas_originales:
-        col_lower = str(col).strip().lower()
-        if _es_columna_combinada_cargo_abono(col_lower) and "Importe" not in rename_map.values():
+        col_lower = columnas_lower[col]
+        if col in combinadas and not hay_importe_real and "Importe" not in rename_map.values():
             rename_map[col] = "Importe"
             continue
         for wildcard, nombre_estandar in plantilla.items():
@@ -330,11 +373,23 @@ def detectar_mapa_columnas(
 def _construir_columna_monto(df: pd.DataFrame) -> pd.Series:
     """Construye la columna 'Monto' final a partir de las columnas normalizadas
     disponibles, sin que una le gane a la otra por accidente:
-    - Si hay 'Importe': se usa tal cual (ya viene con signo).
+    - Si 'Cargo' es en realidad una columna de bandera de dirección ("-"/"+"/
+      "cargo"/"abono", ver `_signo_desde_bandera`) y el monto real vive en una
+      columna 'Importe' aparte (formato usado por algunos exportes, p. ej.
+      Santander: "Cargo/Abono" trae sólo el signo y "Importe" el monto sin
+      signo): Monto = signo(Cargo) * abs(Importe).
+    - Si no aplica lo anterior y hay 'Importe': se usa tal cual (ya viene con
+      signo).
     - Si hay 'Cargo' y/o 'Abono' por separado: Monto = Abono - Cargo (cada una
       tratada como número positivo; si el banco ya trae a Cargo en negativo se
       normaliza con valor absoluto antes de restar, para no duplicar el signo).
     """
+    if "Importe" in df.columns and "Cargo" in df.columns and "Abono" not in df.columns and not df.empty:
+        signos = df["Cargo"].map(_signo_desde_bandera)
+        if signos.notna().all():
+            magnitud = pd.to_numeric(df["Importe"], errors="coerce").fillna(0.0).abs()
+            return (signos.astype(float) * magnitud).astype(float)
+
     if "Importe" in df.columns:
         return pd.to_numeric(df["Importe"], errors="coerce").fillna(0.0).astype(float)
 
@@ -352,6 +407,27 @@ def _construir_columna_monto(df: pd.DataFrame) -> pd.Series:
         # ninguna de las dos columnas existe
         return pd.Series(0.0, index=df.index)
     return (abono - cargo).astype(float)
+
+
+_PATRON_FECHA_8_DIGITOS = re.compile(r"^\d{8}$")
+
+
+def _normalizar_fecha_serie(serie: pd.Series) -> pd.Series:
+    """Convierte la columna 'Fecha' cruda a 'YYYY-MM-DD'.
+
+    Algunos exportes (p. ej. cierto formato de Santander) traen la fecha como
+    8 dígitos pegados sin separador (p. ej. "03082026"), en orden DDMMAAAA.
+    `pd.to_datetime` no puede inferir ese formato de forma confiable (cae a
+    parseo elemento por elemento con dateutil, que para una cadena de puro
+    dígitos sin separadores puede fallar o adivinar mal) y esas fechas
+    terminaban en NaT/vacío. Si la mayoría de los valores no nulos tiene ese
+    patrón, se parsean explícitamente como día-mes-año; si no, se usa el
+    parseo genérico de siempre."""
+    serie_texto = serie.astype(str).str.strip()
+    no_nulos = serie_texto[serie.notna() & (serie_texto != "") & (serie_texto.str.lower() != "nan")]
+    if not no_nulos.empty and no_nulos.map(lambda v: bool(_PATRON_FECHA_8_DIGITOS.match(v))).mean() > 0.5:
+        return pd.to_datetime(serie_texto, format="%d%m%Y", errors="coerce").dt.strftime("%Y-%m-%d")
+    return pd.to_datetime(serie, errors="coerce").dt.strftime("%Y-%m-%d")
 
 
 def cargar_estado_cuenta(
@@ -401,7 +477,7 @@ def cargar_estado_cuenta(
     df["Monto"] = _construir_columna_monto(df)
 
     if "Fecha" in df.columns:
-        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.strftime("%Y-%m-%d")
+        df["Fecha"] = _normalizar_fecha_serie(df["Fecha"])
 
     if "Saldo" in df.columns:
         df["Saldo"] = pd.to_numeric(df["Saldo"], errors="coerce")
