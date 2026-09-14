@@ -54,11 +54,12 @@ from persistence import (
 # de contraste (WCAG AA) -incluido el naranja, que con texto blanco encima
 # sólo daba 2.7:1: se usa con texto azul marino (4.83:1) en su lugar-.
 # ============================================================
-C_FONDO = "#F2F4F5"            # fondo general de la página (gris muy claro)
+C_FONDO = "#C7D1DC"            # fondo general de la página (azul grisáceo, contrasta con tarjetas blancas)
 C_TARJETA = "#FFFFFF"          # superficies claras puntuales
-C_BORDE = "#BDC3C2"            # bordes sobre fondo claro
-C_TEXTO_OSCURO = "#2B2F43"     # texto principal sobre fondo claro (12:1)
-C_TEXTO_SECUNDARIO = "#5B6472" # texto secundario / captions (5.4:1)
+C_BORDE = "#647385"            # bordes sobre fondo claro (ajustado para seguir contrastando sobre el nuevo fondo)
+C_TEXTO_OSCURO = "#2B2F43"     # texto principal sobre fondo claro (8.5:1 sobre C_FONDO)
+C_TEXTO_SECUNDARIO = "#3F4759" # texto secundario / captions (6:1 sobre C_FONDO, 9.3:1 sobre blanco)
+C_BORDE_BITACORA = "#344B4A"   # borde de celdas de la tabla de bitácora (pedido explícito del usuario)
 C_NAVY = "#2B2F43"             # azul marino oscuro — cuadros, tarjetas, sidebar (13.2:1 con blanco)
 C_SLATE = "#4A5E76"            # azul grisáceo — estados secundarios (6.7:1 con blanco)
 C_ACENTO = "#F4794A"           # naranja de acento — botones primarios, foco, pestaña activa
@@ -94,6 +95,16 @@ def init_state() -> None:
         "aplicantes": None,
         "solicitud_en_proceso": None,
         "solicitud_form_version": 0,
+        # Idx del gasto cuyo diálogo "Trabajar gasto" está abierto (o None si
+        # ninguno). Se guarda en session_state -en vez de invocar el diálogo
+        # directo dentro del "if st.button(Abrir)"- porque un st.rerun() disparado
+        # desde DENTRO del diálogo (p.ej. al agregar/quitar una factura) cierra el
+        # modal si su apertura sólo dependía de ese click puntual: al no volver a
+        # evaluarse ese "if" como verdadero en la siguiente ejecución, el diálogo
+        # no se vuelve a invocar y desaparece. Con la bandera persistente, cada
+        # rerun (incluidos los internos) lo vuelve a abrir con el mismo gasto.
+        "gasto_abierto_idx": None,
+        "gasto_abierto_solicitud": None,
     })
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -128,11 +139,16 @@ td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
 [data-testid="stMetricValue"] {{ color: {C_NAVY}; font-weight: 700; }}
 [data-testid="stMetricLabel"] {{ color: {C_TEXTO_SECUNDARIO}; }}
 
-/* -------- Pestañas -------- */
-[data-baseweb="tab-list"] {{ border-bottom: 2px solid {C_BORDE}; gap: 4px; }}
-[data-baseweb="tab"] {{ color: {C_TEXTO_SECUNDARIO}; font-weight: 600; }}
-[data-baseweb="tab"][aria-selected="true"] {{ color: {C_NAVY}; }}
-[data-baseweb="tab-highlight"] {{ background-color: {C_ACENTO} !important; height: 3px !important; }}
+/* -------- Pestañas --------
+   Streamlit 1.6x ya no usa los atributos data-baseweb="tab"/"tab-list"/"tab-highlight"
+   (quedaron de una versión anterior y nunca hacían match); el marcado actual usa
+   role="tablist"/"tab" y data-testid="stTab", con el texto dentro de un <p>. Se fuerza
+   el color con !important porque Streamlit también le pone color al <p> según
+   primaryColor (naranja) del tema. */
+[role="tablist"] {{ border-bottom: 2px solid {C_BORDE}; gap: 4px; }}
+[data-testid="stTab"], [data-testid="stTab"] p {{ color: {C_TEXTO_SECUNDARIO} !important; font-weight: 600; }}
+[data-testid="stTab"][aria-selected="true"], [data-testid="stTab"][aria-selected="true"] p {{ color: {C_NAVY} !important; }}
+[data-testid="stTab"] .react-aria-SelectionIndicator {{ background-color: {C_ACENTO} !important; height: 3px !important; }}
 
 /* -------- Expander (p.ej. "Gastos pendientes") con encabezado oscuro -------- */
 [data-testid="stExpander"] {{
@@ -204,6 +220,9 @@ section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{ color: #FFFF
 .summary-amount {{ font-size: 1.0rem; opacity: 0.95; }}
 
 .box-pendiente {{ background-color: {C_SLATE}; }}
+.box-pendiente-detalles {{ background-color: {C_ACENTO}; }}
+.box-pendiente-detalles .summary-title, .box-pendiente-detalles .summary-count,
+.box-pendiente-detalles .summary-amount {{ color: {C_NAVY}; }}
 .box-comprobado {{ background-color: {C_NAVY}; }}
 .box-no-necesario {{ background-color: {C_AMARILLO_ACENTO}; }}
 
@@ -216,10 +235,17 @@ section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{ color: #FFFF
 .warn-box {{
     background-color: {C_AMARILLO_ACENTO}; color: white; padding: 8px; border-radius: 6px; font-weight: 600;
 }}
+/* -------- Bitácora de solicitudes: tabla compacta, encabezado rojo con borde
+   inferior grueso, celdas con borde {C_BORDE_BITACORA} -------- */
 .bitacora-header {{
-    background-color: {C_BITACORA_HEADER}; color: white; font-weight: 700; padding: 6px 4px;
-    border-radius: 4px; text-align: center; font-size: 0.85rem;
+    background-color: {C_BITACORA_HEADER}; color: white; font-weight: 600; padding: 4px 6px;
+    text-align: center; font-size: 0.78rem; border-bottom: 3px solid {C_BORDE_BITACORA};
 }}
+.bitacora-fila {{
+    border: 1px solid {C_BORDE_BITACORA}; padding: 4px 6px; font-size: 0.85rem;
+    display: flex; align-items: center; min-height: 30px; background-color: {C_TARJETA};
+}}
+.bitacora-fila-impar {{ background-color: #F4F6F8; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -238,6 +264,7 @@ def money(x) -> str:
 def status_label(estado: str) -> str:
     return {
         "pendiente": "⏳ Sin comprobar",
+        "pendiente_detalles": "🧾 Pendiente de detalles",
         "comprobado": "✅ Comprobado",
         "no_necesario": "🚫 No necesario",
     }.get(estado, estado)
@@ -506,7 +533,7 @@ if df is None:
     st.stop()
 
 resumen = resumen_estados(df, st.session_state.estados)
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.markdown(f"""
     <div class="summary-box box-pendiente">
@@ -516,12 +543,19 @@ with col1:
     </div>""", unsafe_allow_html=True)
 with col2:
     st.markdown(f"""
+    <div class="summary-box box-pendiente-detalles">
+        <div class="summary-title">🧾 PENDIENTE DE DETALLES</div>
+        <div class="summary-count">{resumen['pendiente_detalles']['count']}</div>
+        <div class="summary-amount">{money(resumen['pendiente_detalles']['total'])}</div>
+    </div>""", unsafe_allow_html=True)
+with col3:
+    st.markdown(f"""
     <div class="summary-box box-comprobado">
         <div class="summary-title">✅ COMPROBADOS</div>
         <div class="summary-count">{resumen['comprobado']['count']}</div>
         <div class="summary-amount">{money(resumen['comprobado']['total'])}</div>
     </div>""", unsafe_allow_html=True)
-with col3:
+with col4:
     st.markdown(f"""
     <div class="summary-box box-no-necesario">
         <div class="summary-title">🚫 NO NECESARIOS</div>
@@ -537,8 +571,8 @@ if total_monto > 0:
 
 st.write("")
 
-tab_pendientes, tab_comprobados, tab_no_necesarios, tab_resumen = st.tabs(
-    ["⏳ Pendientes", "✅ Comprobados", "🚫 No necesarios", "📊 Resumen y descarga"]
+tab_pendientes, tab_detalles, tab_comprobados, tab_no_necesarios, tab_resumen = st.tabs(
+    ["⏳ Pendientes", "🧾 Pendiente de detalles", "✅ Comprobados", "🚫 No necesarios", "📊 Resumen y descarga"]
 )
 
 
@@ -549,6 +583,44 @@ def _solicitud_por_id(solicitud_id):
     if solicitud_id is None:
         return None
     return next((s for s in st.session_state.solicitudes if s["id"] == solicitud_id), None)
+
+
+def _revertir_a_pendiente(idx: int, origen: str) -> None:
+    """Regresa un gasto ya resuelto (comprobado, pendiente de detalles o no
+    necesario) a estado pendiente, para poder corregirlo. Las facturas que tenía
+    asignadas quedan disponibles de nuevo para editarlas en el diálogo del gasto."""
+    if origen in ("comprobado", "pendiente_detalles"):
+        registro = next((r for r in st.session_state.concatenados if r["idx"] == idx), None)
+        if registro is not None:
+            st.session_state.facturas_por_gasto[idx] = registro["Facturas"]
+            st.session_state.concatenados = [r for r in st.session_state.concatenados if r["idx"] != idx]
+            sol = registro.get("Solicitud")
+            if sol is not None:
+                sol_actual = _solicitud_por_id(sol["id"])
+                if sol_actual is not None:
+                    sol_actual["estado"] = "pendiente"
+                    sol_actual["idx_vinculado"] = None
+    else:
+        st.session_state.no_necesarios = [r for r in st.session_state.no_necesarios if r.get("idx") != idx]
+    st.session_state.estados[idx] = "pendiente"
+    _limpiar_seleccion_tabla_pendientes()
+    _autoguardar_si_activo()
+
+
+def _eliminar_solicitud(solicitud_id: int) -> None:
+    """Elimina un registro de la bitácora agregado por error. Si ya estaba
+    vinculado a un gasto comprobado, primero deshace esa comprobación (el gasto
+    vuelve a 'pendiente' y sus facturas quedan disponibles de nuevo) para no
+    dejar un gasto comprobado con una referencia a una solicitud que ya no existe."""
+    sol = _solicitud_por_id(solicitud_id)
+    if sol is None:
+        return
+    if sol.get("estado") == "comprobado" and sol.get("idx_vinculado") is not None:
+        _revertir_a_pendiente(sol["idx_vinculado"], "comprobado")
+    if st.session_state.solicitud_en_proceso == solicitud_id:
+        st.session_state.solicitud_en_proceso = None
+    st.session_state.solicitudes = [s for s in st.session_state.solicitudes if s["id"] != solicitud_id]
+    _autoguardar_si_activo()
 
 
 @_dialog("📌 Trabajar gasto")
@@ -591,6 +663,8 @@ def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
             # este movimiento no era el correcto para la solicitud; la dejamos
             # pendiente para que se pueda volver a vincular con otro gasto.
             st.session_state.solicitud_en_proceso = None
+        st.session_state.gasto_abierto_idx = None
+        st.session_state.gasto_abierto_solicitud = None
         _limpiar_seleccion_tabla_pendientes()
         _autoguardar_si_activo()
         st.rerun()
@@ -679,29 +753,33 @@ def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
 
     st.markdown("##### 🧾 Facturas agregadas a este gasto")
     if facturas:
-        df_facturas = pd.DataFrame(facturas)
-        columnas_mostrar = [c for c in [
-            "Archivo", "UUID", "RFC Emisor", "Concepto", "Fecha Factura", "IVA", "Monto Total", "Incompleta"
-        ] if c in df_facturas.columns]
-        st.dataframe(
-            df_facturas[columnas_mostrar].style.format({"IVA": money, "Monto Total": money}),
-            use_container_width=True, hide_index=True,
-        )
+        anchos_facturas = [1.6, 1.6, 1.2, 2.2, 1.1, 0.9, 1.1, 0.5]
+        titulos_facturas = ["Archivo", "UUID", "RFC Emisor", "Concepto", "Fecha", "IVA", "Monto Total", ""]
+        enc_facturas = st.columns(anchos_facturas)
+        for col, titulo in zip(enc_facturas, titulos_facturas):
+            col.caption(f"**{titulo}**" if titulo else "")
+        for f in list(facturas):
+            cols_f = st.columns(anchos_facturas)
+            marca = " ⚠️" if f.get("Incompleta") else ""
+            cols_f[0].write(f"{f.get('Archivo', '')}{marca}")
+            cols_f[1].write(f.get("UUID", ""))
+            cols_f[2].write(f.get("RFC Emisor", ""))
+            cols_f[3].write(str(f.get("Concepto", ""))[:40])
+            cols_f[4].write(f.get("Fecha Factura", ""))
+            cols_f[5].write(money(f.get("IVA", 0)))
+            cols_f[6].write(money(f.get("Monto Total", 0)))
+            with cols_f[7]:
+                if st.button("✕", key=f"btn_quitar_factura_{idx}_{f['_id']}",
+                             help="Quitar esta factura de la lista", use_container_width=True):
+                    st.session_state.facturas_por_gasto[idx] = [
+                        fx for fx in st.session_state.facturas_por_gasto[idx] if fx["_id"] != f["_id"]
+                    ]
+                    st.rerun()
         if any(f.get("Incompleta") for f in facturas):
             st.markdown(
                 "<div class='warn-box'>⚠️ Alguna factura de esta lista quedó incompleta al leer el XML "
-                "(revisa la columna 'Incompleta').</div>", unsafe_allow_html=True,
+                "(revisa el ⚠️ junto a su nombre de archivo).</div>", unsafe_allow_html=True,
             )
-
-        quitar = st.multiselect(
-            "Quitar factura(s) de la lista",
-            options=[f["_id"] for f in facturas],
-            format_func=lambda fid: next(f"{etiqueta_factura(f)} · {f['UUID']}" for f in facturas if f["_id"] == fid),
-            key=f"quitar_{idx}",
-        )
-        if quitar and st.button("Quitar seleccionadas", key=f"btn_quitar_{idx}"):
-            st.session_state.facturas_por_gasto[idx] = [f for f in facturas if f["_id"] not in quitar]
-            st.rerun()
 
         suma_facturas = sum(f["Monto Total"] for f in facturas)
         diferencia = round(monto_gasto - suma_facturas, 2)
@@ -733,6 +811,8 @@ def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
                     sol["estado"] = "comprobado"
                     sol["idx_vinculado"] = idx
                     st.session_state.solicitud_en_proceso = None
+                st.session_state.gasto_abierto_idx = None
+                st.session_state.gasto_abierto_solicitud = None
                 st.success("Gasto añadido a los registros.")
                 _limpiar_seleccion_tabla_pendientes()
                 _autoguardar_si_activo()
@@ -932,34 +1012,42 @@ def _mostrar_seccion_solicitudes() -> None:
         else:
             st.session_state.solicitud_en_proceso = None
 
-    anchos_bitacora = [0.7, 1.5, 1.9, 2.2, 1.6, 0.8, 0.9, 1.8, 1.3, 2]
+    anchos_bitacora = [0.6, 1.4, 1.7, 2.0, 1.4, 0.7, 0.8, 1.6, 1.2, 1.8, 0.5]
     titulos_bitacora = [
         "No.", "Applicant", "Category", "Description", "Request #",
-        "Días", "Personas", "Employee", "Material", "",
+        "Días", "Personas", "Employee", "Material", "", "",
     ]
     encabezados = st.columns(anchos_bitacora)
     for col, titulo in zip(encabezados, titulos_bitacora):
         col.markdown(f"<div class='bitacora-header'>{titulo}</div>", unsafe_allow_html=True)
 
-    for sol in st.session_state.solicitudes:
+    def _celda(valor) -> str:
+        return f"<div class='bitacora-fila'>{valor}</div>"
+
+    for fila_n, sol in enumerate(st.session_state.solicitudes):
         cols = st.columns(anchos_bitacora)
-        cols[0].write(f"#{sol['No']}")
-        cols[1].write(sol["Applicant"])
-        cols[2].write(sol["Category"] or "—")
-        cols[3].write(sol.get("Description") or "—")
-        cols[4].write(sol["Request Number"] or "—")
-        cols[5].write(sol["Number of Days"])
-        cols[6].write(sol["Number of People"])
-        cols[7].write(sol["Employee Name"] or "—")
-        cols[8].write(sol["Material"] or "—")
+        valores = [
+            f"#{sol['No']}", sol["Applicant"], sol["Category"] or "—",
+            sol.get("Description") or "—", sol["Request Number"] or "—",
+            sol["Number of Days"], sol["Number of People"],
+            sol["Employee Name"] or "—", sol["Material"] or "—",
+        ]
+        for col, valor in zip(cols[:9], valores):
+            col.markdown(_celda(valor), unsafe_allow_html=True)
         with cols[9]:
             if sol["estado"] == "comprobado":
-                st.caption(f"✅ Comprobado (#{sol['idx_vinculado']})")
+                st.markdown(_celda(f"✅ #{sol['idx_vinculado']}"), unsafe_allow_html=True)
             else:
                 ya_vinculando_otra = st.session_state.solicitud_en_proceso not in (None, sol["id"])
-                if st.button("🔗 Comprobar gasto", key=f"btn_comprobar_sol_{sol['id']}", disabled=ya_vinculando_otra):
+                if st.button("🔗 Comprobar", key=f"btn_comprobar_sol_{sol['id']}", disabled=ya_vinculando_otra,
+                             use_container_width=True):
                     st.session_state.solicitud_en_proceso = sol["id"]
                     st.rerun()
+        with cols[10]:
+            if st.button("✕", key=f"btn_eliminar_sol_{sol['id']}", help="Eliminar este registro de la bitácora",
+                         use_container_width=True):
+                _eliminar_solicitud(sol["id"])
+                st.rerun()
 
     st.download_button(
         "📥 Descargar bitácora (formato Details, .xlsx)",
@@ -1025,9 +1113,19 @@ with tab_pendientes:
                         )
                     with col_btn:
                         if st.button("🔍 Abrir", use_container_width=True, key="btn_abrir_gasto", type="primary"):
-                            dialog_trabajar_gasto(idx_sel, solicitud_id=st.session_state.solicitud_en_proceso)
+                            st.session_state.gasto_abierto_idx = idx_sel
+                            st.session_state.gasto_abierto_solicitud = st.session_state.solicitud_en_proceso
                 else:
                     st.caption("Ningún gasto seleccionado todavía.")
+
+    # Se invoca fuera del "if st.button(...)" para que la bandera en session_state
+    # (y no el click puntual) sea lo único que decide si el diálogo sigue abierto;
+    # así sobrevive a los st.rerun() que se disparan desde dentro de él.
+    if st.session_state.gasto_abierto_idx is not None:
+        dialog_trabajar_gasto(
+            st.session_state.gasto_abierto_idx,
+            solicitud_id=st.session_state.gasto_abierto_solicitud,
+        )
 
     st.divider()
     with st.expander("🔁 Emparejamiento automático de facturas", expanded=False):
@@ -1108,8 +1206,19 @@ with tab_pendientes:
                     "Categoria": categoria,
                     "Material": material,
                     "Facturas": [factura],
+                    # Un gasto emparejado automáticamente todavía no tiene los datos
+                    # administrativos de la bitácora (Applicant, Employee, etc.) — se
+                    # queda en "pendiente_detalles" hasta completarlos en esa pestaña,
+                    # en vez de darlo por "comprobado" de una vez.
+                    "DetallesPendientes": True,
+                    "Applicant": "",
+                    "Employee Name": "",
+                    "Description": "",
+                    "Request Number": "",
+                    "Number of Days": 0,
+                    "Number of People": 0,
                 })
-                st.session_state.estados[idx] = "comprobado"
+                st.session_state.estados[idx] = "pendiente_detalles"
                 st.session_state.facturas_por_gasto.pop(idx, None)
                 st.session_state.clasificacion_por_gasto[idx] = {"categoria": categoria, "material": material}
                 st.session_state.pool_facturas = [
@@ -1137,7 +1246,8 @@ with tab_pendientes:
             if st.button("➕ Aplicar coincidencias exactas seleccionadas", type="primary", key="btn_aplicar_exactas"):
                 n = _aplicar_sugerencias_editadas(edited_exactas, sug_exactas)
                 if n:
-                    st.success(f"{n} gasto(s) comprobado(s) automáticamente.")
+                    st.success(f"{n} gasto(s) emparejado(s) automáticamente — pasaron a "
+                               f"«🧾 Pendiente de detalles» para completar sus datos de bitácora.")
                     _limpiar_seleccion_tabla_pendientes()
                     _autoguardar_si_activo()
                     st.rerun()
@@ -1153,7 +1263,8 @@ with tab_pendientes:
             if st.button("➕ Aplicar coincidencias validadas", key="btn_aplicar_revision"):
                 n = _aplicar_sugerencias_editadas(edited_revision, sug_revision)
                 if n:
-                    st.success(f"{n} gasto(s) comprobado(s) tras validación.")
+                    st.success(f"{n} gasto(s) emparejado(s) tras validación — pasaron a "
+                               f"«🧾 Pendiente de detalles» para completar sus datos de bitácora.")
                     _limpiar_seleccion_tabla_pendientes()
                     _autoguardar_si_activo()
                     st.rerun()
@@ -1173,34 +1284,95 @@ with tab_pendientes:
 
 
 # ============================================================
+# PESTAÑA: PENDIENTE DE DETALLES
+# ============================================================
+with tab_detalles:
+    registros_detalle = [r for r in st.session_state.concatenados if r.get("DetallesPendientes")]
+    if not registros_detalle:
+        st.caption(
+            "No hay gastos esperando detalles. Los gastos que se emparejen automáticamente con una "
+            "factura llegan aquí para completar sus datos de bitácora (Applicant, Employee, etc.) antes "
+            "de pasar a «✅ Comprobados»."
+        )
+    else:
+        st.caption(
+            f"{len(registros_detalle)} gasto(s) ya tienen su factura emparejada, pero todavía necesitan "
+            "los datos de bitácora. Complétalos y pulsa «✅ Guardar y comprobar»."
+        )
+        for reg in registros_detalle:
+            idx_d = reg["idx"]
+            facturas_d = reg["Facturas"]
+            with st.expander(
+                f"#{idx_d} · {reg.get('Fecha Estado', '')} · "
+                f"{str(reg.get('Descripción Estado', ''))[:40]} · {money(reg.get('Monto Estado', 0))}"
+            ):
+                st.write(f"**Factura(s) emparejada(s):** " +
+                         ", ".join(etiqueta_factura(f) for f in facturas_d))
+                st.write(f"**Categoría:** {reg.get('Categoria', '') or '—'}  ·  "
+                         f"**Material:** {reg.get('Material', '') or '—'}")
+
+                d1, d2, d3 = st.columns(3)
+                with d1:
+                    applicant_d = _selector_catalogo(
+                        "Applicant", "aplicantes", reg.get("Applicant", ""), f"det_applicant_{idx_d}"
+                    )
+                with d2:
+                    employee_d = _selector_catalogo(
+                        "Employee name", "empleados", reg.get("Employee Name", ""), f"det_employee_{idx_d}"
+                    )
+                with d3:
+                    request_d = st.text_input(
+                        "Request number", value=reg.get("Request Number", ""), key=f"det_request_{idx_d}"
+                    )
+
+                description_d = st.text_input(
+                    "Description", value=reg.get("Description", ""), key=f"det_description_{idx_d}"
+                )
+                d4, d5 = st.columns(2)
+                with d4:
+                    days_d = st.number_input(
+                        "Number of days", min_value=0, step=1,
+                        value=int(reg.get("Number of Days", 0) or 0), key=f"det_days_{idx_d}",
+                    )
+                with d5:
+                    people_d = st.number_input(
+                        "Number of people", min_value=0, step=1,
+                        value=int(reg.get("Number of People", 0) or 0), key=f"det_people_{idx_d}",
+                    )
+
+                bcol1, bcol2 = st.columns(2)
+                with bcol1:
+                    if st.button("✅ Guardar y comprobar", key=f"btn_guardar_detalle_{idx_d}", type="primary",
+                                 use_container_width=True):
+                        if not applicant_d.strip():
+                            st.error("«Applicant» es obligatorio.")
+                        else:
+                            reg["Applicant"] = applicant_d.strip()
+                            reg["Employee Name"] = employee_d
+                            reg["Request Number"] = request_d.strip()
+                            reg["Description"] = description_d.strip()
+                            reg["Number of Days"] = int(days_d)
+                            reg["Number of People"] = int(people_d)
+                            reg["DetallesPendientes"] = False
+                            st.session_state.estados[idx_d] = "comprobado"
+                            st.success(f"Gasto #{idx_d} comprobado.")
+                            _autoguardar_si_activo()
+                            st.rerun()
+                with bcol2:
+                    if st.button("↩️ Revertir a pendiente", key=f"btn_revertir_detalle_{idx_d}",
+                                 use_container_width=True):
+                        _revertir_a_pendiente(idx_d, "pendiente_detalles")
+                        st.rerun()
+
+
+# ============================================================
 # PESTAÑA: COMPROBADOS
 # ============================================================
-def _revertir_a_pendiente(idx: int, origen: str) -> None:
-    """Regresa un gasto ya resuelto (comprobado o no necesario) a estado pendiente,
-    para poder corregirlo. Las facturas que tenía asignadas quedan disponibles de
-    nuevo para editarlas en el diálogo del gasto."""
-    if origen == "comprobado":
-        registro = next((r for r in st.session_state.concatenados if r["idx"] == idx), None)
-        if registro is not None:
-            st.session_state.facturas_por_gasto[idx] = registro["Facturas"]
-            st.session_state.concatenados = [r for r in st.session_state.concatenados if r["idx"] != idx]
-            sol = registro.get("Solicitud")
-            if sol is not None:
-                sol_actual = _solicitud_por_id(sol["id"])
-                if sol_actual is not None:
-                    sol_actual["estado"] = "pendiente"
-                    sol_actual["idx_vinculado"] = None
-    else:
-        st.session_state.no_necesarios = [r for r in st.session_state.no_necesarios if r.get("idx") != idx]
-    st.session_state.estados[idx] = "pendiente"
-    _limpiar_seleccion_tabla_pendientes()
-    _autoguardar_si_activo()
-
-
 with tab_comprobados:
-    if st.session_state.concatenados:
+    registros_comprobados_totales = [r for r in st.session_state.concatenados if not r.get("DetallesPendientes")]
+    if registros_comprobados_totales:
         busqueda_c = st.text_input("🔎 Buscar por descripción", key="busqueda_comprobados")
-        registros = st.session_state.concatenados
+        registros = registros_comprobados_totales
         if busqueda_c:
             registros = [
                 r for r in registros
@@ -1299,6 +1471,7 @@ with tab_resumen:
             suma_facturas = sum(f.get("Monto Total", 0.0) or 0.0 for f in facturas)
             diff = round(abs(float(registro["Monto Estado"])) - suma_facturas, 2)
             incompleta = "Sí" if any(f.get("Incompleta") for f in facturas) else ""
+            status = "Pendiente detalles" if registro.get("DetallesPendientes") else "Comprobado"
             for i, f in enumerate(facturas):
                 primera = i == 0
                 filas.append({
@@ -1317,6 +1490,7 @@ with tab_resumen:
                     "ISR Retenido": f.get("ISR Retenido", 0.0),
                     "Diff": diff if primera else None,
                     "Incompleta": incompleta if primera else "",
+                    "Status": status if primera else "",
                 })
         return filas
 
@@ -1337,6 +1511,7 @@ with tab_resumen:
                 columnas_finales = [
                     "No", "Bank date", "Bank amt", "Category", "Material", "Concepto", "Month",
                     "UUID date", "UUID", "UUID amt", "IVA", "IVA Retenido", "ISR Retenido", "Diff", "Incompleta",
+                    "Status",
                 ]
                 df_export = df_comprobados_vista[columnas_finales].copy()
                 df_export.to_excel(writer, index=False, sheet_name="Comprobados")
