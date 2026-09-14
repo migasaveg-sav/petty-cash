@@ -105,6 +105,12 @@ def init_state() -> None:
         # rerun (incluidos los internos) lo vuelve a abrir con el mismo gasto.
         "gasto_abierto_idx": None,
         "gasto_abierto_solicitud": None,
+        # Contador de versión para la key del uploader masivo de XML del
+        # emparejamiento automático: subirlo fuerza a Streamlit a remontar el
+        # widget vacío, que es la única forma de "vaciarlo" de código (los
+        # uploaders no tienen un método .clear()) — así el botón "Limpiar XML
+        # cargados" puede quitarlos todos de un golpe en vez de uno por uno.
+        "xml_bulk_version": 0,
     })
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -598,8 +604,17 @@ def _revertir_a_pendiente(idx: int, origen: str) -> None:
             if sol is not None:
                 sol_actual = _solicitud_por_id(sol["id"])
                 if sol_actual is not None:
-                    sol_actual["estado"] = "pendiente"
-                    sol_actual["idx_vinculado"] = None
+                    if sol_actual.get("AutoCreada"):
+                        # La creó el emparejamiento automático, no el usuario: al
+                        # revertir el gasto no queda nada real que capturar de vuelta
+                        # en la bitácora, así que se borra en vez de dejar una fila
+                        # vacía en "pendiente".
+                        st.session_state.solicitudes = [
+                            s for s in st.session_state.solicitudes if s["id"] != sol_actual["id"]
+                        ]
+                    else:
+                        sol_actual["estado"] = "pendiente"
+                        sol_actual["idx_vinculado"] = None
     else:
         st.session_state.no_necesarios = [r for r in st.session_state.no_necesarios if r.get("idx") != idx]
     st.session_state.estados[idx] = "pendiente"
@@ -615,8 +630,8 @@ def _eliminar_solicitud(solicitud_id: int) -> None:
     sol = _solicitud_por_id(solicitud_id)
     if sol is None:
         return
-    if sol.get("estado") == "comprobado" and sol.get("idx_vinculado") is not None:
-        _revertir_a_pendiente(sol["idx_vinculado"], "comprobado")
+    if sol.get("estado") in ("comprobado", "pendiente_detalles") and sol.get("idx_vinculado") is not None:
+        _revertir_a_pendiente(sol["idx_vinculado"], sol["estado"])
     if st.session_state.solicitud_en_proceso == solicitud_id:
         st.session_state.solicitud_en_proceso = None
     st.session_state.solicitudes = [s for s in st.session_state.solicitudes if s["id"] != solicitud_id]
@@ -841,8 +856,10 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
     from io import BytesIO
 
     def _facturas_vinculadas(sol: dict) -> list[dict]:
-        """Facturas del gasto vinculado a esta solicitud (o [] si sigue pendiente)."""
-        if sol.get("estado") != "comprobado" or sol.get("idx_vinculado") is None:
+        """Facturas del gasto vinculado a esta solicitud (o [] si sigue sin vincular).
+        Incluye también las de un gasto en "pendiente_detalles": ya tiene factura
+        emparejada aunque todavía falten los datos administrativos."""
+        if sol.get("estado") not in ("comprobado", "pendiente_detalles") or sol.get("idx_vinculado") is None:
             return []
         registro = next((c for c in concatenados if c["idx"] == sol["idx_vinculado"]), None)
         if registro is None:
@@ -895,7 +912,10 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
                 "Total Number of People": sol.get("Number of People", 0) if primera else None,
                 "Employee Name": (sol.get("Employee Name") or "") if primera else "",
                 "Material": (sol.get("Material") or "") if primera else "",
-                "Status": ("Comprobado" if sol.get("estado") == "comprobado" else "Pendiente") if primera else "",
+                "Status": ({
+                    "comprobado": "Comprobado",
+                    "pendiente_detalles": "Pendiente detalles",
+                }.get(sol.get("estado"), "Pendiente")) if primera else "",
             }
             fila.update(_comprobacion_de(sol, factura, primera))
             filas.append(fila)
@@ -928,6 +948,33 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
         }
         for nombre, ancho in anchos.items():
             ws.set_column(columnas_df.index(nombre), columnas_df.index(nombre), ancho)
+
+        # -------- Hojas extra: "No necesarios" y "Por comprobar" --------
+        # Con los gastos emparejados automáticamente ya representados en "Details"
+        # (como "Pendiente detalles"), este Excel de la bitácora cubre prácticamente
+        # lo mismo que el de "Resumen y descargas"; se agregan estas dos hojas para
+        # que sea igual de completo sin tener que descargar los dos por separado.
+        no_necesarios = st.session_state.get("no_necesarios", [])
+        cols_nn = ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
+        df_nn_todo = pd.DataFrame(no_necesarios)
+        cols_nn_presentes = [c for c in cols_nn if c in df_nn_todo.columns]
+        if cols_nn_presentes:
+            df_nn_todo[cols_nn_presentes].to_excel(writer, index=False, sheet_name="No necesarios")
+        else:
+            pd.DataFrame(columns=cols_nn).to_excel(writer, index=False, sheet_name="No necesarios")
+
+        bank_df = st.session_state.get("bank_df")
+        estados = st.session_state.get("estados", {})
+        cols_pend = ["Fecha", "Descripción", "Monto", "Saldo"]
+        if bank_df is not None:
+            df_pend_todo = bank_df[bank_df.index.map(lambda i: estados.get(i) == "pendiente")]
+            cols_pend_presentes = [c for c in cols_pend if c in df_pend_todo.columns]
+        else:
+            df_pend_todo = pd.DataFrame(columns=cols_pend)
+            cols_pend_presentes = cols_pend
+        (df_pend_todo[cols_pend_presentes] if cols_pend_presentes else df_pend_todo).to_excel(
+            writer, index=False, sheet_name="Por comprobar"
+        )
 
     return output.getvalue()
 
@@ -1027,7 +1074,7 @@ def _mostrar_seccion_solicitudes() -> None:
     for fila_n, sol in enumerate(st.session_state.solicitudes):
         cols = st.columns(anchos_bitacora)
         valores = [
-            f"#{sol['No']}", sol["Applicant"], sol["Category"] or "—",
+            f"#{sol['No']}", sol["Applicant"] or "—", sol["Category"] or "—",
             sol.get("Description") or "—", sol["Request Number"] or "—",
             sol["Number of Days"], sol["Number of People"],
             sol["Employee Name"] or "—", sol["Material"] or "—",
@@ -1037,6 +1084,12 @@ def _mostrar_seccion_solicitudes() -> None:
         with cols[9]:
             if sol["estado"] == "comprobado":
                 st.markdown(_celda(f"✅ #{sol['idx_vinculado']}"), unsafe_allow_html=True)
+            elif sol["estado"] == "pendiente_detalles":
+                # La creó (o la retomó) el emparejamiento automático: ya está
+                # vinculada a un gasto, sólo falta completar sus datos en la
+                # pestaña "🧾 Pendiente de detalles" (no tiene sentido volver a
+                # ofrecer "Comprobar" porque el vínculo ya existe).
+                st.markdown(_celda(f"🧾 #{sol['idx_vinculado']} (faltan datos)"), unsafe_allow_html=True)
             else:
                 ya_vinculando_otra = st.session_state.solicitud_en_proceso not in (None, sol["id"])
                 if st.button("🔗 Comprobar", key=f"btn_comprobar_sol_{sol['id']}", disabled=ya_vinculando_otra,
@@ -1049,6 +1102,11 @@ def _mostrar_seccion_solicitudes() -> None:
                 _eliminar_solicitud(sol["id"])
                 st.rerun()
 
+    st.caption(
+        "El .xlsx incluye la hoja «Details» (con todos los gastos, incluidos los que ya "
+        "tienen factura emparejada automáticamente pero siguen esperando estos datos) más "
+        "«No necesarios» y «Por comprobar»."
+    )
     st.download_button(
         "📥 Descargar bitácora (formato Details, .xlsx)",
         data=_bitacora_a_excel_bytes(st.session_state.solicitudes, st.session_state.concatenados),
@@ -1134,10 +1192,24 @@ with tab_pendientes:
             "asignadas manualmente, buscamos la factura disponible cuyo monto esté más cercano. Las "
             "diferencias de 1 centavo o menos se pueden aplicar directo; el resto necesita tu validación."
         )
-        xml_bulk = st.file_uploader(
-            "Sube uno o más XML de CFDI para emparejar automáticamente",
-            type=["xml"], accept_multiple_files=True, key="xml_bulk_uploader",
-        )
+        col_upl, col_limpiar = st.columns([5, 1.3])
+        with col_upl:
+            xml_bulk = st.file_uploader(
+                "Sube uno o más XML de CFDI para emparejar automáticamente",
+                type=["xml"], accept_multiple_files=True,
+                key=f"xml_bulk_uploader_{st.session_state.xml_bulk_version}",
+            )
+        with col_limpiar:
+            st.write("")  # alinea el botón con la caja del uploader, no con su etiqueta
+            st.write("")
+            if st.button("🗑️ Limpiar XML cargados", key="btn_limpiar_xml_bulk", use_container_width=True,
+                         disabled=not (st.session_state.pool_facturas or xml_bulk),
+                         help="Quita de un solo golpe todos los XML subidos aquí, sin tener que "
+                              "eliminarlos uno por uno."):
+                st.session_state.pool_facturas = []
+                st.session_state.xml_bulk_version += 1
+                st.success("Se limpiaron los XML cargados para el emparejamiento automático.")
+                st.rerun()
         if xml_bulk:
             usados = uuids_consumidos() | {f["UUID"] for f in st.session_state.pool_facturas if f["UUID"] != "SIN-UUID"}
             agregadas, duplicadas, con_error = 0, 0, 0
@@ -1198,6 +1270,33 @@ with tab_pendientes:
                 factura = sug["factura"]
                 categoria = fila.get("Categoría", "") or ""
                 material = fila.get("Material", "") or ""
+                # El gasto emparejado automáticamente todavía no tiene los datos
+                # administrativos de la bitácora (Applicant, Employee, etc.), así que
+                # además de guardarlo se le crea de una vez su propio registro en la
+                # "Bitácora de solicitudes" -igual que si el usuario hubiera empezado
+                # por ahí- ya vinculado a este gasto pero en estado "pendiente_detalles":
+                # aparece en la bitácora esperando esos datos, en vez de quedar invisible
+                # ahí hasta que se completen en la pestaña "Pendiente de detalles".
+                nuevo_no = next_solicitud_id()
+                sol_auto = {
+                    "id": nuevo_no,
+                    "No": nuevo_no,
+                    "Applicant": "",
+                    "Category": categoria,
+                    "Description": "",
+                    "Material": material,
+                    "Employee Name": "",
+                    "Request Number": "",
+                    "Number of Days": 0,
+                    "Number of People": 0,
+                    "estado": "pendiente_detalles",
+                    "idx_vinculado": idx,
+                    # Marca que esta solicitud la creó el emparejamiento automático (no
+                    # el usuario a mano): si el gasto se revierte, este registro se
+                    # borra en vez de quedar como una fila vacía en la bitácora.
+                    "AutoCreada": True,
+                }
+                st.session_state.solicitudes.append(sol_auto)
                 st.session_state.concatenados.append({
                     "idx": idx,
                     "Fecha Estado": sug["gasto"].get("Fecha", ""),
@@ -1206,10 +1305,9 @@ with tab_pendientes:
                     "Categoria": categoria,
                     "Material": material,
                     "Facturas": [factura],
-                    # Un gasto emparejado automáticamente todavía no tiene los datos
-                    # administrativos de la bitácora (Applicant, Employee, etc.) — se
-                    # queda en "pendiente_detalles" hasta completarlos en esa pestaña,
-                    # en vez de darlo por "comprobado" de una vez.
+                    "Solicitud": sol_auto,
+                    # Se queda en "pendiente_detalles" hasta completar esos datos en esa
+                    # pestaña, en vez de darlo por "comprobado" de una vez.
                     "DetallesPendientes": True,
                     "Applicant": "",
                     "Employee Name": "",
@@ -1354,6 +1452,21 @@ with tab_detalles:
                             reg["Number of Days"] = int(days_d)
                             reg["Number of People"] = int(people_d)
                             reg["DetallesPendientes"] = False
+                            # Este gasto ya tiene su propio registro en la bitácora
+                            # (creado al momento del emparejamiento automático) — se
+                            # actualiza con los mismos datos capturados aquí para que
+                            # ambos lados queden consistentes.
+                            sol_vinculada = reg.get("Solicitud")
+                            if sol_vinculada is not None:
+                                sol_actual = _solicitud_por_id(sol_vinculada["id"])
+                                if sol_actual is not None:
+                                    sol_actual["Applicant"] = reg["Applicant"]
+                                    sol_actual["Employee Name"] = reg["Employee Name"]
+                                    sol_actual["Request Number"] = reg["Request Number"]
+                                    sol_actual["Description"] = reg["Description"]
+                                    sol_actual["Number of Days"] = reg["Number of Days"]
+                                    sol_actual["Number of People"] = reg["Number of People"]
+                                    sol_actual["estado"] = "comprobado"
                             st.session_state.estados[idx_d] = "comprobado"
                             st.success(f"Gasto #{idx_d} comprobado.")
                             _autoguardar_si_activo()
