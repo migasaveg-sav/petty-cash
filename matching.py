@@ -13,7 +13,7 @@ import pandas as pd
 UMBRAL_SUGERENCIA_ABS = 500.0
 UMBRAL_SUGERENCIA_PCT = 0.30
 
-ESTADOS = ("pendiente", "comprobado", "no_necesario")
+ESTADOS = ("pendiente", "pendiente_detalles", "comprobado", "no_necesario")
 
 
 def calcular_matches_automaticos(
