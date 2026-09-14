@@ -378,6 +378,16 @@ def _limpiar_seleccion_tabla_pendientes() -> None:
     st.session_state.tabla_pendientes_version = st.session_state.get("tabla_pendientes_version", 0) + 1
 
 
+def _limpiar_seleccion_tabla_comprobados_auto() -> None:
+    """Misma red de seguridad que `_limpiar_seleccion_tabla_pendientes`, mismo motivo,
+    pero para la tabla condensada de comprobados vía emparejamiento automático (pestaña
+    «✅ Comprobados»): si se revierte una fila y la tabla cambia de tamaño, sin esto la
+    posición seleccionada podría quedar apuntando a otra fila -o fuera de rango-."""
+    version_actual = st.session_state.get("tabla_comprobados_auto_version", 0)
+    st.session_state.pop(f"tabla_comprobados_auto_{version_actual}", None)
+    st.session_state.tabla_comprobados_auto_version = version_actual + 1
+
+
 def _selector_catalogo(label: str, catalogo_key: str, valor_actual: str, widget_key: str) -> str:
     """Selectbox respaldado por un catálogo en session_state, con opción de agregar
     un valor nuevo sin salir del flujo."""
@@ -708,7 +718,7 @@ def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
     cl1, cl2 = st.columns(2)
     with cl1:
         clasif["categoria"] = _selector_catalogo(
-            "Categoría", "categorias", clasif.get("categoria", ""), f"categoria_{idx}"
+            "Categoría", "categorias_solicitud", clasif.get("categoria", ""), f"categoria_{idx}"
         )
     with cl2:
         clasif["material"] = _selector_catalogo(
@@ -1325,32 +1335,13 @@ with tab_pendientes:
                 categoria = fila.get("Categoría", "") or ""
                 material = fila.get("Material", "") or ""
                 # El gasto emparejado automáticamente todavía no tiene los datos
-                # administrativos de la bitácora (Applicant, Employee, etc.), así que
-                # además de guardarlo se le crea de una vez su propio registro en la
-                # "Bitácora de solicitudes" -igual que si el usuario hubiera empezado
-                # por ahí- ya vinculado a este gasto pero en estado "pendiente_detalles":
-                # aparece en la bitácora esperando esos datos, en vez de quedar invisible
-                # ahí hasta que se completen en la pestaña "Pendiente de detalles".
-                nuevo_no = next_solicitud_id()
-                sol_auto = {
-                    "id": nuevo_no,
-                    "No": nuevo_no,
-                    "Applicant": "",
-                    "Category": categoria,
-                    "Description": "",
-                    "Material": material,
-                    "Employee Name": "",
-                    "Request Number": "",
-                    "Number of Days": 0,
-                    "Number of People": 0,
-                    "estado": "pendiente_detalles",
-                    "idx_vinculado": idx,
-                    # Marca que esta solicitud la creó el emparejamiento automático (no
-                    # el usuario a mano): si el gasto se revierte, este registro se
-                    # borra en vez de quedar como una fila vacía en la bitácora.
-                    "AutoCreada": True,
-                }
-                st.session_state.solicitudes.append(sol_auto)
+                # administrativos (Applicant, Employee, etc.); se queda en
+                # "pendiente_detalles" (pestaña "🧾 Pendiente de detalles") hasta
+                # completarlos. Ya NO se crea un registro en la "Bitácora de
+                # solicitudes": esa bitácora es exclusivamente para el proceso que el
+                # usuario arranca a mano desde "Nueva solicitud de reembolso" — la
+                # marca "OrigenAutoMatch" es lo que permite mostrar este gasto, una vez
+                # comprobado, en la tabla condensada aparte dentro de "✅ Comprobados".
                 st.session_state.concatenados.append({
                     "idx": idx,
                     "Fecha Estado": sug["gasto"].get("Fecha", ""),
@@ -1359,7 +1350,8 @@ with tab_pendientes:
                     "Categoria": categoria,
                     "Material": material,
                     "Facturas": [factura],
-                    "Solicitud": sol_auto,
+                    "Solicitud": None,
+                    "OrigenAutoMatch": True,
                     # Se queda en "pendiente_detalles" hasta completar esos datos en esa
                     # pestaña, en vez de darlo por "comprobado" de una vez.
                     "DetallesPendientes": True,
@@ -1383,7 +1375,7 @@ with tab_pendientes:
             "Monto gasto": st.column_config.NumberColumn(format="$%.2f"),
             "Monto factura": st.column_config.NumberColumn(format="$%.2f"),
             "Diferencia": st.column_config.NumberColumn(format="$%.2f"),
-            "Categoría": st.column_config.SelectboxColumn(options=st.session_state.categorias),
+            "Categoría": st.column_config.SelectboxColumn(options=st.session_state.categorias_solicitud),
             "Material": st.column_config.SelectboxColumn(options=st.session_state.materiales),
         }
         cols_disabled = ["Fecha gasto", "Descripción gasto", "Monto gasto", "Etiqueta factura",
@@ -1464,7 +1456,7 @@ with tab_detalles:
                 cat_d, mat_d = st.columns(2)
                 with cat_d:
                     categoria_d = _selector_catalogo(
-                        "Categoría", "categorias", reg.get("Categoria", ""), f"det_categoria_{idx_d}"
+                        "Categoría", "categorias_solicitud", reg.get("Categoria", ""), f"det_categoria_{idx_d}"
                     )
                 with mat_d:
                     material_d = _selector_catalogo(
@@ -1519,10 +1511,11 @@ with tab_detalles:
                             st.session_state.clasificacion_por_gasto[idx_d] = {
                                 "categoria": categoria_d, "material": material_d,
                             }
-                            # Este gasto ya tiene su propio registro en la bitácora
-                            # (creado al momento del emparejamiento automático) — se
-                            # actualiza con los mismos datos capturados aquí para que
-                            # ambos lados queden consistentes.
+                            # Compatibilidad con sesiones/JSON guardados antes de este
+                            # cambio: si este registro todavía trae una solicitud
+                            # vinculada (esquema anterior, donde el emparejamiento
+                            # automático sí creaba una en la bitácora), se sigue
+                            # sincronizando; los gastos nuevos ya no la traen.
                             sol_vinculada = reg.get("Solicitud")
                             if sol_vinculada is not None:
                                 sol_actual = _solicitud_por_id(sol_vinculada["id"])
@@ -1552,9 +1545,59 @@ with tab_detalles:
 # ============================================================
 with tab_comprobados:
     registros_comprobados_totales = [r for r in st.session_state.concatenados if not r.get("DetallesPendientes")]
-    if registros_comprobados_totales:
+    registros_auto = [r for r in registros_comprobados_totales if r.get("OrigenAutoMatch")]
+    registros_manual = [r for r in registros_comprobados_totales if not r.get("OrigenAutoMatch")]
+
+    if registros_auto:
+        st.markdown("##### 🔁 Comprobados vía emparejamiento automático")
+        st.caption(
+            "Mismo orden de columnas que «Bitácora de solicitudes». Selecciona una fila y pulsa "
+            "«↩️ Revertir a pendiente» si necesitas deshacerlo."
+        )
+        df_auto = pd.DataFrame([{
+            "No.": f"#{r['idx']}",
+            "Applicant": r.get("Applicant", "") or "—",
+            "Category": r.get("Categoria", "") or "—",
+            "Description": r.get("Description", "") or "—",
+            "Request #": r.get("Request Number", "") or "—",
+            "Días": r.get("Number of Days", 0),
+            "Personas": r.get("Number of People", 0),
+            "Employee": r.get("Employee Name", "") or "—",
+            "Material": r.get("Material", "") or "—",
+        } for r in registros_auto])
+        version_auto = st.session_state.get("tabla_comprobados_auto_version", 0)
+        evento_auto = st.dataframe(
+            df_auto,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key=f"tabla_comprobados_auto_{version_auto}",
+        )
+        filas_sel_auto = evento_auto.selection.rows if evento_auto and evento_auto.selection else []
+        # Misma red de seguridad que en "Gastos pendientes": si la tabla cambió de
+        # tamaño entre una ejecución y otra, la posición seleccionada puede haber
+        # quedado obsoleta o fuera de rango.
+        filas_sel_auto = [f for f in filas_sel_auto if 0 <= f < len(registros_auto)]
+        if filas_sel_auto:
+            reg_sel_auto = registros_auto[filas_sel_auto[0]]
+            col_info_auto, col_btn_auto = st.columns([4, 1])
+            with col_info_auto:
+                st.markdown(
+                    f"**Seleccionado:** #{reg_sel_auto['idx']} · {reg_sel_auto.get('Fecha Estado', '')} · "
+                    f"{str(reg_sel_auto.get('Descripción Estado', ''))[:50]} · "
+                    f"{money(reg_sel_auto.get('Monto Estado', 0))}"
+                )
+            with col_btn_auto:
+                if st.button("↩️ Revertir a pendiente", use_container_width=True, key="btn_revertir_comp_auto"):
+                    _limpiar_seleccion_tabla_comprobados_auto()
+                    _revertir_a_pendiente(reg_sel_auto["idx"], "comprobado")
+                    st.rerun()
+        st.divider()
+
+    if registros_manual:
         busqueda_c = st.text_input("🔎 Buscar por descripción", key="busqueda_comprobados")
-        registros = registros_comprobados_totales
+        registros = registros_manual
         if busqueda_c:
             registros = [
                 r for r in registros
@@ -1579,7 +1622,7 @@ with tab_comprobados:
                 if st.button("↩️ Revertir a pendiente", key=f"revertir_comp_{reg['idx']}"):
                     _revertir_a_pendiente(reg["idx"], "comprobado")
                     st.rerun()
-    else:
+    elif not registros_auto:
         st.caption("Todavía no hay gastos comprobados.")
 
 
