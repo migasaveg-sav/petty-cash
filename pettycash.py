@@ -54,7 +54,7 @@ from persistence import (
 # de contraste (WCAG AA) -incluido el naranja, que con texto blanco encima
 # sólo daba 2.7:1: se usa con texto azul marino (4.83:1) en su lugar-.
 # ============================================================
-C_FONDO = "#006994"            # fondo general de la página (azul grisáceo, contrasta con tarjetas blancas)
+C_FONDO = "#87cefa"            # fondo general de la página (azul grisáceo, contrasta con tarjetas blancas)
 C_TARJETA = "#FFFFFF"          # superficies claras puntuales
 C_BORDE = "#647385"            # bordes sobre fondo claro (ajustado para seguir contrastando sobre el nuevo fondo)
 C_TEXTO_OSCURO = "#2B2F43"     # texto principal sobre fondo claro (8.5:1 sobre C_FONDO)
