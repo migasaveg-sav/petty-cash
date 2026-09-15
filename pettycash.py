@@ -54,14 +54,14 @@ from persistence import (
 # de contraste (WCAG AA) -incluido el naranja, que con texto blanco encima
 # sólo daba 2.7:1: se usa con texto azul marino (4.83:1) en su lugar-.
 # ============================================================
-C_FONDO = "#ADD8E6"            # fondo general de la página (azul grisáceo, contrasta con tarjetas blancas)
+C_FONDO = "#C7D1DC"            # fondo general de la página (azul grisáceo, contrasta con tarjetas blancas)
 C_TARJETA = "#FFFFFF"          # superficies claras puntuales
 C_BORDE = "#647385"            # bordes sobre fondo claro (ajustado para seguir contrastando sobre el nuevo fondo)
 C_TEXTO_OSCURO = "#2B2F43"     # texto principal sobre fondo claro (8.5:1 sobre C_FONDO)
 C_TEXTO_SECUNDARIO = "#3F4759" # texto secundario / captions (6:1 sobre C_FONDO, 9.3:1 sobre blanco)
-C_BORDE_BITACORA = "#DC143C"   # borde de celdas de la tabla de bitácora (pedido explícito del usuario)
-C_NAVY = "#002147"             # azul marino oscuro — cuadros, tarjetas, sidebar (13.2:1 con blanco)
-C_SLATE = "#536878"            # azul grisáceo — estados secundarios (6.7:1 con blanco)
+C_BORDE_BITACORA = "#344B4A"   # borde de celdas de la tabla de bitácora (pedido explícito del usuario)
+C_NAVY = "#2B2F43"             # azul marino oscuro — cuadros, tarjetas, sidebar (13.2:1 con blanco)
+C_SLATE = "#4A5E76"            # azul grisáceo — estados secundarios (6.7:1 con blanco)
 C_ACENTO = "#F4794A"           # naranja de acento — botones primarios, foco, pestaña activa
 C_CORAL_ALERTA = "#C0392B"     # rojo de error/alerta (5.4:1 con blanco)
 C_AMARILLO_ACENTO = "#B45309"  # ámbar de advertencia / "no necesario" (5.0:1 con blanco)
@@ -1008,6 +1008,147 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
     return output.getvalue()
 
 
+def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
+    """Excel del historial completo -pensado para descargarse desde «✅ Comprobados»,
+    y también el que se ofrece en «📊 Resumen y descarga»- con el mismo formato
+    "Details" que ya usa la bitácora de solicitudes (mismas columnas, mismo orden,
+    mismo encabezado rojo), pero cubriendo TODOS los gastos comprobados o pendientes
+    de detalles, vengan o no de una solicitud de la bitácora. Cuando el gasto sí está
+    vinculado a una solicitud se usan los datos administrativos (Applicant, Category,
+    etc.) de esa solicitud; si no, se usan los que el propio gasto haya capturado -por
+    ejemplo los completados en «🧾 Pendiente de detalles»- y si tampoco los tiene,
+    quedan en blanco. Se agregan además las hojas «No necesarios» y «Sin comprobar»
+    para que sea un solo archivo con todo el historial."""
+    from io import BytesIO
+
+    def _datos_admin(registro: dict) -> dict:
+        sol = registro.get("Solicitud")
+        if sol is not None:
+            return {
+                "No_bitacora": sol.get("No"),
+                "Applicant": sol.get("Applicant") or "",
+                "Category": sol.get("Category") or registro.get("Categoria", "") or "",
+                "Description": sol.get("Description") or "",
+                "Linked Request No": sol.get("Request Number") or "",
+                "Number of Days": sol.get("Number of Days", 0) or 0,
+                "Total Number of People": sol.get("Number of People", 0) or 0,
+                "Employee Name": sol.get("Employee Name") or "",
+                "Material": sol.get("Material") or registro.get("Material", "") or "",
+            }
+        return {
+            "No_bitacora": None,
+            "Applicant": registro.get("Applicant", "") or "",
+            "Category": registro.get("Categoria", "") or "",
+            "Description": registro.get("Description", "") or "",
+            "Linked Request No": registro.get("Request Number", "") or "",
+            "Number of Days": registro.get("Number of Days", 0) or 0,
+            "Total Number of People": registro.get("Number of People", 0) or 0,
+            "Employee Name": registro.get("Employee Name", "") or "",
+            "Material": registro.get("Material", "") or "",
+        }
+
+    columnas_df = [
+        "No", "Applicant", "Category", "Description", "Linked Request No",
+        "Number of Days", "Total Number of People", "Employee Name", "Material",
+        "Payment Date", "Expense Outflow Amt", "Bank No", "CFDI Folio",
+        "Reimbursement Cap", "Status",
+    ]
+    encabezados = [
+        "No.", "Applicant", "Category", "Description", "Linked Request No.",
+        "Number of Days", "Total Number of People", "Employee Name", "Material",
+        "Payment Date", "Expense Outflow Amt", "No.", "CFDI Folio",
+        "Reimbursement Cap (With IVA)", "Status",
+    ]
+
+    filas = []
+    for registro in concatenados:
+        admin = _datos_admin(registro)
+        # Sin solicitud vinculada no hay número de solicitud -se usa el número del
+        # movimiento bancario como identificador de la fila, para no dejarla en blanco.
+        no_fila = admin["No_bitacora"] if admin["No_bitacora"] is not None else registro["idx"]
+        status = "Pendiente detalles" if registro.get("DetallesPendientes") else "Comprobado"
+        for i, factura in enumerate(registro.get("Facturas") or [None]):
+            primera = i == 0
+            filas.append({
+                "No": no_fila if primera else None,
+                "Applicant": admin["Applicant"] if primera else "",
+                "Category": admin["Category"] if primera else "",
+                "Description": admin["Description"] if primera else "",
+                "Linked Request No": admin["Linked Request No"] if primera else "",
+                "Number of Days": admin["Number of Days"] if primera else None,
+                "Total Number of People": admin["Total Number of People"] if primera else None,
+                "Employee Name": admin["Employee Name"] if primera else "",
+                "Material": admin["Material"] if primera else "",
+                "Payment Date": registro.get("Fecha Estado", "") if primera else None,
+                "Expense Outflow Amt": (
+                    round(abs(float(registro.get("Monto Estado", 0) or 0)), 2) if primera else None
+                ),
+                "Bank No": no_fila if primera else None,
+                "CFDI Folio": (factura or {}).get("UUID", ""),
+                "Reimbursement Cap": round((factura or {}).get("Monto Total", 0) or 0, 2),
+                "Status": status if primera else "",
+            })
+
+    df_comp = pd.DataFrame(filas, columns=columnas_df) if filas else pd.DataFrame(columns=columnas_df)
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        workbook = writer.book
+        header_fmt = workbook.add_format({
+            "bold": True, "bg_color": C_BITACORA_HEADER, "font_color": "white",
+            "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True,
+        })
+        money_fmt = workbook.add_format({"num_format": "$#,##0.00"})
+        bold_fmt = workbook.add_format({"bold": True})
+
+        df_comp.to_excel(writer, index=False, sheet_name="Comprobados")
+        ws = writer.sheets["Comprobados"]
+        for col_idx, titulo in enumerate(encabezados):
+            ws.write(0, col_idx, titulo, header_fmt)
+        for nombre in ("Expense Outflow Amt", "Reimbursement Cap"):
+            col_idx = columnas_df.index(nombre)
+            ws.set_column(col_idx, col_idx, 20, money_fmt)
+        anchos = {
+            "No": 6, "Applicant": 14, "Category": 24, "Description": 26,
+            "Linked Request No": 24, "Number of Days": 12, "Total Number of People": 14,
+            "Employee Name": 24, "Material": 16, "Payment Date": 14, "Bank No": 8,
+            "CFDI Folio": 38, "Status": 14,
+        }
+        for nombre, ancho in anchos.items():
+            ws.set_column(columnas_df.index(nombre), columnas_df.index(nombre), ancho)
+        if not df_comp.empty:
+            fila_total = len(df_comp) + 1
+            ws.write(fila_total, 0, "Total", bold_fmt)
+            ws.write(fila_total, columnas_df.index("Expense Outflow Amt"),
+                     df_comp["Expense Outflow Amt"].dropna().sum(), money_fmt)
+            ws.write(fila_total, columnas_df.index("Reimbursement Cap"),
+                     df_comp["Reimbursement Cap"].sum(), money_fmt)
+
+        no_necesarios = st.session_state.get("no_necesarios", [])
+        cols_nn = ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
+        df_nn_todo = pd.DataFrame(no_necesarios)
+        cols_nn_presentes = [c for c in cols_nn if c in df_nn_todo.columns]
+        if cols_nn_presentes:
+            df_nn_todo[cols_nn_presentes].to_excel(writer, index=False, sheet_name="No necesarios")
+        else:
+            pd.DataFrame(columns=cols_nn).to_excel(writer, index=False, sheet_name="No necesarios")
+
+        bank_df = st.session_state.get("bank_df")
+        estados = st.session_state.get("estados", {})
+        cols_pend = ["Fecha", "Descripción", "Monto", "Saldo"]
+        if bank_df is not None:
+            df_pend_todo = bank_df[bank_df.index.map(lambda i: estados.get(i) == "pendiente")]
+            cols_pend_presentes = [c for c in cols_pend if c in df_pend_todo.columns]
+        else:
+            df_pend_todo = pd.DataFrame(columns=cols_pend)
+            cols_pend_presentes = cols_pend
+        (df_pend_todo[cols_pend_presentes] if cols_pend_presentes else df_pend_todo).to_excel(
+            writer, index=False, sheet_name="Sin comprobar"
+        )
+
+    return output.getvalue()
+
+
 # Anchos/títulos de la parte "de datos" de la bitácora (todo lo que NO es un
 # botón de acción) — se dibuja como una sola grilla CSS continua (sin huecos
 # entre columnas) para que luzca como una hoja de cálculo real; las dos
@@ -1548,6 +1689,18 @@ with tab_comprobados:
     registros_auto = [r for r in registros_comprobados_totales if r.get("OrigenAutoMatch")]
     registros_manual = [r for r in registros_comprobados_totales if not r.get("OrigenAutoMatch")]
 
+    if st.session_state.concatenados or st.session_state.no_necesarios:
+        st.download_button(
+            label="📥 Descargar Excel del historial",
+            data=_historial_excel_bytes(st.session_state.concatenados),
+            file_name=f"Comprobaciones_{datetime.datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Mismo formato «Details» que la bitácora de solicitudes; incluye también "
+                 "las hojas «No necesarios» y «Sin comprobar».",
+            key="btn_descargar_historial_comprobados",
+        )
+        st.divider()
+
     if registros_auto:
         st.markdown("##### 🔁 Comprobados vía emparejamiento automático")
         st.caption(
@@ -1681,97 +1834,19 @@ with tab_resumen:
 
     st.divider()
     st.markdown("##### 📥 Descargar Excel del historial")
-
-    def filas_excel_comprobado(concatenados):
-        """Una fila POR FACTURA (antes: una fila por gasto con los UUID/Concepto de
-        varias facturas concatenados en una sola celda con '; '.join, ilegible en
-        Excel). Los datos del gasto/movimiento bancario (No., Bank date, Bank amt,
-        Category, Material, Month, Diff, Incompleta) sólo se escriben en la primera
-        fila de cada grupo y se dejan en blanco en las siguientes -mismo No.- para que
-        se vea de un vistazo qué facturas pertenecen al mismo gasto (agrupado por
-        número progresivo) sin duplicar esos montos si alguien suma la columna."""
-        filas = []
-        for no, registro in enumerate(concatenados, start=1):
-            facturas = registro["Facturas"] or [{}]
-            suma_facturas = sum(f.get("Monto Total", 0.0) or 0.0 for f in facturas)
-            diff = round(abs(float(registro["Monto Estado"])) - suma_facturas, 2)
-            incompleta = "Sí" if any(f.get("Incompleta") for f in facturas) else ""
-            status = "Pendiente detalles" if registro.get("DetallesPendientes") else "Comprobado"
-            for i, f in enumerate(facturas):
-                primera = i == 0
-                filas.append({
-                    "No": no if primera else None,
-                    "Bank date": registro["Fecha Estado"] if primera else None,
-                    "Bank amt": registro["Monto Estado"] if primera else None,
-                    "Category": registro.get("Categoria", "") if primera else "",
-                    "Material": registro.get("Material", "") if primera else "",
-                    "Concepto": f.get("Concepto", ""),
-                    "Month": mes_es(registro["Fecha Estado"]) if primera else "",
-                    "UUID date": f.get("Fecha Factura", ""),
-                    "UUID": f.get("UUID", ""),
-                    "UUID amt": f.get("Monto Total", 0.0),
-                    "IVA": f.get("IVA", 0.0),
-                    "IVA Retenido": f.get("IVA Retenido", 0.0),
-                    "ISR Retenido": f.get("ISR Retenido", 0.0),
-                    "Diff": diff if primera else None,
-                    "Incompleta": incompleta if primera else "",
-                    "Status": status if primera else "",
-                })
-        return filas
-
-    df_comprobados_vista = None
-    if st.session_state.concatenados:
-        filas = filas_excel_comprobado(st.session_state.concatenados)
-        df_comprobados_vista = pd.DataFrame(filas)
+    st.caption(
+        "Mismo formato «Details» que la bitácora de solicitudes, con todos los gastos "
+        "comprobados (vengan o no de una solicitud), más las hojas «No necesarios» y "
+        "«Sin comprobar»."
+    )
 
     if st.session_state.concatenados or st.session_state.no_necesarios:
-        from io import BytesIO
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            workbook = writer.book
-            money_fmt = workbook.add_format({"num_format": "$#,##0.00"})
-            bold_fmt = workbook.add_format({"bold": True})
-
-            if df_comprobados_vista is not None:
-                columnas_finales = [
-                    "No", "Bank date", "Bank amt", "Category", "Material", "Concepto", "Month",
-                    "UUID date", "UUID", "UUID amt", "IVA", "IVA Retenido", "ISR Retenido", "Diff", "Incompleta",
-                    "Status",
-                ]
-                df_export = df_comprobados_vista[columnas_finales].copy()
-                df_export.to_excel(writer, index=False, sheet_name="Comprobados")
-                ws = writer.sheets["Comprobados"]
-                for col_name in ["Bank amt", "UUID amt", "IVA", "IVA Retenido", "ISR Retenido", "Diff"]:
-                    col_idx = columnas_finales.index(col_name)
-                    ws.set_column(col_idx, col_idx, 14, money_fmt)
-                fila_total = len(df_export) + 1
-                ws.write(fila_total, 0, "Total", bold_fmt)
-                for col_name in ["Bank amt", "UUID amt", "IVA", "IVA Retenido", "ISR Retenido", "Diff"]:
-                    col_idx = columnas_finales.index(col_name)
-                    ws.write(fila_total, col_idx, df_export[col_name].sum(), money_fmt)
-                ws.set_column(1, 1, 12)
-                ws.set_column(3, 4, 16)
-                ws.set_column(5, 5, 30)
-                ws.set_column(7, 8, 22)
-
-            if st.session_state.no_necesarios:
-                cols_nn_export = [c for c in ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
-                                   if c in pd.DataFrame(st.session_state.no_necesarios).columns]
-                pd.DataFrame(st.session_state.no_necesarios)[cols_nn_export].to_excel(
-                    writer, index=False, sheet_name="No necesarios"
-                )
-
-            df_pend_export = df[df.index.map(lambda i: st.session_state.estados.get(i) == "pendiente")]
-            if not df_pend_export.empty:
-                # a diferencia de la versión original, aquí SÍ se conserva la columna 'Monto'
-                # (antes se perdía en el Excel exportado).
-                df_pend_export.to_excel(writer, index=False, sheet_name="Sin comprobar")
-
         st.download_button(
             label="📥 Descargar Excel (todo el historial)",
-            data=output.getvalue(),
+            data=_historial_excel_bytes(st.session_state.concatenados),
             file_name=f"Comprobaciones_{datetime.datetime.now().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="btn_descargar_historial_resumen",
         )
     else:
         st.caption("Todavía no hay nada que exportar.")
