@@ -54,7 +54,7 @@ from persistence import (
 # de contraste (WCAG AA) -incluido el naranja, que con texto blanco encima
 # sólo daba 2.7:1: se usa con texto azul marino (4.83:1) en su lugar-.
 # ============================================================
-C_FONDO = "#add8e6"            # fondo general de la página (azul grisáceo, contrasta con tarjetas blancas)
+C_FONDO = "#C7D1DC"            # fondo general de la página (azul grisáceo, contrasta con tarjetas blancas)
 C_TARJETA = "#FFFFFF"          # superficies claras puntuales
 C_BORDE = "#647385"            # bordes sobre fondo claro (ajustado para seguir contrastando sobre el nuevo fondo)
 C_TEXTO_OSCURO = "#2B2F43"     # texto principal sobre fondo claro (8.5:1 sobre C_FONDO)
@@ -789,6 +789,7 @@ def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
                         "IVA": mf_iva,
                         "IVA Retenido": 0.0,
                         "ISR Retenido": 0.0,
+                        "ISH": 0.0,
                         "Monto Total": mf_monto,
                         "Incompleta": False,
                         "Advertencias": [],
@@ -1050,13 +1051,15 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
     columnas_df = [
         "No", "Applicant", "Category", "Description", "Linked Request No",
         "Number of Days", "Total Number of People", "Employee Name", "Material",
-        "Payment Date", "Expense Outflow Amt", "Bank No", "CFDI Folio",
+        "Payment Date", "Expense Outflow Amt", "Bank No", "Invoice Date", "CFDI Folio",
+        "IVA", "ISR Retenido", "IVA Retenido", "ISH",
         "Reimbursement Cap", "Status",
     ]
     encabezados = [
         "No.", "Applicant", "Category", "Description", "Linked Request No.",
         "Number of Days", "Total Number of People", "Employee Name", "Material",
-        "Payment Date", "Expense Outflow Amt", "No.", "CFDI Folio",
+        "Payment Date", "Expense Outflow Amt", "No.", "Invoice date", "CFDI Folio",
+        "IVA", "ISR Retenido", "IVA Retenido", "ISH",
         "Reimbursement Cap (With IVA)", "Status",
     ]
 
@@ -1069,6 +1072,7 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
         status = "Pendiente detalles" if registro.get("DetallesPendientes") else "Comprobado"
         for i, factura in enumerate(registro.get("Facturas") or [None]):
             primera = i == 0
+            f = factura or {}
             filas.append({
                 "No": no_fila if primera else None,
                 "Applicant": admin["Applicant"] if primera else "",
@@ -1084,8 +1088,15 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
                     round(abs(float(registro.get("Monto Estado", 0) or 0)), 2) if primera else None
                 ),
                 "Bank No": no_fila if primera else None,
-                "CFDI Folio": (factura or {}).get("UUID", ""),
-                "Reimbursement Cap": round((factura or {}).get("Monto Total", 0) or 0, 2),
+                # Datos fiscales extraídos del XML de cada factura -una fila por
+                # factura, igual que "CFDI Folio"-, no del gasto/movimiento bancario.
+                "Invoice Date": f.get("Fecha Factura", ""),
+                "CFDI Folio": f.get("UUID", ""),
+                "IVA": round(f.get("IVA", 0) or 0, 2),
+                "ISR Retenido": round(f.get("ISR Retenido", 0) or 0, 2),
+                "IVA Retenido": round(f.get("IVA Retenido", 0) or 0, 2),
+                "ISH": round(f.get("ISH", 0) or 0, 2),
+                "Reimbursement Cap": round(f.get("Monto Total", 0) or 0, 2),
                 "Status": status if primera else "",
             })
 
@@ -1105,14 +1116,15 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
         ws = writer.sheets["Comprobados"]
         for col_idx, titulo in enumerate(encabezados):
             ws.write(0, col_idx, titulo, header_fmt)
-        for nombre in ("Expense Outflow Amt", "Reimbursement Cap"):
+        columnas_dinero = ["Expense Outflow Amt", "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap"]
+        for nombre in columnas_dinero:
             col_idx = columnas_df.index(nombre)
-            ws.set_column(col_idx, col_idx, 20, money_fmt)
+            ws.set_column(col_idx, col_idx, 16, money_fmt)
         anchos = {
             "No": 6, "Applicant": 14, "Category": 24, "Description": 26,
             "Linked Request No": 24, "Number of Days": 12, "Total Number of People": 14,
             "Employee Name": 24, "Material": 16, "Payment Date": 14, "Bank No": 8,
-            "CFDI Folio": 38, "Status": 14,
+            "Invoice Date": 14, "CFDI Folio": 38, "Status": 14,
         }
         for nombre, ancho in anchos.items():
             ws.set_column(columnas_df.index(nombre), columnas_df.index(nombre), ancho)
@@ -1121,8 +1133,8 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
             ws.write(fila_total, 0, "Total", bold_fmt)
             ws.write(fila_total, columnas_df.index("Expense Outflow Amt"),
                      df_comp["Expense Outflow Amt"].dropna().sum(), money_fmt)
-            ws.write(fila_total, columnas_df.index("Reimbursement Cap"),
-                     df_comp["Reimbursement Cap"].sum(), money_fmt)
+            for nombre in ("IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap"):
+                ws.write(fila_total, columnas_df.index(nombre), df_comp[nombre].sum(), money_fmt)
 
         no_necesarios = st.session_state.get("no_necesarios", [])
         cols_nn = ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
