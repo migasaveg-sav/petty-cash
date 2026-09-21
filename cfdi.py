@@ -55,6 +55,33 @@ def _parse_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _local_tag(elem: ET.Element) -> str:
+    """Nombre del nodo sin el prefijo de namespace (p. ej. "TrasladosLocales")."""
+    tag = elem.tag
+    return tag.split("}", 1)[1] if "}" in tag else tag
+
+
+def _extraer_ish(root: ET.Element) -> float:
+    """Busca el Impuesto Sobre Hospedaje (ISH) en el complemento de "Impuestos
+    Locales" del CFDI -típico en facturas de hotel-. A diferencia de IVA/ISR, el
+    ISH es un impuesto ESTATAL: no vive en el nodo estándar cfdi:Impuestos sino en
+    un complemento aparte (namespace "implocal", nodo TrasladosLocales con el
+    atributo ImpLocTrasladado describiendo el impuesto). Se busca por nombre de
+    nodo sin depender del prefijo/namespace exacto, ya que el complemento no es
+    parte del estándar CFDI base y su URI puede variar; si no existe ningún nodo
+    así (la gran mayoría de las facturas: Uber, comidas, taxis, etc.), regresa 0.0
+    en vez de marcar la factura como incompleta -es opcional, no un dato faltante-.
+    """
+    total = 0.0
+    for elem in root.iter():
+        if _local_tag(elem) != "TrasladosLocales":
+            continue
+        concepto = (elem.get("ImpLocTrasladado") or "").strip().lower()
+        if "hospedaje" in concepto:
+            total += _parse_float(elem.get("Importe"))
+    return total
+
+
 def parse_cfdi(xml_bytes: bytes, filename: str) -> dict[str, Any]:
     """Extrae los datos relevantes de un CFDI (3.3 o 4.0).
 
@@ -123,6 +150,10 @@ def parse_cfdi(xml_bytes: bytes, filename: str) -> dict[str, Any]:
     if es_nota_credito:
         valor_iva = -valor_iva
 
+    ish = _extraer_ish(root)
+    if es_nota_credito:
+        ish = -ish
+
     conceptos = root.findall(".//cfdi:Concepto", ns)
     concepto = "; ".join(c.get("Descripcion", "") for c in conceptos) if conceptos else "N/A"
 
@@ -140,6 +171,7 @@ def parse_cfdi(xml_bytes: bytes, filename: str) -> dict[str, Any]:
         "IVA": valor_iva,
         "IVA Retenido": iva_retenido,
         "ISR Retenido": isr_retenido,
+        "ISH": ish,
         "Monto Total": monto_total,
         "Tipo Comprobante": TIPOS_COMPROBANTE.get(tipo_comprobante, tipo_comprobante),
         "Es Nota Credito": es_nota_credito,
