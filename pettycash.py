@@ -1372,10 +1372,40 @@ with tab_pendientes:
     if not pendientes_idx:
         st.success("No hay gastos pendientes por comprobar. 🎉")
     else:
-        busqueda = st.text_input("🔎 Buscar por descripción", key="busqueda_pendientes")
-        df_pend = df.loc[df.index.intersection(pendientes_idx)].copy()
+        df_pend_base = df.loc[df.index.intersection(pendientes_idx)].copy()
+
+        col_busq, col_monto = st.columns([2, 1])
+        with col_busq:
+            busqueda = st.text_input("🔎 Buscar por descripción", key="busqueda_pendientes")
+        with col_monto:
+            # Filtro por monto (cargo): se compara sobre el valor absoluto porque a
+            # quien busca "cuánto gasté" no le interesa el signo -en "pendientes"
+            # casi todo son cargos (negativos), pero un abono ocasional no debería
+            # quedar fuera del rango sólo por su signo.
+            rango_monto = None
+            if "Monto" in df_pend_base.columns and not df_pend_base.empty:
+                montos_abs = df_pend_base["Monto"].abs()
+                monto_min_disp = float(montos_abs.min())
+                monto_max_disp = float(montos_abs.max())
+                if monto_max_disp > monto_min_disp:
+                    span = monto_max_disp - monto_min_disp
+                    paso = round(max(span / 200, 1.0), 2)
+                    rango_monto = st.slider(
+                        "💰 Filtrar por monto",
+                        min_value=monto_min_disp,
+                        max_value=monto_max_disp,
+                        value=(monto_min_disp, monto_max_disp),
+                        step=paso,
+                        format="$%.2f",
+                        key="rango_monto_pendientes",
+                        help="Filtra los gastos cuyo monto (en valor absoluto) cae en este rango.",
+                    )
+
+        df_pend = df_pend_base
         if busqueda and "Descripción" in df_pend.columns:
             df_pend = df_pend[df_pend["Descripción"].astype(str).str.contains(busqueda, case=False, na=False)]
+        if rango_monto is not None:
+            df_pend = df_pend[df_pend["Monto"].abs().between(rango_monto[0], rango_monto[1])]
 
         columnas_mostrar = [c for c in ["Fecha", "Descripción", "Monto", "Saldo"] if c in df_pend.columns]
 
