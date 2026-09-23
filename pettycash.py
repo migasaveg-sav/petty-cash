@@ -405,11 +405,24 @@ def _selector_catalogo(label: str, catalogo_key: str, valor_actual: str, widget_
     return elegido
 
 
-def _dialog(title: str, width: str = "large"):
+def _dialog(title: str, width: str = "large", on_dismiss=None):
     """Decorador de diálogo modal, con respaldo si st.dialog no existe en la versión
-    de Streamlit instalada (se muestra inline en vez de en modal)."""
+    de Streamlit instalada (se muestra inline en vez de en modal).
+
+    ``on_dismiss`` se reenvía a ``st.dialog`` cuando está disponible: es la única
+    forma de enterarnos, desde Python, de que el usuario cerró el modal con la "X",
+    con ESC o haciendo clic afuera -sin esto, si el estado que decide "el diálogo
+    está abierto" vive en session_state (necesario para sobrevivir a los
+    st.rerun() internos del diálogo, ver comentario en dialog_trabajar_gasto), ese
+    estado nunca se limpia al cerrar con la "X" y el diálogo reaparece solo en la
+    siguiente interacción con cualquier otra parte de la página.
+    """
     if hasattr(st, "dialog"):
-        return st.dialog(title, width=width)
+        try:
+            return st.dialog(title, width=width, on_dismiss=on_dismiss or "ignore")
+        except TypeError:
+            # Versión de Streamlit sin soporte para on_dismiss.
+            return st.dialog(title, width=width)
 
     def decorador(func):
         def envoltura(*args, **kwargs):
@@ -667,7 +680,21 @@ def _eliminar_solicitud(solicitud_id: int) -> None:
     _autoguardar_si_activo()
 
 
-@_dialog("📌 Trabajar gasto")
+def _cerrar_dialogo_trabajar_gasto() -> None:
+    """Callback de on_dismiss: se ejecuta cuando el usuario cierra el diálogo con
+    la "X", con ESC o haciendo clic afuera (a diferencia de los botones internos
+    del diálogo -"Marcar como no necesario", "Añadir a los registros"-, que ya
+    limpiaban estas mismas dos banderas antes de este fix). Sin esto, cerrar el
+    diálogo así dejaba `gasto_abierto_idx` con el valor del gasto ya cerrado, y el
+    diálogo volvía a aparecer solo -mostrando ese mismo gasto viejo- en cuanto el
+    usuario interactuaba con cualquier otra parte de la página (otra tabla,
+    expandir "Emparejamiento automático de facturas", etc.), aunque no hubiera
+    vuelto a pulsar "Abrir" en ningún gasto."""
+    st.session_state.gasto_abierto_idx = None
+    st.session_state.gasto_abierto_solicitud = None
+
+
+@_dialog("📌 Trabajar gasto", on_dismiss=_cerrar_dialogo_trabajar_gasto)
 def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
     df_actual = st.session_state.bank_df
     if idx not in df_actual.index or st.session_state.estados.get(idx) != "pendiente":
