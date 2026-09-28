@@ -25,6 +25,7 @@ CAMPOS_SESION = [
     "bank_file_id",
     "estados",
     "facturas_por_gasto",
+    "facturas_por_gasto_grupo",
     "clasificacion_por_gasto",
     "pool_facturas",
     "modo_trabajo",
@@ -108,6 +109,12 @@ def cargar_sesion_dict(data: dict[str, Any]) -> dict[str, Any]:
     resultado["facturas_por_gasto"] = {
         int(k): v for k, v in data.get("facturas_por_gasto", {}).items()
     }
+    # Facturas en curso (todavía sin guardar) de un grupo de "comprobar varios
+    # gastos con 1 factura" que se cerró a medias: la llave ya es un string
+    # ("10,15,22", los idx del grupo ordenados y unidos con comas) tanto en
+    # session_state como en el JSON, así que no necesita el mismo cast a int
+    # que "estados"/"facturas_por_gasto"/"clasificacion_por_gasto".
+    resultado["facturas_por_gasto_grupo"] = data.get("facturas_por_gasto_grupo", {})
     resultado["clasificacion_por_gasto"] = {
         int(k): v for k, v in data.get("clasificacion_por_gasto", {}).items()
     }
@@ -135,6 +142,7 @@ def sesion_vacia() -> dict[str, Any]:
         "banco": None,
         "estados": {},
         "facturas_por_gasto": {},
+        "facturas_por_gasto_grupo": {},
         "clasificacion_por_gasto": {},
         "pool_facturas": [],
         "modo_trabajo": None,
