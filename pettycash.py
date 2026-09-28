@@ -45,7 +45,6 @@ from persistence import (
     sesion_a_json_bytes,
     sesion_vacia,
 )
-from supabase_store import cargar_de_supabase, configuracion_disponible, guardar_en_supabase, listar_guardados
 
 # ============================================================
 # PALETA DE COLORES — corporativa, a partir de la paleta que compartió el
@@ -406,11 +405,11 @@ def _restaurar_estado(restaurado: dict) -> None:
 
 
 def _completar_catalogos_faltantes() -> None:
-    """Tras restaurar un avance -desde .json, autoguardado local o Supabase-,
-    rellena con los catálogos por default cualquiera que haya venido vacío (por
-    ejemplo, un avance guardado antes de que existiera alguno de estos catálogos).
-    Un solo lugar para las tres rutas de restauración, en vez de repetir este
-    mismo bloque de cinco "if" en cada una."""
+    """Tras restaurar un avance -desde .json o autoguardado local-, rellena con
+    los catálogos por default cualquiera que haya venido vacío (por ejemplo, un
+    avance guardado antes de que existiera alguno de estos catálogos). Un solo
+    lugar para las rutas de restauración, en vez de repetir este mismo bloque de
+    cinco "if" en cada una."""
     if st.session_state.categorias is None:
         st.session_state.categorias = catalogo_inicial(CATEGORIAS_DEFAULT)
     if st.session_state.materiales is None:
@@ -602,57 +601,6 @@ with st.sidebar:
                 st.session_state.solicitud_en_proceso = None
                 st.success("Avance restaurado desde autoguardado.")
                 st.rerun()
-
-    st.divider()
-    st.markdown("### ☁️ Sincronizar con Supabase")
-    config_supabase = configuracion_disponible(st.secrets)
-    if config_supabase is None:
-        st.caption(
-            "No configurado. Agrega `SUPABASE_URL` y `SUPABASE_KEY` en los *Secrets* de "
-            "la app (o en `.streamlit/secrets.toml` en local, nunca en el repositorio) "
-            "para activar el respaldo en la nube."
-        )
-    else:
-        url_supabase, key_supabase = config_supabase
-        if st.session_state.bank_df is not None:
-            if st.button("☁️ Guardar en la nube", use_container_width=True):
-                try:
-                    fila = guardar_en_supabase(_state_snapshot(), url_supabase, key_supabase)
-                    st.success(f"Guardado en Supabase (#{fila.get('id', '?')}, {fila.get('guardado_en', '')}).")
-                except Exception as e:
-                    st.error(f"No se pudo guardar en Supabase: {e}")
-        else:
-            st.caption("Sube un estado de cuenta primero para poder guardar en la nube.")
-
-        try:
-            guardados_supabase = listar_guardados(url_supabase, key_supabase, limite=20)
-        except Exception as e:
-            guardados_supabase = []
-            st.error(f"No se pudo consultar Supabase: {e}")
-
-        if guardados_supabase:
-            opciones_restaurar = {f"#{g['id']} · {g['guardado_en']}": g["id"] for g in guardados_supabase}
-            etiqueta_elegida = st.selectbox(
-                "Restaurar una versión guardada (la primera es la más reciente)",
-                list(opciones_restaurar.keys()),
-                key="supabase_version_elegida",
-            )
-            if st.button("⬇️ Restaurar esta versión desde Supabase", use_container_width=True):
-                try:
-                    restaurado = cargar_de_supabase(
-                        url_supabase, key_supabase, id_guardado=opciones_restaurar[etiqueta_elegida]
-                    )
-                except Exception as e:
-                    restaurado = None
-                    st.error(f"No se pudo restaurar desde Supabase: {e}")
-                if restaurado:
-                    _restaurar_estado(restaurado)
-                    _completar_catalogos_faltantes()
-                    st.session_state.solicitud_en_proceso = None
-                    st.success("Avance restaurado desde Supabase.")
-                    st.rerun()
-        else:
-            st.caption("Todavía no hay guardados en Supabase.")
 
     st.divider()
     if st.session_state.confirmar_reset:
