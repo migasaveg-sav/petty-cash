@@ -45,6 +45,7 @@ from persistence import (
     sesion_a_json_bytes,
     sesion_vacia,
 )
+from supabase_store import cargar_de_supabase, configuracion_disponible, guardar_en_supabase, listar_guardados
 
 # ============================================================
 # PALETA DE COLORES — corporativa, a partir de la paleta que compartió el
@@ -95,16 +96,18 @@ def init_state() -> None:
         "aplicantes": None,
         "solicitud_en_proceso": None,
         "solicitud_form_version": 0,
-        # Idx del gasto cuyo diálogo "Trabajar gasto" está abierto (o None si
-        # ninguno). Se guarda en session_state -en vez de invocar el diálogo
-        # directo dentro del "if st.button(Abrir)"- porque un st.rerun() disparado
-        # desde DENTRO del diálogo (p.ej. al agregar/quitar una factura) cierra el
-        # modal si su apertura sólo dependía de ese click puntual: al no volver a
-        # evaluarse ese "if" como verdadero en la siguiente ejecución, el diálogo
-        # no se vuelve a invocar y desaparece. Con la bandera persistente, cada
-        # rerun (incluidos los internos) lo vuelve a abrir con el mismo gasto.
-        "gasto_abierto_idx": None,
-        "gasto_abierto_solicitud": None,
+        # Idx del o los gastos cuyo diálogo "Trabajar gasto" está abierto (lista,
+        # o None si ninguno -1 solo elemento para un gasto suelto, 2+ para "varios
+        # gastos con 1 factura"-). Se guarda en session_state -en vez de invocar
+        # el diálogo directo dentro del "if st.button(Abrir)"- porque un
+        # st.rerun() disparado desde DENTRO del diálogo (p.ej. al agregar/quitar
+        # una factura) cierra el modal si su apertura sólo dependía de ese click
+        # puntual: al no volver a evaluarse ese "if" como verdadero en la
+        # siguiente ejecución, el diálogo no se vuelve a invocar y desaparece.
+        # Con la bandera persistente, cada rerun (incluidos los internos) lo
+        # vuelve a abrir con el mismo gasto (o grupo de gastos).
+        "gastos_abiertos_idxs": None,
+        "gastos_abiertos_solicitud": None,
         # Contador de versión para la key del uploader masivo de XML del
         # emparejamiento automático: subirlo fuerza a Streamlit a remontar el
         # widget vacío, que es la única forma de "vaciarlo" de código (los
@@ -333,9 +336,61 @@ def uuids_consumidos() -> set:
     usados = set()
     for facs in st.session_state.facturas_por_gasto.values():
         usados.update(f["UUID"] for f in facs if f["UUID"] != "SIN-UUID")
+    for facs in st.session_state.facturas_por_gasto_grupo.values():
+        usados.update(f["UUID"] for f in facs if f["UUID"] != "SIN-UUID")
     for reg in st.session_state.concatenados:
         usados.update(f["UUID"] for f in reg["Facturas"] if f["UUID"] != "SIN-UUID")
     return usados
+
+
+def _clave_grupo(idxs: list[int]) -> str:
+    """Llave (string, para que sea válida como llave de dict y como llave de
+    session_state) que identifica de forma estable un grupo de gastos que se
+    están comprobando juntos con 1 sola factura -no depende del orden en que se
+    hayan seleccionado en la tabla-."""
+    return ",".join(str(i) for i in sorted(idxs))
+
+
+def _idx_vinculado_lista(sol: dict) -> list[int]:
+    """`sol['idx_vinculado']` es un int para una solicitud vinculada a un solo
+    gasto (el caso normal), o una lista de int cuando la solicitud se vinculó a
+    varios gastos que compartieron 1 factura. Esta función siempre regresa una
+    lista, para poder recorrerla igual en ambos casos."""
+    v = sol.get("idx_vinculado")
+    if v is None:
+        return []
+    return list(v) if isinstance(v, (list, tuple)) else [v]
+
+
+def _prorratear_facturas_grupo(facturas: list[dict], montos: dict[int, float]) -> dict[int, list[dict]]:
+    """Reparte una lista de facturas compartidas entre los gastos de `montos`
+    ({idx: monto_abs_del_gasto}), proporcionalmente al monto de cada gasto (a
+    mayor monto, mayor parte de la factura le toca). Cada gasto se queda con su
+    propia copia -mismo UUID y datos del emisor, montos en dinero (Monto Total,
+    IVA, IVA Retenido, ISR Retenido, ISH) escalados por su proporción- para que
+    cada uno siga siendo, de cara a `matching.diferencia_gasto_facturas` y al
+    resto de la app, un registro normal de "1 gasto con sus facturas" que ya
+    cuadra por sí solo -sin tocar esa lógica ni la del Excel/checksum-.
+
+    Si la suma de los montos del grupo es 0 (caso degenerado), se reparte por
+    partes iguales en vez de dividir entre cero."""
+    idxs = list(montos.keys())
+    suma_montos = sum(montos.values())
+    campos_dinero = ["Monto Total", "IVA", "IVA Retenido", "ISR Retenido", "ISH"]
+    resultado: dict[int, list[dict]] = {i: [] for i in idxs}
+    for i in idxs:
+        proporcion = (montos[i] / suma_montos) if suma_montos > 0 else (1 / len(idxs))
+        for f in facturas:
+            copia = dict(f)
+            for campo in campos_dinero:
+                if campo in copia and copia[campo] is not None:
+                    copia[campo] = round(float(copia[campo]) * proporcion, 2)
+            copia["_id"] = next_factura_id()
+            copia["GrupoCompartido"] = _clave_grupo(idxs)
+            copia["GastosDelGrupo"] = idxs
+            copia["Proporcion"] = round(proporcion, 4)
+            resultado[i].append(copia)
+    return resultado
 
 
 def _state_snapshot() -> dict:
@@ -348,6 +403,24 @@ def _state_snapshot() -> dict:
 def _restaurar_estado(restaurado: dict) -> None:
     for k, v in restaurado.items():
         st.session_state[k] = v
+
+
+def _completar_catalogos_faltantes() -> None:
+    """Tras restaurar un avance -desde .json, autoguardado local o Supabase-,
+    rellena con los catálogos por default cualquiera que haya venido vacío (por
+    ejemplo, un avance guardado antes de que existiera alguno de estos catálogos).
+    Un solo lugar para las tres rutas de restauración, en vez de repetir este
+    mismo bloque de cinco "if" en cada una."""
+    if st.session_state.categorias is None:
+        st.session_state.categorias = catalogo_inicial(CATEGORIAS_DEFAULT)
+    if st.session_state.materiales is None:
+        st.session_state.materiales = catalogo_inicial(MATERIALES_DEFAULT)
+    if st.session_state.categorias_solicitud is None:
+        st.session_state.categorias_solicitud = catalogo_inicial(CATEGORIAS_SOLICITUD_DEFAULT)
+    if st.session_state.empleados is None:
+        st.session_state.empleados = catalogo_inicial(EMPLEADOS_DEFAULT)
+    if st.session_state.aplicantes is None:
+        st.session_state.aplicantes = catalogo_inicial(APLICANTES_DEFAULT)
 
 
 def _autoguardar_si_activo() -> None:
@@ -505,16 +578,7 @@ with st.sidebar:
         try:
             data = json.loads(json_file.getvalue().decode("utf-8"))
             _restaurar_estado(cargar_sesion_dict(data))
-            if st.session_state.categorias is None:
-                st.session_state.categorias = catalogo_inicial(CATEGORIAS_DEFAULT)
-            if st.session_state.materiales is None:
-                st.session_state.materiales = catalogo_inicial(MATERIALES_DEFAULT)
-            if st.session_state.categorias_solicitud is None:
-                st.session_state.categorias_solicitud = catalogo_inicial(CATEGORIAS_SOLICITUD_DEFAULT)
-            if st.session_state.empleados is None:
-                st.session_state.empleados = catalogo_inicial(EMPLEADOS_DEFAULT)
-            if st.session_state.aplicantes is None:
-                st.session_state.aplicantes = catalogo_inicial(APLICANTES_DEFAULT)
+            _completar_catalogos_faltantes()
             st.session_state.solicitud_en_proceso = None
             st.success("Avance restaurado correctamente.")
             st.rerun()
@@ -534,19 +598,61 @@ with st.sidebar:
             restaurado = restaurar_autoguardado(AUTOSAVE_DB)
             if restaurado:
                 _restaurar_estado(restaurado)
-                if st.session_state.categorias is None:
-                    st.session_state.categorias = catalogo_inicial(CATEGORIAS_DEFAULT)
-                if st.session_state.materiales is None:
-                    st.session_state.materiales = catalogo_inicial(MATERIALES_DEFAULT)
-                if st.session_state.categorias_solicitud is None:
-                    st.session_state.categorias_solicitud = catalogo_inicial(CATEGORIAS_SOLICITUD_DEFAULT)
-                if st.session_state.empleados is None:
-                    st.session_state.empleados = catalogo_inicial(EMPLEADOS_DEFAULT)
-                if st.session_state.aplicantes is None:
-                    st.session_state.aplicantes = catalogo_inicial(APLICANTES_DEFAULT)
+                _completar_catalogos_faltantes()
                 st.session_state.solicitud_en_proceso = None
                 st.success("Avance restaurado desde autoguardado.")
                 st.rerun()
+
+    st.divider()
+    st.markdown("### ☁️ Sincronizar con Supabase")
+    config_supabase = configuracion_disponible(st.secrets)
+    if config_supabase is None:
+        st.caption(
+            "No configurado. Agrega `SUPABASE_URL` y `SUPABASE_KEY` en los *Secrets* de "
+            "la app (o en `.streamlit/secrets.toml` en local, nunca en el repositorio) "
+            "para activar el respaldo en la nube."
+        )
+    else:
+        url_supabase, key_supabase = config_supabase
+        if st.session_state.bank_df is not None:
+            if st.button("☁️ Guardar en la nube", use_container_width=True):
+                try:
+                    fila = guardar_en_supabase(_state_snapshot(), url_supabase, key_supabase)
+                    st.success(f"Guardado en Supabase (#{fila.get('id', '?')}, {fila.get('guardado_en', '')}).")
+                except Exception as e:
+                    st.error(f"No se pudo guardar en Supabase: {e}")
+        else:
+            st.caption("Sube un estado de cuenta primero para poder guardar en la nube.")
+
+        try:
+            guardados_supabase = listar_guardados(url_supabase, key_supabase, limite=20)
+        except Exception as e:
+            guardados_supabase = []
+            st.error(f"No se pudo consultar Supabase: {e}")
+
+        if guardados_supabase:
+            opciones_restaurar = {f"#{g['id']} · {g['guardado_en']}": g["id"] for g in guardados_supabase}
+            etiqueta_elegida = st.selectbox(
+                "Restaurar una versión guardada (la primera es la más reciente)",
+                list(opciones_restaurar.keys()),
+                key="supabase_version_elegida",
+            )
+            if st.button("⬇️ Restaurar esta versión desde Supabase", use_container_width=True):
+                try:
+                    restaurado = cargar_de_supabase(
+                        url_supabase, key_supabase, id_guardado=opciones_restaurar[etiqueta_elegida]
+                    )
+                except Exception as e:
+                    restaurado = None
+                    st.error(f"No se pudo restaurar desde Supabase: {e}")
+                if restaurado:
+                    _restaurar_estado(restaurado)
+                    _completar_catalogos_faltantes()
+                    st.session_state.solicitud_en_proceso = None
+                    st.success("Avance restaurado desde Supabase.")
+                    st.rerun()
+        else:
+            st.caption("Todavía no hay guardados en Supabase.")
 
     st.divider()
     if st.session_state.confirmar_reset:
@@ -655,8 +761,16 @@ def _revertir_a_pendiente(idx: int, origen: str) -> None:
                             s for s in st.session_state.solicitudes if s["id"] != sol_actual["id"]
                         ]
                     else:
-                        sol_actual["estado"] = "pendiente"
-                        sol_actual["idx_vinculado"] = None
+                        # Si la solicitud se había vinculado a varios gastos (grupo
+                        # con 1 factura compartida), revertir uno solo sólo lo quita
+                        # a él de la lista; la solicitud sigue "comprobada" mientras
+                        # le quede al menos un gasto vinculado.
+                        restantes = [i for i in _idx_vinculado_lista(sol_actual) if i != idx]
+                        if restantes:
+                            sol_actual["idx_vinculado"] = restantes[0] if len(restantes) == 1 else restantes
+                        else:
+                            sol_actual["estado"] = "pendiente"
+                            sol_actual["idx_vinculado"] = None
     else:
         st.session_state.no_necesarios = [r for r in st.session_state.no_necesarios if r.get("idx") != idx]
     st.session_state.estados[idx] = "pendiente"
@@ -673,7 +787,8 @@ def _eliminar_solicitud(solicitud_id: int) -> None:
     if sol is None:
         return
     if sol.get("estado") in ("comprobado", "pendiente_detalles") and sol.get("idx_vinculado") is not None:
-        _revertir_a_pendiente(sol["idx_vinculado"], sol["estado"])
+        for i in _idx_vinculado_lista(sol):
+            _revertir_a_pendiente(i, sol["estado"])
     if st.session_state.solicitud_en_proceso == solicitud_id:
         st.session_state.solicitud_en_proceso = None
     st.session_state.solicitudes = [s for s in st.session_state.solicitudes if s["id"] != solicitud_id]
@@ -685,21 +800,35 @@ def _cerrar_dialogo_trabajar_gasto() -> None:
     la "X", con ESC o haciendo clic afuera (a diferencia de los botones internos
     del diálogo -"Marcar como no necesario", "Añadir a los registros"-, que ya
     limpiaban estas mismas dos banderas antes de este fix). Sin esto, cerrar el
-    diálogo así dejaba `gasto_abierto_idx` con el valor del gasto ya cerrado, y el
-    diálogo volvía a aparecer solo -mostrando ese mismo gasto viejo- en cuanto el
-    usuario interactuaba con cualquier otra parte de la página (otra tabla,
+    diálogo así dejaba `gastos_abiertos_idxs` con el valor del gasto ya cerrado, y
+    el diálogo volvía a aparecer solo -mostrando ese mismo gasto viejo- en cuanto
+    el usuario interactuaba con cualquier otra parte de la página (otra tabla,
     expandir "Emparejamiento automático de facturas", etc.), aunque no hubiera
     vuelto a pulsar "Abrir" en ningún gasto."""
-    st.session_state.gasto_abierto_idx = None
-    st.session_state.gasto_abierto_solicitud = None
+    st.session_state.gastos_abiertos_idxs = None
+    st.session_state.gastos_abiertos_solicitud = None
 
 
 @_dialog("📌 Trabajar gasto", on_dismiss=_cerrar_dialogo_trabajar_gasto)
-def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
+def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> None:
+    """Diálogo para comprobar un gasto -o, si `idxs` trae más de uno, VARIOS
+    gastos que comparten 1 sola factura-: clasificación, datos de bitácora y
+    adjuntar/emparejar factura(s).
+
+    Con 2+ idxs, la factura (o facturas) que se suban se reparten al guardar
+    -proporcionalmente al monto de cada gasto- entre todos ellos vía
+    `_prorratear_facturas_grupo`, y cada uno termina con su propio registro en
+    `concatenados` (mismo modelo de siempre, 1 registro por gasto) para que el
+    resto de la app -matching.py, el Excel, el checksum- no necesite saber que
+    la factura se compartió."""
     df_actual = st.session_state.bank_df
-    if idx not in df_actual.index or st.session_state.estados.get(idx) != "pendiente":
+    idxs = [i for i in idxs if i in df_actual.index and st.session_state.estados.get(i) == "pendiente"]
+    if not idxs:
         st.info("Este gasto ya no está pendiente (puede que ya se haya comprobado en otra pestaña).")
         return
+
+    es_grupo = len(idxs) > 1
+    clave_grupo = _clave_grupo(idxs)
 
     sol = _solicitud_por_id(solicitud_id)
     if sol is not None:
@@ -710,55 +839,131 @@ def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
             unsafe_allow_html=True,
         )
 
-    gasto = df_actual.loc[idx]
-    monto_gasto = abs(float(gasto["Monto"]))
+    gastos = {i: df_actual.loc[i] for i in idxs}
+    montos = {i: abs(float(gastos[i]["Monto"])) for i in idxs}
+    monto_total = sum(montos.values())
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Fecha", str(gasto.get("Fecha", "")))
-    c2.metric("Descripción", str(gasto.get("Descripción", ""))[:30])
-    c3.metric("Monto", money(monto_gasto))
+    if es_grupo:
+        st.markdown(f"##### 🔗 Comprobando {len(idxs)} gastos con 1 sola factura")
+        st.caption(
+            "El monto de la factura (y sus impuestos) se va a repartir entre estos gastos, "
+            "proporcionalmente al monto de cada uno, para que cada uno quede comprobado "
+            "correctamente por su parte."
+        )
+        anchos_g = [0.8, 1.3, 3, 1.3]
+        enc_g = st.columns(anchos_g)
+        for col, titulo in zip(enc_g, ["No.", "Fecha", "Descripción", "Monto"]):
+            col.caption(f"**{titulo}**")
+        for i in idxs:
+            cols_g = st.columns(anchos_g)
+            cols_g[0].write(f"#{i}")
+            cols_g[1].write(str(gastos[i].get("Fecha", "")))
+            cols_g[2].write(str(gastos[i].get("Descripción", ""))[:45])
+            cols_g[3].write(money(montos[i]))
+        st.metric("Monto total del grupo", money(monto_total))
+    else:
+        idx_unico = idxs[0]
+        gasto = gastos[idx_unico]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Fecha", str(gasto.get("Fecha", "")))
+        c2.metric("Descripción", str(gasto.get("Descripción", ""))[:30])
+        c3.metric("Monto", money(monto_total))
 
-    if st.button("🚫 Marcar como no necesario", key=f"btn_no_necesario_{idx}"):
-        clasif_actual = st.session_state.clasificacion_por_gasto.get(idx, {"categoria": "", "material": ""})
-        st.session_state.no_necesarios.append({
-            "idx": idx,
-            "Fecha Estado": gasto.get("Fecha", ""),
-            "Descripción Estado": gasto.get("Descripción", ""),
-            "Monto Estado": monto_gasto,
-            "Categoria": clasif_actual.get("categoria", ""),
-            "Material": clasif_actual.get("material", ""),
-        })
-        st.session_state.estados[idx] = "no_necesario"
-        st.session_state.facturas_por_gasto.pop(idx, None)
-        if sol is not None:
-            # este movimiento no era el correcto para la solicitud; la dejamos
-            # pendiente para que se pueda volver a vincular con otro gasto.
-            st.session_state.solicitud_en_proceso = None
-        st.session_state.gasto_abierto_idx = None
-        st.session_state.gasto_abierto_solicitud = None
-        _limpiar_seleccion_tabla_pendientes()
-        _autoguardar_si_activo()
-        st.rerun()
+    if not es_grupo:
+        idx_unico = idxs[0]
+        if st.button("🚫 Marcar como no necesario", key=f"btn_no_necesario_{idx_unico}"):
+            gasto = gastos[idx_unico]
+            clasif_actual = st.session_state.clasificacion_por_gasto.get(
+                idx_unico, {"categoria": "", "material": ""}
+            )
+            st.session_state.no_necesarios.append({
+                "idx": idx_unico,
+                "Fecha Estado": gasto.get("Fecha", ""),
+                "Descripción Estado": gasto.get("Descripción", ""),
+                "Monto Estado": monto_total,
+                "Categoria": clasif_actual.get("categoria", ""),
+                "Material": clasif_actual.get("material", ""),
+            })
+            st.session_state.estados[idx_unico] = "no_necesario"
+            st.session_state.facturas_por_gasto.pop(idx_unico, None)
+            if sol is not None:
+                # este movimiento no era el correcto para la solicitud; la dejamos
+                # pendiente para que se pueda volver a vincular con otro gasto.
+                st.session_state.solicitud_en_proceso = None
+            st.session_state.gastos_abiertos_idxs = None
+            st.session_state.gastos_abiertos_solicitud = None
+            _limpiar_seleccion_tabla_pendientes()
+            _autoguardar_si_activo()
+            st.rerun()
 
-    st.markdown("##### 🏷️ Clasificación del gasto")
-    clasif = st.session_state.clasificacion_por_gasto.setdefault(idx, {"categoria": "", "material": ""})
+    st.markdown(
+        "##### 🏷️ Clasificación del gasto" if not es_grupo
+        else "##### 🏷️ Clasificación (se aplica a todos los gastos del grupo)"
+    )
+    clasif_base = st.session_state.clasificacion_por_gasto.get(idxs[0], {"categoria": "", "material": ""})
     cl1, cl2 = st.columns(2)
     with cl1:
-        clasif["categoria"] = _selector_catalogo(
-            "Categoría", "categorias_solicitud", clasif.get("categoria", ""), f"categoria_{idx}"
+        categoria_sel = _selector_catalogo(
+            "Categoría", "categorias_solicitud", clasif_base.get("categoria", ""), f"categoria_{clave_grupo}"
         )
     with cl2:
-        clasif["material"] = _selector_catalogo(
-            "Material", "materiales", clasif.get("material", ""), f"material_{idx}"
+        material_sel = _selector_catalogo(
+            "Material", "materiales", clasif_base.get("material", ""), f"material_{clave_grupo}"
         )
+    for i in idxs:
+        st.session_state.clasificacion_por_gasto[i] = {"categoria": categoria_sel, "material": material_sel}
 
-    st.session_state.facturas_por_gasto.setdefault(idx, [])
-    facturas = st.session_state.facturas_por_gasto[idx]
+    # -------- Datos de la solicitud (bitácora) --------
+    # Mismos campos que "Nueva solicitud de reembolso" (Categoría/Material ya se
+    # capturaron arriba). Sólo se piden aquí cuando el gasto no viene ya vinculado
+    # a una solicitud existente -si sol no es None, esos datos ya están fijados
+    # por esa solicitud y se muestran en el banner de arriba-, para poder
+    # comprobar correctamente un gasto abierto directo desde el estado de cuenta
+    # sin tener que pasar primero por la bitácora.
+    admin_vals: dict = {}
+    if sol is None:
+        st.markdown("##### 🧍 Datos de la solicitud (bitácora)")
+        st.caption(
+            "Mismos campos que «Nueva solicitud de reembolso»: quedan guardados junto con "
+            "este gasto para que el Excel de comprobados salga completo aunque no se haya "
+            "registrado antes en la bitácora."
+        )
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            admin_vals["Applicant"] = _selector_catalogo(
+                "Applicant", "aplicantes", "", f"admin_applicant_{clave_grupo}"
+            )
+        with a2:
+            admin_vals["Employee Name"] = _selector_catalogo(
+                "Employee name", "empleados", "", f"admin_employee_{clave_grupo}"
+            )
+        with a3:
+            admin_vals["Request Number"] = st.text_input(
+                "Request number", key=f"admin_request_{clave_grupo}"
+            )
+        admin_vals["Description"] = st.text_input("Description", key=f"admin_description_{clave_grupo}")
+        a4, a5 = st.columns(2)
+        with a4:
+            admin_vals["Number of Days"] = st.number_input(
+                "Number of days", min_value=0, step=1, key=f"admin_days_{clave_grupo}"
+            )
+        with a5:
+            admin_vals["Number of People"] = st.number_input(
+                "Number of people", min_value=0, step=1, key=f"admin_people_{clave_grupo}"
+            )
+
+    # -------- Facturas: pool propio del gasto suelto, o pool compartido del grupo --------
+    if es_grupo:
+        st.session_state.facturas_por_gasto_grupo.setdefault(clave_grupo, [])
+        facturas = st.session_state.facturas_por_gasto_grupo[clave_grupo]
+    else:
+        st.session_state.facturas_por_gasto.setdefault(idxs[0], [])
+        facturas = st.session_state.facturas_por_gasto[idxs[0]]
 
     st.markdown("##### 📎 Agregar facturas (XML de CFDI, puedes subir varias a la vez)")
     xml_files = st.file_uploader(
         "Sube uno o más XML (CFDI 3.3 o 4.0)", type=["xml"], accept_multiple_files=True,
-        key=f"xml_uploader_{idx}",
+        key=f"xml_uploader_{clave_grupo}",
     )
     if xml_files:
         uuids_existentes = {f["UUID"] for f in facturas} | uuids_consumidos()
@@ -789,7 +994,7 @@ def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
             st.info(f"{duplicadas} factura(s) ya estaban en uso y se omitieron.")
 
     with st.expander("✏️ Agregar comprobación manual (sin XML)"):
-        with st.form(f"manual_form_{idx}", clear_on_submit=True):
+        with st.form(f"manual_form_{clave_grupo}", clear_on_submit=True):
             mf_fecha = st.date_input("Fecha de factura", value=datetime.date.today())
             mf_uuid = st.text_input("UUID (opcional)")
             mf_concepto = st.text_input("Concepto/Descripción")
@@ -823,7 +1028,10 @@ def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
                     })
                     st.rerun()
 
-    st.markdown("##### 🧾 Facturas agregadas a este gasto")
+    st.markdown(
+        "##### 🧾 Facturas agregadas a este gasto" if not es_grupo
+        else "##### 🧾 Facturas agregadas (compartidas entre los gastos del grupo)"
+    )
     if facturas:
         anchos_facturas = [1.6, 1.6, 1.2, 2.2, 1.1, 0.9, 1.1, 0.5]
         titulos_facturas = ["Archivo", "UUID", "RFC Emisor", "Concepto", "Fecha", "IVA", "Monto Total", ""]
@@ -841,11 +1049,13 @@ def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
             cols_f[5].write(money(f.get("IVA", 0)))
             cols_f[6].write(money(f.get("Monto Total", 0)))
             with cols_f[7]:
-                if st.button("✕", key=f"btn_quitar_factura_{idx}_{f['_id']}",
+                if st.button("✕", key=f"btn_quitar_factura_{clave_grupo}_{f['_id']}",
                              help="Quitar esta factura de la lista", use_container_width=True):
-                    st.session_state.facturas_por_gasto[idx] = [
-                        fx for fx in st.session_state.facturas_por_gasto[idx] if fx["_id"] != f["_id"]
-                    ]
+                    nueva_lista = [fx for fx in facturas if fx["_id"] != f["_id"]]
+                    if es_grupo:
+                        st.session_state.facturas_por_gasto_grupo[clave_grupo] = nueva_lista
+                    else:
+                        st.session_state.facturas_por_gasto[idxs[0]] = nueva_lista
                     st.rerun()
         if any(f.get("Incompleta") for f in facturas):
             st.markdown(
@@ -854,48 +1064,80 @@ def dialog_trabajar_gasto(idx: int, solicitud_id: int | None = None) -> None:
             )
 
         suma_facturas = sum(f["Monto Total"] for f in facturas)
-        diferencia = round(monto_gasto - suma_facturas, 2)
+        diferencia = round(monto_total - suma_facturas, 2)
 
         cc1, cc2, cc3 = st.columns(3)
-        cc1.metric("Monto del gasto", money(monto_gasto))
+        cc1.metric("Monto del gasto" if not es_grupo else "Monto total del grupo", money(monto_total))
         cc2.metric("Suma de facturas", money(suma_facturas))
         cc3.metric("Diferencia", money(diferencia))
 
         if abs(diferencia) <= 0.01:
+            etiqueta_ok = "Gasto comprobado" if not es_grupo else "Grupo comprobado"
             st.markdown(
-                f"<div class='success-box'>✅ Gasto comprobado correctamente. Diferencia: {money(diferencia)}</div>",
+                f"<div class='success-box'>✅ {etiqueta_ok} correctamente. Diferencia: {money(diferencia)}</div>",
                 unsafe_allow_html=True,
             )
-            if st.button("➕ Añadir a los registros", key=f"btn_guardar_{idx}", type="primary"):
-                st.session_state.concatenados.append({
-                    "idx": idx,
-                    "Fecha Estado": gasto.get("Fecha", ""),
-                    "Descripción Estado": gasto.get("Descripción", ""),
-                    "Monto Estado": monto_gasto,
-                    "Categoria": clasif.get("categoria", ""),
-                    "Material": clasif.get("material", ""),
-                    "Facturas": facturas,
-                    "Solicitud": sol,
-                })
-                st.session_state.estados[idx] = "comprobado"
-                st.session_state.facturas_por_gasto.pop(idx, None)
-                if sol is not None:
-                    sol["estado"] = "comprobado"
-                    sol["idx_vinculado"] = idx
-                    st.session_state.solicitud_en_proceso = None
-                st.session_state.gasto_abierto_idx = None
-                st.session_state.gasto_abierto_solicitud = None
-                st.success("Gasto añadido a los registros.")
-                _limpiar_seleccion_tabla_pendientes()
-                _autoguardar_si_activo()
-                st.rerun()
+            if st.button("➕ Añadir a los registros", key=f"btn_guardar_{clave_grupo}", type="primary"):
+                if sol is None and not admin_vals.get("Applicant", "").strip():
+                    st.error("«Applicant» es obligatorio.")
+                else:
+                    facturas_por_idx = (
+                        _prorratear_facturas_grupo(facturas, montos) if es_grupo else {idxs[0]: facturas}
+                    )
+                    for i in idxs:
+                        gasto_i = gastos[i]
+                        registro = {
+                            "idx": i,
+                            "Fecha Estado": gasto_i.get("Fecha", ""),
+                            "Descripción Estado": gasto_i.get("Descripción", ""),
+                            "Monto Estado": montos[i],
+                            "Categoria": categoria_sel,
+                            "Material": material_sel,
+                            "Facturas": facturas_por_idx[i],
+                            "Solicitud": sol,
+                        }
+                        if es_grupo:
+                            registro["GrupoCompartido"] = clave_grupo
+                            registro["GastosDelGrupo"] = list(idxs)
+                        if sol is None:
+                            registro["Applicant"] = admin_vals["Applicant"].strip()
+                            registro["Employee Name"] = admin_vals["Employee Name"]
+                            registro["Request Number"] = admin_vals["Request Number"].strip()
+                            registro["Description"] = admin_vals["Description"].strip()
+                            registro["Number of Days"] = int(admin_vals["Number of Days"])
+                            registro["Number of People"] = int(admin_vals["Number of People"])
+                        st.session_state.concatenados.append(registro)
+                        st.session_state.estados[i] = "comprobado"
+                        st.session_state.facturas_por_gasto.pop(i, None)
+                    if es_grupo:
+                        st.session_state.facturas_por_gasto_grupo.pop(clave_grupo, None)
+                    if sol is not None:
+                        sol["estado"] = "comprobado"
+                        sol["idx_vinculado"] = idxs[0] if len(idxs) == 1 else list(idxs)
+                        st.session_state.solicitud_en_proceso = None
+                    st.session_state.gastos_abiertos_idxs = None
+                    st.session_state.gastos_abiertos_solicitud = None
+                    if es_grupo:
+                        st.success(
+                            f"{len(idxs)} gastos añadidos a los registros, repartiendo entre "
+                            "ellos la(s) misma(s) factura(s)."
+                        )
+                    else:
+                        st.success("Gasto añadido a los registros.")
+                    _limpiar_seleccion_tabla_pendientes()
+                    _autoguardar_si_activo()
+                    st.rerun()
         else:
+            etiqueta_err = "el gasto" if not es_grupo else "el total del grupo"
             st.markdown(
-                f"<div class='error-box'>❌ La suma de facturas no coincide con el gasto. "
+                f"<div class='error-box'>❌ La suma de facturas no coincide con {etiqueta_err}. "
                 f"Diferencia: {money(diferencia)}</div>", unsafe_allow_html=True,
             )
     else:
-        st.caption("Aún no has agregado ninguna factura para este gasto.")
+        st.caption(
+            "Aún no has agregado ninguna factura para este gasto." if not es_grupo
+            else "Aún no has agregado ninguna factura para este grupo."
+        )
 
 
 # ============================================================
@@ -912,33 +1154,65 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
     final para saber de un vistazo qué sigue pendiente."""
     from io import BytesIO
 
-    def _facturas_vinculadas(sol: dict) -> list[dict]:
-        """Facturas del gasto vinculado a esta solicitud (o [] si sigue sin vincular).
-        Incluye también las de un gasto en "pendiente_detalles": ya tiene factura
-        emparejada aunque todavía falten los datos administrativos."""
-        if sol.get("estado") not in ("comprobado", "pendiente_detalles") or sol.get("idx_vinculado") is None:
+    def _registros_vinculados(sol: dict) -> list[dict]:
+        """Gastos vinculados a esta solicitud -normalmente uno solo, o varios
+        cuando se comprobaron juntos compartiendo 1 sola factura- con su lista de
+        facturas cada uno. Incluye también un gasto en "pendiente_detalles": ya
+        tiene factura emparejada aunque todavía falten los datos administrativos."""
+        if sol.get("estado") not in ("comprobado", "pendiente_detalles"):
             return []
-        registro = next((c for c in concatenados if c["idx"] == sol["idx_vinculado"]), None)
-        if registro is None:
-            return []
-        return registro.get("Facturas", []) or []
+        registros = []
+        for i in _idx_vinculado_lista(sol):
+            registro = next((c for c in concatenados if c["idx"] == i), None)
+            if registro is not None:
+                registros.append(registro)
+        return registros
 
-    def _comprobacion_de(sol: dict, factura: dict | None, primera: bool) -> dict:
+    def _comprobacion_de(sol: dict, registro: dict, factura: dict | None, primera_registro: bool) -> dict:
         """Una FACTURA por fila (antes: todos los UUID de un gasto concatenados en una
         sola celda «CFDI Folio» con '; '.join). Payment Date/Expense Outflow Amt/el
-        No. del banco sólo van en la primera fila del grupo (igual que en la hoja
-        «Comprobados»), CFDI Folio y Reimbursement Cap son siempre por factura."""
+        No. del banco sólo van en la primera fila DE CADA GASTO del grupo (igual
+        que en la hoja «Comprobados»; si la solicitud se vinculó a varios gastos,
+        cada uno tiene su propia primera fila), CFDI Folio y Reimbursement Cap son
+        siempre por factura."""
         if factura is None:
             return {}
-        registro = next((c for c in concatenados if c["idx"] == sol["idx_vinculado"]), None)
         return {
-            "Payment Date": (registro.get("Fecha Estado", "") if registro else "") if primera else None,
+            "Payment Date": (registro.get("Fecha Estado", "")) if primera_registro else None,
             "Expense Outflow Amt": (
-                round(abs(float(registro.get("Monto Estado", 0) or 0)), 2) if registro else None
-            ) if primera else None,
-            "Bank No": sol["No"] if primera else None,
+                round(abs(float(registro.get("Monto Estado", 0) or 0)), 2)
+            ) if primera_registro else None,
+            "Bank No": sol["No"] if primera_registro else None,
             "CFDI Folio": factura.get("UUID", ""),
             "Reimbursement Cap": round(factura.get("Monto Total", 0) or 0, 2),
+        }
+
+    def _fila_admin(sol: dict, mostrar: bool) -> dict:
+        """Columnas A-I (datos de la solicitud): sólo se muestran en la primera
+        fila de la solicitud completa -si se vinculó a varios gastos, las demás
+        filas (de ese mismo gasto o de los siguientes) las dejan en blanco, igual
+        que ya pasaba entre facturas de un mismo gasto-."""
+        if not mostrar:
+            return {
+                "No": None, "Applicant": "", "Category": "", "Description": "",
+                "Linked Request No": "", "Number of Days": None,
+                "Total Number of People": None, "Employee Name": "", "Material": "",
+                "Status": "",
+            }
+        return {
+            "No": sol.get("No"),
+            "Applicant": sol.get("Applicant") or "",
+            "Category": sol.get("Category") or "",
+            "Description": sol.get("Description") or "",
+            "Linked Request No": sol.get("Request Number") or "",
+            "Number of Days": sol.get("Number of Days", 0),
+            "Total Number of People": sol.get("Number of People", 0),
+            "Employee Name": sol.get("Employee Name") or "",
+            "Material": sol.get("Material") or "",
+            "Status": ({
+                "comprobado": "Comprobado",
+                "pendiente_detalles": "Pendiente detalles",
+            }.get(sol.get("estado"), "Pendiente")),
         }
 
     columnas_df = [
@@ -956,26 +1230,19 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
 
     filas = []
     for sol in solicitudes:
-        facturas = _facturas_vinculadas(sol)
-        for i, factura in enumerate([*facturas] or [None]):
-            primera = i == 0
-            fila = {
-                "No": sol.get("No") if primera else None,
-                "Applicant": (sol.get("Applicant") or "") if primera else "",
-                "Category": (sol.get("Category") or "") if primera else "",
-                "Description": (sol.get("Description") or "") if primera else "",
-                "Linked Request No": (sol.get("Request Number") or "") if primera else "",
-                "Number of Days": sol.get("Number of Days", 0) if primera else None,
-                "Total Number of People": sol.get("Number of People", 0) if primera else None,
-                "Employee Name": (sol.get("Employee Name") or "") if primera else "",
-                "Material": (sol.get("Material") or "") if primera else "",
-                "Status": ({
-                    "comprobado": "Comprobado",
-                    "pendiente_detalles": "Pendiente detalles",
-                }.get(sol.get("estado"), "Pendiente")) if primera else "",
-            }
-            fila.update(_comprobacion_de(sol, factura, primera))
-            filas.append(fila)
+        registros = _registros_vinculados(sol)
+        if not registros:
+            filas.append(_fila_admin(sol, True))
+            continue
+        primera_de_sol = True
+        for registro in registros:
+            facturas_registro = registro.get("Facturas", []) or []
+            for j, factura in enumerate([*facturas_registro] or [None]):
+                primera_registro = j == 0
+                fila = _fila_admin(sol, primera_de_sol)
+                fila.update(_comprobacion_de(sol, registro, factura, primera_registro))
+                filas.append(fila)
+                primera_de_sol = False
 
     df = pd.DataFrame(filas, columns=columnas_df) if filas else pd.DataFrame(columns=columnas_df)
 
@@ -1285,8 +1552,9 @@ def _mostrar_seccion_solicitudes() -> None:
                 if sol_activa is not None:
                     st.markdown(
                         f"<div class='warn-box'>🔗 Vinculando la solicitud #{sol_activa['No']} "
-                        f"({sol_activa['Applicant']} · {sol_activa['Category']}): selecciona su gasto en la "
-                        f"tabla de «Gastos pendientes» de abajo y pulsa «Abrir».</div>",
+                        f"({sol_activa['Applicant']} · {sol_activa['Category']}): selecciona uno o más gastos "
+                        f"(si son varios, van a compartir la misma factura) en la tabla de «Gastos pendientes» "
+                        f"de abajo y pulsa «Abrir».</div>",
                         unsafe_allow_html=True,
                     )
                     if st.button("Cancelar vinculación", key="btn_cancelar_vinculacion"):
@@ -1326,14 +1594,15 @@ def _mostrar_seccion_solicitudes() -> None:
                         unsafe_allow_html=True,
                     )
                 with col_estado:
+                    idxs_vinc_txt = ", ".join(f"#{i}" for i in _idx_vinculado_lista(sol))
                     if sol["estado"] == "comprobado":
-                        st.markdown(_celda(f"✅ #{sol['idx_vinculado']}"), unsafe_allow_html=True)
+                        st.markdown(_celda(f"✅ {idxs_vinc_txt}"), unsafe_allow_html=True)
                     elif sol["estado"] == "pendiente_detalles":
                         # La creó (o la retomó) el emparejamiento automático: ya está
                         # vinculada a un gasto, sólo falta completar sus datos en la
                         # pestaña "🧾 Pendiente de detalles" (no tiene sentido volver a
                         # ofrecer "Comprobar" porque el vínculo ya existe).
-                        st.markdown(_celda(f"🧾 #{sol['idx_vinculado']} (faltan datos)"), unsafe_allow_html=True)
+                        st.markdown(_celda(f"🧾 {idxs_vinc_txt} (faltan datos)"), unsafe_allow_html=True)
                     else:
                         ya_vinculando_otra = st.session_state.solicitud_en_proceso not in (None, sol["id"])
                         if st.button("🔗 Comprobar", key=f"btn_comprobar_sol_{sol['id']}", disabled=ya_vinculando_otra,
@@ -1374,38 +1643,47 @@ with tab_pendientes:
     else:
         df_pend_base = df.loc[df.index.intersection(pendientes_idx)].copy()
 
-        col_busq, col_monto = st.columns([2, 1])
+        col_busq, col_monto_min, col_monto_max = st.columns([2, 1, 1])
         with col_busq:
             busqueda = st.text_input("🔎 Buscar por descripción", key="busqueda_pendientes")
-        with col_monto:
-            # Filtro por monto (cargo): se compara sobre el valor absoluto porque a
-            # quien busca "cuánto gasté" no le interesa el signo -en "pendientes"
-            # casi todo son cargos (negativos), pero un abono ocasional no debería
-            # quedar fuera del rango sólo por su signo.
-            rango_monto = None
-            if "Monto" in df_pend_base.columns and not df_pend_base.empty:
-                montos_abs = df_pend_base["Monto"].abs()
-                monto_min_disp = float(montos_abs.min())
-                monto_max_disp = float(montos_abs.max())
-                if monto_max_disp > monto_min_disp:
-                    span = monto_max_disp - monto_min_disp
-                    paso = round(max(span / 200, 1.0), 2)
-                    rango_monto = st.slider(
-                        "💰 Filtrar por monto",
-                        min_value=monto_min_disp,
-                        max_value=monto_max_disp,
-                        value=(monto_min_disp, monto_max_disp),
-                        step=paso,
-                        format="$%.2f",
-                        key="rango_monto_pendientes",
-                        help="Filtra los gastos cuyo monto (en valor absoluto) cae en este rango.",
-                    )
+        # Filtro por monto (cargo): se compara sobre el valor absoluto porque a quien
+        # busca "cuánto gasté" no le interesa el signo -en "pendientes" casi todo son
+        # cargos (negativos), pero un abono ocasional no debería quedar fuera del
+        # rango sólo por su signo-. Son dos campos numéricos (no un slider) para que
+        # se pueda teclear un monto exacto o un rango sin arrastrar nada; vacíos
+        # ambos, no se filtra. Un solo campo lleno filtra "monto exacto o mayor" /
+        # "monto exacto o menor" según cuál se haya llenado.
+        monto_min_ingresado = None
+        monto_max_ingresado = None
+        if "Monto" in df_pend_base.columns and not df_pend_base.empty:
+            with col_monto_min:
+                monto_min_ingresado = st.number_input(
+                    "💰 Monto mínimo",
+                    min_value=0.0,
+                    value=None,
+                    step=1.0,
+                    format="%.2f",
+                    key="monto_min_pendientes",
+                    placeholder="Sin mínimo",
+                )
+            with col_monto_max:
+                monto_max_ingresado = st.number_input(
+                    "💰 Monto máximo",
+                    min_value=0.0,
+                    value=None,
+                    step=1.0,
+                    format="%.2f",
+                    key="monto_max_pendientes",
+                    placeholder="Sin máximo",
+                )
 
         df_pend = df_pend_base
         if busqueda and "Descripción" in df_pend.columns:
             df_pend = df_pend[df_pend["Descripción"].astype(str).str.contains(busqueda, case=False, na=False)]
-        if rango_monto is not None:
-            df_pend = df_pend[df_pend["Monto"].abs().between(rango_monto[0], rango_monto[1])]
+        if monto_min_ingresado is not None:
+            df_pend = df_pend[df_pend["Monto"].abs() >= monto_min_ingresado]
+        if monto_max_ingresado is not None:
+            df_pend = df_pend[df_pend["Monto"].abs() <= monto_max_ingresado]
 
         columnas_mostrar = [c for c in ["Fecha", "Descripción", "Monto", "Saldo"] if c in df_pend.columns]
 
@@ -1413,14 +1691,17 @@ with tab_pendientes:
             if df_pend.empty:
                 st.caption("Ningún gasto coincide con la búsqueda.")
             else:
-                st.caption("👆 Haz clic en una fila para seleccionar el gasto y luego pulsa «Abrir».")
+                st.caption(
+                    "👆 Selecciona una o más filas -varias, si van a compartir 1 sola factura- y "
+                    "pulsa «Abrir»."
+                )
                 version_tabla = st.session_state.get("tabla_pendientes_version", 0)
                 evento_tabla = st.dataframe(
                     df_pend[columnas_mostrar],
                     use_container_width=True,
                     hide_index=False,
                     on_select="rerun",
-                    selection_mode="single-row",
+                    selection_mode="multi-row",
                     key=f"tabla_pendientes_{version_tabla}",
                     column_config={
                         "Monto": st.column_config.NumberColumn("Monto", format="$%.2f"),
@@ -1434,29 +1715,39 @@ with tab_pendientes:
                 filas_sel = [f for f in filas_sel if 0 <= f < len(df_pend)]
 
                 if filas_sel:
-                    idx_sel = df_pend.index[filas_sel[0]]
-                    desc_sel = str(df_pend.loc[idx_sel, "Descripción"])[:50] if "Descripción" in df_pend.columns else ""
-                    fecha_sel = df_pend.loc[idx_sel, "Fecha"] if "Fecha" in df_pend.columns else ""
+                    idxs_sel = [df_pend.index[f] for f in filas_sel]
+                    monto_sel_total = sum(abs(df_pend.loc[i, "Monto"]) for i in idxs_sel)
                     col_info, col_btn = st.columns([4, 1])
                     with col_info:
-                        st.markdown(
-                            f"**Seleccionado:** #{idx_sel} · {fecha_sel} · {desc_sel} · "
-                            f"{money(abs(df_pend.loc[idx_sel, 'Monto']))}"
-                        )
+                        if len(idxs_sel) == 1:
+                            i = idxs_sel[0]
+                            desc_sel = str(df_pend.loc[i, "Descripción"])[:50] if "Descripción" in df_pend.columns else ""
+                            fecha_sel = df_pend.loc[i, "Fecha"] if "Fecha" in df_pend.columns else ""
+                            st.markdown(
+                                f"**Seleccionado:** #{i} · {fecha_sel} · {desc_sel} · "
+                                f"{money(monto_sel_total)}"
+                            )
+                        else:
+                            nums = ", ".join(f"#{i}" for i in idxs_sel)
+                            st.markdown(
+                                f"**{len(idxs_sel)} gastos seleccionados** ({nums}) · "
+                                f"Monto total: {money(monto_sel_total)} · van a compartir 1 sola factura"
+                            )
                     with col_btn:
-                        if st.button("🔍 Abrir", use_container_width=True, key="btn_abrir_gasto", type="primary"):
-                            st.session_state.gasto_abierto_idx = idx_sel
-                            st.session_state.gasto_abierto_solicitud = st.session_state.solicitud_en_proceso
+                        etiqueta_btn = "🔍 Abrir" if len(idxs_sel) == 1 else "🔗 Comprobar juntos"
+                        if st.button(etiqueta_btn, use_container_width=True, key="btn_abrir_gasto", type="primary"):
+                            st.session_state.gastos_abiertos_idxs = idxs_sel
+                            st.session_state.gastos_abiertos_solicitud = st.session_state.solicitud_en_proceso
                 else:
                     st.caption("Ningún gasto seleccionado todavía.")
 
     # Se invoca fuera del "if st.button(...)" para que la bandera en session_state
     # (y no el click puntual) sea lo único que decide si el diálogo sigue abierto;
     # así sobrevive a los st.rerun() que se disparan desde dentro de él.
-    if st.session_state.gasto_abierto_idx is not None:
+    if st.session_state.gastos_abiertos_idxs is not None:
         dialog_trabajar_gasto(
-            st.session_state.gasto_abierto_idx,
-            solicitud_id=st.session_state.gasto_abierto_solicitud,
+            st.session_state.gastos_abiertos_idxs,
+            solicitud_id=st.session_state.gastos_abiertos_solicitud,
         )
 
     st.divider()
