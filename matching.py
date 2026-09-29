@@ -100,12 +100,17 @@ def resumen_estados(df: pd.DataFrame, estados: dict[int, str]) -> dict[str, dict
     return resumen
 
 
-def diferencia_gasto_facturas(monto_gasto: float, facturas: list[dict[str, Any]]) -> float:
+def diferencia_gasto_facturas(
+    monto_gasto: float, facturas: list[dict[str, Any]], propina: float = 0.0
+) -> float:
     """Diferencia entre el monto del gasto bancario y la suma de montos de las facturas
-    asignadas. La suma se toma con signo (no valor absoluto) para que una nota de
-    crédito incluida en la lista (monto negativo) reste del total, en vez de sumarse
-    como si fuera otra factura más. Redondeada a centavos."""
-    suma_facturas = sum(f.get("Monto Total", 0.0) for f in facturas)
+    asignadas (más la propina, si la hay). La suma de facturas se toma con signo (no
+    valor absoluto) para que una nota de crédito incluida en la lista (monto negativo)
+    reste del total, en vez de sumarse como si fuera otra factura más. `propina` cubre
+    el caso de categorías como "Client Entertainment"/"Travel Meal", donde el cargo
+    bancario puede incluir una propina que no aparece en el CFDI -sin esto, ese gasto
+    nunca cuadraría contra su(s) factura(s)-. Redondeada a centavos."""
+    suma_facturas = sum(f.get("Monto Total", 0.0) for f in facturas) + (propina or 0.0)
     return round(abs(monto_gasto) - suma_facturas, 2)
 
 
@@ -125,7 +130,9 @@ def checksum_reconciliacion(
 
     descuadrados = []
     for reg in concatenados:
-        diff = diferencia_gasto_facturas(reg.get("Monto Estado", 0.0), reg.get("Facturas", []))
+        diff = diferencia_gasto_facturas(
+            reg.get("Monto Estado", 0.0), reg.get("Facturas", []), reg.get("Propina", 0.0)
+        )
         if abs(diff) > DIFERENCIA_ACEPTABLE:
             descuadrados.append({"idx": reg.get("idx"), "diferencia": diff})
 
