@@ -79,6 +79,11 @@ MESES_ES = [
 
 AUTOSAVE_DB = "pettycash_autosave.db"
 
+# Categorías cuyo cargo bancario suele incluir una propina que no aparece en el CFDI
+# (restaurantes/entretenimiento con cliente, comidas de viaje): para estas se ofrece
+# un campo aparte para capturarla y que el gasto pueda cuadrar contra factura+propina.
+CATEGORIAS_CON_PROPINA = {"Client Entertainment", "Travel Meal"}
+
 # ============================================================
 # ESTADO DE SESIÓN
 # ============================================================
@@ -861,6 +866,24 @@ def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> N
     for i in idxs:
         st.session_state.clasificacion_por_gasto[i] = {"categoria": categoria_sel, "material": material_sel}
 
+    # -------- Propina (sólo para categorías donde el cargo bancario suele --------
+    # -------- traer una propina que no aparece en el CFDI) --------
+    propina = 0.0
+    if categoria_sel in CATEGORIAS_CON_PROPINA:
+        st.markdown("##### 💵 Propina")
+        st.caption(
+            "En «Client Entertainment» y «Travel Meal» el cargo bancario suele incluir una "
+            "propina que no aparece en la factura (CFDI). Captúrala aquí para que el gasto "
+            "cuadre contra factura(s) + propina."
+        )
+        propina = st.number_input(
+            "Monto de la propina",
+            min_value=0.0,
+            step=1.0,
+            format="%.2f",
+            key=f"propina_{clave_grupo}",
+        )
+
     # -------- Datos de la solicitud (bitácora) --------
     # Mismos campos que "Nueva solicitud de reembolso" (Categoría/Material ya se
     # capturaron arriba). Sólo se piden aquí cuando el gasto no viene ya vinculado
@@ -1011,12 +1034,15 @@ def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> N
                 "(revisa el ⚠️ junto a su nombre de archivo).</div>", unsafe_allow_html=True,
             )
 
-        suma_facturas = sum(f["Monto Total"] for f in facturas)
+        suma_facturas = sum(f["Monto Total"] for f in facturas) + propina
         diferencia = round(monto_total - suma_facturas, 2)
 
         cc1, cc2, cc3 = st.columns(3)
         cc1.metric("Monto del gasto" if not es_grupo else "Monto total del grupo", money(monto_total))
-        cc2.metric("Suma de facturas", money(suma_facturas))
+        cc2.metric(
+            "Suma de facturas + propina" if propina else "Suma de facturas",
+            money(suma_facturas),
+        )
         cc3.metric("Diferencia", money(diferencia))
 
         if abs(diferencia) <= DIFERENCIA_ACEPTABLE:
@@ -1032,6 +1058,17 @@ def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> N
                     facturas_por_idx = (
                         _prorratear_facturas_grupo(facturas, montos) if es_grupo else {idxs[0]: facturas}
                     )
+                    if es_grupo and propina:
+                        suma_montos_grupo = sum(montos.values())
+                        propina_por_idx = {
+                            i: round(
+                                propina * ((montos[i] / suma_montos_grupo) if suma_montos_grupo > 0 else (1 / len(idxs))),
+                                2,
+                            )
+                            for i in idxs
+                        }
+                    else:
+                        propina_por_idx = {i: (propina if not es_grupo else 0.0) for i in idxs}
                     for i in idxs:
                         gasto_i = gastos[i]
                         registro = {
@@ -1042,6 +1079,7 @@ def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> N
                             "Categoria": categoria_sel,
                             "Material": material_sel,
                             "Facturas": facturas_por_idx[i],
+                            "Propina": propina_por_idx[i],
                             "Solicitud": sol,
                         }
                         if es_grupo:
@@ -1293,14 +1331,14 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
     columnas_df = [
         "No", "Applicant", "Category", "Description", "Linked Request No",
         "Number of Days", "Total Number of People", "Employee Name", "Material",
-        "Payment Date", "Expense Outflow Amt", "Bank No", "Invoice Date", "CFDI Folio",
+        "Payment Date", "Expense Outflow Amt", "Propina", "Bank No", "Invoice Date", "CFDI Folio",
         "IVA", "ISR Retenido", "IVA Retenido", "ISH",
         "Reimbursement Cap", "Status",
     ]
     encabezados = [
         "No.", "Applicant", "Category", "Description", "Linked Request No.",
         "Number of Days", "Total Number of People", "Employee Name", "Material",
-        "Payment Date", "Expense Outflow Amt", "No.", "Invoice date", "CFDI Folio",
+        "Payment Date", "Expense Outflow Amt", "Propina", "No.", "Invoice date", "CFDI Folio",
         "IVA", "ISR Retenido", "IVA Retenido", "ISH",
         "Reimbursement Cap (With IVA)", "Status",
     ]
@@ -1329,6 +1367,7 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
                 "Expense Outflow Amt": (
                     round(abs(float(registro.get("Monto Estado", 0) or 0)), 2) if primera else None
                 ),
+                "Propina": (round(float(registro.get("Propina", 0) or 0), 2) if primera else None),
                 "Bank No": no_fila if primera else None,
                 # Datos fiscales extraídos del XML de cada factura -una fila por
                 # factura, igual que "CFDI Folio"-, no del gasto/movimiento bancario.
@@ -1358,7 +1397,7 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
         ws = writer.sheets["Comprobados"]
         for col_idx, titulo in enumerate(encabezados):
             ws.write(0, col_idx, titulo, header_fmt)
-        columnas_dinero = ["Expense Outflow Amt", "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap"]
+        columnas_dinero = ["Expense Outflow Amt", "Propina", "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap"]
         for nombre in columnas_dinero:
             col_idx = columnas_df.index(nombre)
             ws.set_column(col_idx, col_idx, 16, money_fmt)
@@ -1375,6 +1414,8 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
             ws.write(fila_total, 0, "Total", bold_fmt)
             ws.write(fila_total, columnas_df.index("Expense Outflow Amt"),
                      df_comp["Expense Outflow Amt"].dropna().sum(), money_fmt)
+            ws.write(fila_total, columnas_df.index("Propina"),
+                     df_comp["Propina"].dropna().sum(), money_fmt)
             for nombre in ("IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap"):
                 ws.write(fila_total, columnas_df.index(nombre), df_comp[nombre].sum(), money_fmt)
 
@@ -2067,7 +2108,8 @@ with tab_comprobados:
 
         for reg in registros:
             facturas = reg["Facturas"]
-            suma_facturas = sum(f["Monto Total"] for f in facturas)
+            propina_reg = reg.get("Propina", 0.0) or 0.0
+            suma_facturas = sum(f["Monto Total"] for f in facturas) + propina_reg
             marca_incompleta = " ⚠️" if any(f.get("Incompleta") for f in facturas) else ""
             with st.expander(
                 f"#{reg['idx']} · {reg.get('Fecha Estado', '')} · "
@@ -2078,7 +2120,9 @@ with tab_comprobados:
                 cols_f = [c for c in ["Archivo", "UUID", "RFC Emisor", "Concepto", "IVA", "Monto Total"] if c in df_f.columns]
                 st.dataframe(df_f[cols_f].style.format({"IVA": money, "Monto Total": money}),
                              use_container_width=True, hide_index=True)
-                st.caption(f"Suma de facturas: {money(suma_facturas)}  ·  Diferencia: "
+                if propina_reg:
+                    st.caption(f"Propina: {money(propina_reg)}")
+                st.caption(f"Suma de facturas{' + propina' if propina_reg else ''}: {money(suma_facturas)}  ·  Diferencia: "
                            f"{money(round(abs(reg.get('Monto Estado', 0)) - suma_facturas, 2))}")
                 if st.button("↩️ Revertir a pendiente", key=f"revertir_comp_{reg['idx']}"):
                     _revertir_a_pendiente(reg["idx"], "comprobado")
