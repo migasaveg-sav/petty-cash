@@ -13,6 +13,15 @@ import pandas as pd
 UMBRAL_SUGERENCIA_ABS = 500.0
 UMBRAL_SUGERENCIA_PCT = 0.30
 
+# Diferencia máxima (en pesos) entre el monto de un gasto y la suma de sus facturas
+# que todavía se considera "cuadrado" -tanto para clasificar una sugerencia del
+# emparejamiento automático como "exacto" (en vez de "a revisar"), como para que el
+# diálogo "Trabajar gasto" deje comprobar un gasto, como para el checksum de
+# reconciliación (qué comprobados quedan "descuadrados"). Antes era 1 centavo (0.01);
+# a petición del usuario ahora tolera hasta 5 centavos (0.05) de diferencia por
+# redondeos menores, sin exigir que cuadre al centavo exacto.
+DIFERENCIA_ACEPTABLE = 0.05
+
 ESTADOS = ("pendiente", "pendiente_detalles", "comprobado", "no_necesario")
 
 
@@ -68,7 +77,7 @@ def calcular_matches_automaticos(
         if idx in usados_idx or factura["_id"] in usados_pool_ids:
             continue
         diferencia = round(monto_gasto - abs(factura["Monto Total"]), 2)
-        tipo = "exacto" if abs(diferencia) <= 0.01 else "revision"
+        tipo = "exacto" if abs(diferencia) <= DIFERENCIA_ACEPTABLE else "revision"
         sugerencias.append({
             "idx": idx, "gasto": df.loc[idx], "monto_gasto": monto_gasto,
             "factura": factura, "diferencia": diferencia, "tipo": tipo,
@@ -117,12 +126,17 @@ def checksum_reconciliacion(
     descuadrados = []
     for reg in concatenados:
         diff = diferencia_gasto_facturas(reg.get("Monto Estado", 0.0), reg.get("Facturas", []))
-        if abs(diff) > 0.01:
+        if abs(diff) > DIFERENCIA_ACEPTABLE:
             descuadrados.append({"idx": reg.get("idx"), "diferencia": diff})
 
     return {
         "total_estado_cuenta": total_general,
         "total_por_estados": total_por_estados,
+        # Este "cuadra" es una identidad contable (cada movimiento del estado de
+        # cuenta cae en exactamente un estado): debe dar igual salvo ruido de
+        # redondeo de punto flotante, así que se queda en 1 centavo -no es la
+        # misma tolerancia de negocio que DIFERENCIA_ACEPTABLE- para no esconder
+        # un gasto que quedó sin clasificar o clasificado dos veces.
         "cuadra": abs(total_general - total_por_estados) <= 0.01,
         "comprobados_descuadrados": descuadrados,
     }
