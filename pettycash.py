@@ -34,7 +34,7 @@ from catalog import (
     catalogo_inicial,
 )
 from cfdi import CFDIParseError, parse_cfdi
-from matching import calcular_matches_automaticos, checksum_reconciliacion, resumen_estados
+from matching import DIFERENCIA_ACEPTABLE, calcular_matches_automaticos, checksum_reconciliacion, resumen_estados
 from persistence import (
     CAMPOS_SESION,
     autoguardar,
@@ -1019,7 +1019,7 @@ def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> N
         cc2.metric("Suma de facturas", money(suma_facturas))
         cc3.metric("Diferencia", money(diferencia))
 
-        if abs(diferencia) <= 0.01:
+        if abs(diferencia) <= DIFERENCIA_ACEPTABLE:
             etiqueta_ok = "Gasto comprobado" if not es_grupo else "Grupo comprobado"
             st.markdown(
                 f"<div class='success-box'>✅ {etiqueta_ok} correctamente. Diferencia: {money(diferencia)}</div>",
@@ -1831,7 +1831,7 @@ with tab_pendientes:
                           "Factura (UUID)", "RFC Emisor", "Monto factura", "Diferencia"]
 
         if sug_exactas:
-            st.markdown("##### ✅ Coincidencias exactas (diferencia ≤ $0.01)")
+            st.markdown(f"##### ✅ Coincidencias exactas (diferencia ≤ {money(DIFERENCIA_ACEPTABLE)})")
             edited_exactas = st.data_editor(
                 _df_para_editor(sug_exactas, incluir_default=True), use_container_width=True, hide_index=True,
                 disabled=cols_disabled, column_config=col_cfg, key="editor_exactas",
@@ -1848,7 +1848,7 @@ with tab_pendientes:
                     st.warning("No marcaste ninguna fila con 'Incluir'.")
 
         if sug_revision:
-            st.markdown("##### 🔍 Requieren tu validación (diferencia mayor a $0.01)")
+            st.markdown(f"##### 🔍 Requieren tu validación (diferencia mayor a {money(DIFERENCIA_ACEPTABLE)})")
             edited_revision = st.data_editor(
                 _df_para_editor(sug_revision, incluir_default=False), use_container_width=True, hide_index=True,
                 disabled=cols_disabled, column_config=col_cfg, key="editor_revision",
