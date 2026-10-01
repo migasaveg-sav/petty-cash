@@ -44,6 +44,7 @@ from persistence import (
     restaurar_autoguardado,
     sesion_a_json_bytes,
     sesion_vacia,
+    trasladar_progreso,
 )
 
 # ============================================================
@@ -427,6 +428,24 @@ def _completar_catalogos_faltantes() -> None:
         st.session_state.aplicantes = catalogo_inicial(APLICANTES_DEFAULT)
 
 
+_CAMPOS_CATALOGO = ("categorias", "materiales", "categorias_solicitud", "empleados", "aplicantes")
+
+
+def _fusionar_catalogos(otros: dict) -> None:
+    """Agrega a los catálogos de la sesión actual cualquier valor que sólo
+    existiera en `otros` (los catálogos de un avance .json que se está
+    trasladando sobre un estado de cuenta más nuevo, en vez de reemplazarlo
+    por completo). Sin esto, un Applicant/Employee/Category agregado sólo en la
+    sesión vieja desaparecería del selector al trasladar su progreso."""
+    for campo in _CAMPOS_CATALOGO:
+        actual = st.session_state.get(campo) or []
+        combinado = list(actual)
+        for valor in (otros.get(campo) or []):
+            if valor not in combinado:
+                combinado.append(valor)
+        st.session_state[campo] = combinado
+
+
 def _autoguardar_si_activo() -> None:
     if st.session_state.autoguardado_activo and st.session_state.bank_df is not None:
         try:
@@ -551,16 +570,67 @@ with st.sidebar:
                 st.error(f"No se pudo cargar el estado de cuenta: {e}")
                 nuevo_df = None
             if nuevo_df is not None:
-                st.session_state.bank_df = nuevo_df
-                st.session_state.banco = banco
-                st.session_state.bank_file_id = file_key
-                st.session_state.estados = {i: "pendiente" for i in nuevo_df.index}
-                st.session_state.facturas_por_gasto = {}
-                st.session_state.clasificacion_por_gasto = {}
-                st.session_state.pool_facturas = []
-                st.session_state.concatenados = []
-                st.session_state.no_necesarios = []
-                st.success(f"Estado de cuenta cargado: {len(nuevo_df)} movimiento(s).")
+                df_anterior = st.session_state.bank_df
+                hay_progreso_previo = df_anterior is not None and bool(
+                    any(v != "pendiente" for v in st.session_state.estados.values())
+                    or st.session_state.concatenados
+                    or st.session_state.no_necesarios
+                    or st.session_state.facturas_por_gasto
+                    or st.session_state.facturas_por_gasto_grupo
+                    or st.session_state.clasificacion_por_gasto
+                )
+                if hay_progreso_previo:
+                    # Un estado de cuenta nuevo normalmente es una versión más amplia
+                    # del mismo periodo -el banco vuelve a incluir lo de antes más lo
+                    # nuevo hasta una fecha más reciente-, no un archivo sin relación
+                    # con el anterior. Antes, cargar uno nuevo borraba sin más todo el
+                    # progreso (estados, facturas, comprobaciones); ahora se traslada
+                    # emparejando cada movimiento por Fecha+Descripción+Monto, en vez
+                    # de perderlo sólo porque la posición de fila cambió.
+                    traslado = trasladar_progreso(
+                        df_anterior, nuevo_df,
+                        st.session_state.estados, st.session_state.facturas_por_gasto,
+                        st.session_state.facturas_por_gasto_grupo, st.session_state.clasificacion_por_gasto,
+                        st.session_state.concatenados, st.session_state.no_necesarios,
+                        st.session_state.solicitudes,
+                    )
+                    st.session_state.estados = traslado["estados"]
+                    st.session_state.facturas_por_gasto = traslado["facturas_por_gasto"]
+                    st.session_state.facturas_por_gasto_grupo = traslado["facturas_por_gasto_grupo"]
+                    st.session_state.clasificacion_por_gasto = traslado["clasificacion_por_gasto"]
+                    st.session_state.concatenados = traslado["concatenados"]
+                    st.session_state.no_necesarios = traslado["no_necesarios"]
+                    st.session_state.solicitudes = traslado["solicitudes"]
+                    # pool_facturas no se toca: son facturas subidas sin asignar
+                    # todavía a ningún gasto, no dependen de qué estado de cuenta
+                    # esté cargado.
+                    mensaje = (
+                        f"Estado de cuenta actualizado: {len(nuevo_df)} movimiento(s) "
+                        f"({traslado['movimientos_nuevos']} nuevo(s)). Se trasladó el progreso de "
+                        f"{traslado['movimientos_trasladados']} movimiento(s) ya trabajados."
+                    )
+                    if traslado["movimientos_sin_match_en_nuevo"]:
+                        mensaje += (
+                            f" ⚠️ {len(traslado['movimientos_sin_match_en_nuevo'])} movimiento(s) del "
+                            "estado de cuenta anterior ya no aparecen en este archivo -revísalos, pudo "
+                            "haber sido una corrección del banco-."
+                        )
+                    st.session_state.bank_df = nuevo_df
+                    st.session_state.banco = banco
+                    st.session_state.bank_file_id = file_key
+                    st.success(mensaje)
+                else:
+                    st.session_state.bank_df = nuevo_df
+                    st.session_state.banco = banco
+                    st.session_state.bank_file_id = file_key
+                    st.session_state.estados = {i: "pendiente" for i in nuevo_df.index}
+                    st.session_state.facturas_por_gasto = {}
+                    st.session_state.facturas_por_gasto_grupo = {}
+                    st.session_state.clasificacion_por_gasto = {}
+                    st.session_state.pool_facturas = []
+                    st.session_state.concatenados = []
+                    st.session_state.no_necesarios = []
+                    st.success(f"Estado de cuenta cargado: {len(nuevo_df)} movimiento(s).")
                 _autoguardar_si_activo()
                 st.rerun()
 
@@ -581,10 +651,62 @@ with st.sidebar:
     if json_file is not None and st.button("Cargar este avance", use_container_width=True):
         try:
             data = json.loads(json_file.getvalue().decode("utf-8"))
-            _restaurar_estado(cargar_sesion_dict(data))
-            _completar_catalogos_faltantes()
-            st.session_state.solicitud_en_proceso = None
-            st.success("Avance restaurado correctamente.")
+            restaurado = cargar_sesion_dict(data)
+            if st.session_state.bank_df is not None and restaurado.get("bank_df") is not None:
+                # Ya hay un estado de cuenta cargado en esta sesión -probablemente
+                # más reciente que el que traía este avance-: en vez de reemplazarlo
+                # por el viejo que trae el .json (perdiendo cualquier movimiento que
+                # no estuviera ahí), se conserva el actual y se le traslada el
+                # progreso del avance, emparejando cada movimiento por
+                # Fecha+Descripción+Monto.
+                traslado = trasladar_progreso(
+                    restaurado["bank_df"], st.session_state.bank_df,
+                    restaurado["estados"], restaurado["facturas_por_gasto"],
+                    restaurado.get("facturas_por_gasto_grupo", {}), restaurado["clasificacion_por_gasto"],
+                    restaurado["concatenados"], restaurado["no_necesarios"],
+                    restaurado.get("solicitudes", []),
+                )
+                st.session_state.estados = traslado["estados"]
+                st.session_state.facturas_por_gasto = traslado["facturas_por_gasto"]
+                st.session_state.facturas_por_gasto_grupo = traslado["facturas_por_gasto_grupo"]
+                st.session_state.clasificacion_por_gasto = traslado["clasificacion_por_gasto"]
+                st.session_state.concatenados = traslado["concatenados"]
+                st.session_state.no_necesarios = traslado["no_necesarios"]
+                st.session_state.solicitudes = traslado["solicitudes"]
+                # Las facturas del avance que seguían sin asignar (pool) también
+                # siguen siendo válidas sin importar el estado de cuenta: se
+                # combinan con las que ya hubiera en la sesión actual, evitando
+                # duplicar un mismo UUID real.
+                uuids_actuales = {f.get("UUID") for f in st.session_state.pool_facturas}
+                for f in restaurado.get("pool_facturas") or []:
+                    if f.get("UUID") == "SIN-UUID" or f.get("UUID") not in uuids_actuales:
+                        st.session_state.pool_facturas.append(f)
+                        uuids_actuales.add(f.get("UUID"))
+                st.session_state.factura_counter = max(
+                    st.session_state.factura_counter, restaurado.get("factura_counter", 0) or 0
+                )
+                st.session_state.solicitud_counter = max(
+                    st.session_state.solicitud_counter, restaurado.get("solicitud_counter", 0) or 0
+                )
+                _fusionar_catalogos(restaurado)
+                _completar_catalogos_faltantes()
+                st.session_state.solicitud_en_proceso = None
+                mensaje = (
+                    f"Avance trasladado al estado de cuenta actual: "
+                    f"{traslado['movimientos_trasladados']} movimiento(s) ya trabajados se reconocieron."
+                )
+                if traslado["movimientos_sin_match_en_nuevo"]:
+                    mensaje += (
+                        f" ⚠️ {len(traslado['movimientos_sin_match_en_nuevo'])} movimiento(s) del avance "
+                        "no se encontraron en el estado de cuenta actual."
+                    )
+                st.success(mensaje)
+            else:
+                _restaurar_estado(restaurado)
+                _completar_catalogos_faltantes()
+                st.session_state.solicitud_en_proceso = None
+                st.success("Avance restaurado correctamente.")
+            _autoguardar_si_activo()
             st.rerun()
         except Exception as e:
             st.error(f"No se pudo leer el archivo de avance: {e}")
