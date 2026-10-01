@@ -6,6 +6,17 @@
 2. Autoguardado en SQLite como red de seguridad: cada cierto número de acciones (o
    al cerrar un gasto) se guarda una copia local en disco, para poder recuperar el
    trabajo si el navegador se cierra sin que el usuario haya descargado el .json.
+3. Traslado de progreso entre dos estados de cuenta distintos (`emparejar_filas_por_contenido`
+   / `trasladar_progreso`): un estado de cuenta nuevo normalmente es una versión más
+   amplia del mismo periodo (vuelve a traer lo de antes más movimientos nuevos hasta
+   una fecha más reciente), no un archivo sin relación con el anterior. Antes, tanto
+   subir un estado de cuenta nuevo como restaurar un avance (.json) viejo reemplazaban
+   TODO -incluido el propio estado de cuenta- sin ningún emparejamiento, así que el
+   progreso ya trabajado (qué gastos están comprobados, sus facturas, la bitácora) se
+   perdía o quedaba apuntando a las filas equivocadas en cuanto cambiaba el archivo.
+   Estas dos funciones permiten trasladar ese progreso de un estado de cuenta a otro
+   emparejando cada movimiento por Fecha+Descripción+Monto, en vez de por posición de
+   fila (que no se puede asumir estable entre dos exportes distintos del banco).
 
 Todo aquí es independiente de Streamlit para poder probarse con pytest.
 """
@@ -158,6 +169,195 @@ def sesion_vacia() -> dict[str, Any]:
         "aplicantes": None,
         "selected_idx": None,
     }
+
+
+# ============================================================
+# TRASLADO DE PROGRESO ENTRE DOS ESTADOS DE CUENTA DISTINTOS
+# ============================================================
+def emparejar_filas_por_contenido(df_viejo: pd.DataFrame, df_nuevo: pd.DataFrame) -> dict[int, int]:
+    """Empareja cada fila de un estado de cuenta anterior (`df_viejo`) con la fila
+    del estado de cuenta nuevo (`df_nuevo`) que represente el mismo movimiento
+    bancario -misma Fecha, Descripción y Monto-, para poder trasladar el progreso
+    ya trabajado (estados, facturas asignadas, comprobaciones) cuando se carga un
+    estado de cuenta más reciente que amplía/reemplaza al anterior (típico: un
+    exporte acumulado del banco que ahora llega hasta una fecha posterior, pero
+    que no tiene por qué traer los movimientos en las mismas posiciones -o con el
+    mismo número total de filas- que el exporte anterior).
+
+    Si hay varias filas idénticas de un lado o del otro (montos/fechas/conceptos
+    repetidos, común en comisiones o cargos genéricos), se emparejan en el mismo
+    orden en que aparecen -la 1a fila vieja con esa clave con la 1a fila nueva con
+    esa misma clave, la 2a con la 2a, etc.- en vez de que la primera coincidencia
+    se quede con todas y deje las demás sin pareja.
+
+    Regresa {idx_viejo: idx_nuevo} sólo para las filas que sí encontraron pareja.
+    Una fila vieja sin pareja ya no aparece en el estado de cuenta nuevo (poco
+    común: el banco corrigió o quitó un movimiento). Una fila nueva sin pareja es
+    un movimiento que no estaba antes -lo normal, la razón de cargar un estado de
+    cuenta más reciente-."""
+
+    def _clave(fila: pd.Series) -> tuple:
+        try:
+            monto = round(float(fila.get("Monto", 0.0)), 2)
+        except (TypeError, ValueError):
+            monto = None
+        return (
+            str(fila.get("Fecha", "")).strip(),
+            str(fila.get("Descripción", "")).strip(),
+            monto,
+        )
+
+    disponibles: dict[tuple, list[int]] = {}
+    for idx_nuevo, fila in df_nuevo.iterrows():
+        disponibles.setdefault(_clave(fila), []).append(idx_nuevo)
+
+    mapeo: dict[int, int] = {}
+    for idx_viejo, fila in df_viejo.iterrows():
+        candidatos = disponibles.get(_clave(fila))
+        if candidatos:
+            mapeo[idx_viejo] = candidatos.pop(0)
+    return mapeo
+
+
+def trasladar_progreso(
+    df_viejo: pd.DataFrame,
+    df_nuevo: pd.DataFrame,
+    estados: dict[int, str],
+    facturas_por_gasto: dict[int, list],
+    facturas_por_gasto_grupo: dict[str, list],
+    clasificacion_por_gasto: dict[int, dict],
+    concatenados: list[dict],
+    no_necesarios: list[dict],
+    solicitudes: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Traslada todo el progreso trabajado sobre `df_viejo` hacia `df_nuevo` (otro
+    estado de cuenta, normalmente una versión más reciente/ampliada de la misma
+    cuenta), emparejando movimientos por contenido en vez de por posición de fila
+    -ver `emparejar_filas_por_contenido`-. Pensado para dos casos:
+
+    1. Se sube un estado de cuenta nuevo encima de uno que ya tenía avance.
+    2. Se restaura un avance (.json) guardado sobre un estado de cuenta viejo,
+       mientras en la sesión actual ya hay cargado uno más nuevo -en vez de que
+       restaurar el avance reemplace el estado de cuenta nuevo por el viejo-.
+
+    Cada idx de `df_nuevo` queda en 'pendiente' salvo que su movimiento haya
+    tenido pareja en `df_viejo` con un progreso distinto (comprobado, pendiente de
+    detalles, no necesario). Los movimientos del estado de cuenta viejo que ya no
+    aparecen en el nuevo (poco común) se excluyen de `concatenados`/`no_necesarios`
+    -no hay una fila a la que asignarlos- y se reportan en "movimientos_sin_match_en_nuevo"
+    para poder avisar al usuario en vez de desaparecer en silencio."""
+    mapeo = emparejar_filas_por_contenido(df_viejo, df_nuevo)
+
+    def _remap(i):
+        return mapeo.get(i)
+
+    nuevos_estados: dict[int, str] = {idx_nuevo: "pendiente" for idx_nuevo in df_nuevo.index}
+    for idx_viejo, estado in (estados or {}).items():
+        idx_nuevo = _remap(idx_viejo)
+        if idx_nuevo is not None:
+            nuevos_estados[idx_nuevo] = estado
+
+    nuevas_facturas_por_gasto: dict[int, list] = {}
+    for idx_viejo, facturas in (facturas_por_gasto or {}).items():
+        idx_nuevo = _remap(idx_viejo)
+        if idx_nuevo is not None:
+            nuevas_facturas_por_gasto[idx_nuevo] = facturas
+
+    nueva_clasificacion: dict[int, dict] = {}
+    for idx_viejo, clasif in (clasificacion_por_gasto or {}).items():
+        idx_nuevo = _remap(idx_viejo)
+        if idx_nuevo is not None:
+            nueva_clasificacion[idx_nuevo] = clasif
+
+    def _remap_clave_grupo(clave: str) -> str | None:
+        idxs_viejos = [int(x) for x in clave.split(",") if x != ""]
+        idxs_nuevos = [_remap(i) for i in idxs_viejos]
+        if not idxs_nuevos or any(i is None for i in idxs_nuevos):
+            return None
+        return ",".join(str(i) for i in sorted(idxs_nuevos))
+
+    nueva_facturas_grupo: dict[str, list] = {}
+    for clave, facturas in (facturas_por_gasto_grupo or {}).items():
+        nueva_clave = _remap_clave_grupo(clave)
+        if nueva_clave is not None:
+            nueva_facturas_grupo[nueva_clave] = facturas
+
+    nuevos_concatenados: list[dict] = []
+    concatenados_sin_match = 0
+    for reg in concatenados or []:
+        reg = dict(reg)
+        idx_nuevo = _remap(reg.get("idx"))
+        if idx_nuevo is None:
+            concatenados_sin_match += 1
+            continue
+        reg["idx"] = idx_nuevo
+        if reg.get("GastosDelGrupo"):
+            grupo_nuevo = [_remap(i) for i in reg["GastosDelGrupo"]]
+            if all(i is not None for i in grupo_nuevo):
+                reg["GastosDelGrupo"] = grupo_nuevo
+            else:
+                # alguno de los compañeros del grupo no tuvo pareja en el estado de
+                # cuenta nuevo: este registro sigue siendo válido por sí solo (ya
+                # cuadra contra su propia porción prorrateada), sólo se le quita la
+                # referencia a un grupo que ya no se puede reconstruir completo.
+                reg.pop("GastosDelGrupo", None)
+                reg.pop("GrupoCompartido", None)
+        nuevos_concatenados.append(reg)
+        nuevos_estados[idx_nuevo] = "pendiente_detalles" if reg.get("DetallesPendientes") else "comprobado"
+
+    nuevos_no_necesarios: list[dict] = []
+    no_necesarios_sin_match = 0
+    for reg in no_necesarios or []:
+        reg = dict(reg)
+        idx_nuevo = _remap(reg.get("idx"))
+        if idx_nuevo is None:
+            no_necesarios_sin_match += 1
+            continue
+        reg["idx"] = idx_nuevo
+        nuevos_no_necesarios.append(reg)
+        nuevos_estados[idx_nuevo] = "no_necesario"
+
+    nuevas_solicitudes: list[dict] | None = None
+    if solicitudes is not None:
+        nuevas_solicitudes = []
+        for sol in solicitudes:
+            sol = dict(sol)
+            idx_vinc = sol.get("idx_vinculado")
+            if idx_vinc is not None:
+                if isinstance(idx_vinc, (list, tuple)):
+                    remapeados = [r for r in (_remap(i) for i in idx_vinc) if r is not None]
+                    if remapeados:
+                        sol["idx_vinculado"] = remapeados[0] if len(remapeados) == 1 else remapeados
+                    else:
+                        sol["idx_vinculado"] = None
+                        if sol.get("estado") in ("comprobado", "pendiente_detalles"):
+                            sol["estado"] = "pendiente"
+                else:
+                    nuevo = _remap(idx_vinc)
+                    sol["idx_vinculado"] = nuevo
+                    if nuevo is None and sol.get("estado") in ("comprobado", "pendiente_detalles"):
+                        sol["estado"] = "pendiente"
+            nuevas_solicitudes.append(sol)
+
+    idxs_viejos_sin_match = [i for i in df_viejo.index if i not in mapeo]
+    idxs_nuevos_sin_progreso_previo = [i for i in df_nuevo.index if i not in mapeo.values()]
+
+    resultado: dict[str, Any] = {
+        "estados": nuevos_estados,
+        "facturas_por_gasto": nuevas_facturas_por_gasto,
+        "facturas_por_gasto_grupo": nueva_facturas_grupo,
+        "clasificacion_por_gasto": nueva_clasificacion,
+        "concatenados": nuevos_concatenados,
+        "no_necesarios": nuevos_no_necesarios,
+        "movimientos_trasladados": len(mapeo),
+        "movimientos_nuevos": len(idxs_nuevos_sin_progreso_previo),
+        "movimientos_sin_match_en_nuevo": idxs_viejos_sin_match,
+        "concatenados_sin_match": concatenados_sin_match,
+        "no_necesarios_sin_match": no_necesarios_sin_match,
+    }
+    if nuevas_solicitudes is not None:
+        resultado["solicitudes"] = nuevas_solicitudes
+    return resultado
 
 
 # ============================================================
