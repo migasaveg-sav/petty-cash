@@ -201,11 +201,13 @@ td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
 [data-testid="stExpander"] summary:hover {{ background-color: {C_NAVY_SUAVE}; }}
 
 /* -------- Botones -------- */
-.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
+.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button,
+[data-testid="stPopoverButton"] {{
     background-color: {C_TARJETA}; color: {C_NAVY}; border: 1.5px solid {C_BORDE};
     border-radius: 8px; font-weight: 600; transition: all 0.12s ease;
 }}
-.stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {{
+.stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover,
+[data-testid="stPopoverButton"]:hover {{
     background-color: {C_ACENTO_SUAVE}; color: {C_ACENTO_HOVER}; border-color: {C_ACENTO};
 }}
 .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{
@@ -213,6 +215,29 @@ td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
 }}
 .stButton > button[kind="primary"]:hover, .stFormSubmitButton > button[kind="primary"]:hover {{
     background-color: {C_ACENTO_HOVER}; color: #FFFFFF; border-color: {C_ACENTO_HOVER};
+}}
+
+/* -------- Indicador verde/rojo de adjunto (PDF/imagen) por factura --------
+   `_factura_control_adjunto` envuelve cada botón "📎" en un st.container con
+   key="adj-ok-..." o "adj-falta-...": Streamlit expone esa key como clase CSS
+   del contenedor (st-key-<key>), que es el mecanismo oficial para estilizar un
+   widget puntual sin afectar a los demás. El selector usa [class*=] (substring)
+   porque el resto de la key (prefijo de la tabla + _id de la factura) cambia
+   por fila. NOTA: como esto aplica a CUALQUIER stPopoverButton dentro de un
+   contenedor con esa key, si en el futuro se agrega otro st.popover fuera de
+   este helper, debe envolverse con una key que no empiece con "adj-ok-"/
+   "adj-falta-" para no heredar este color sin querer. */
+[class*="st-key-adj-ok-"] [data-testid="stPopoverButton"] {{
+    background-color: #EAF7EF; border-color: {C_VERDE_OK} !important;
+}}
+[class*="st-key-adj-ok-"] [data-testid="stPopoverButton"]:hover {{
+    background-color: #D7F0E0;
+}}
+[class*="st-key-adj-falta-"] [data-testid="stPopoverButton"] {{
+    background-color: #FDECEC; border-color: {C_CORAL_ALERTA} !important;
+}}
+[class*="st-key-adj-falta-"] [data-testid="stPopoverButton"]:hover {{
+    background-color: #FBDCDC;
 }}
 
 /* -------- Barra lateral: panel de navegación oscuro -------- */
@@ -402,7 +427,11 @@ def _factura_control_adjunto(f: dict, key_prefix: str) -> None:
     tiene uno, o para subirlo si todavía no. `key_prefix` debe ser único por tabla
     donde se llama (el `_id` de la factura ya la distingue dentro de esa tabla)."""
     adjunto = f.get("Adjunto")
-    with st.popover("📎✅" if adjunto else "📎", help="Ver o adjuntar el PDF/imagen de esta factura"):
+    # El contenedor con esta key es lo que le da color verde/rojo al botón de abajo
+    # (ver el bloque de CSS "Indicador verde/rojo de adjunto" en los estilos de la app).
+    estado_clave = "ok" if adjunto else "falta"
+    contenedor = st.container(key=f"adj-{estado_clave}-{key_prefix}-{f['_id']}")
+    with contenedor, st.popover("📎✅" if adjunto else "📎", help="Ver o adjuntar el PDF/imagen de esta factura"):
         if adjunto:
             st.caption(f"📄 {adjunto['nombre']}")
             contenido = base64.b64decode(adjunto["contenido_b64"])
