@@ -17,6 +17,7 @@ elige un gasto específico para trabajar.
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 
@@ -366,6 +367,80 @@ def etiqueta_factura(f: dict) -> str:
     origen = f.get("Archivo") or f.get("Fuente", "Factura")
     marca = " ⚠️" if f.get("Incompleta") else ""
     return f"{origen} · {money(f.get('Monto Total', 0))}{marca}"
+
+
+# ============================================================
+# ADJUNTOS (PDF/imagen) DE UNA FACTURA
+# ============================================================
+# Del XML sólo se extraen los datos (UUID, montos, RFC, etc.); a veces hace falta
+# revisar el PDF o una foto/escaneo de la factura tal cual -por ejemplo para ver
+# el detalle de un restaurante, o confirmar algo que el XML no trae-. El adjunto
+# se guarda codificado en base64 DENTRO del propio diccionario de la factura
+# (f["Adjunto"]), no en un archivo aparte en disco: así viaja automáticamente con
+# el resto del progreso sin tocar persistence.py -se incluye solo al descargar el
+# avance .json, en el autoguardado local, y sobrevive a trasladar_progreso (que
+# nunca mira el contenido de una factura, sólo la reubica)-. Streamlit Cloud borra
+# el disco local del contenedor en cada reinicio, así que cualquier cosa que sólo
+# viva ahí (sin pasar por el .json) se perdería igual; esto evita ese problema sin
+# depender de un servicio externo.
+FORMATOS_ADJUNTO_PERMITIDOS = ["pdf", "jpg", "jpeg", "png"]
+TAMANO_MAXIMO_ADJUNTO_MB = 10
+
+
+def _mime_adjunto(nombre: str) -> str:
+    ext = nombre.rsplit(".", 1)[-1].lower() if "." in nombre else ""
+    return {
+        "pdf": "application/pdf",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+    }.get(ext, "application/octet-stream")
+
+
+def _factura_control_adjunto(f: dict, key_prefix: str) -> None:
+    """Botón que abre un popover para ver/descargar/quitar el adjunto de `f` si ya
+    tiene uno, o para subirlo si todavía no. `key_prefix` debe ser único por tabla
+    donde se llama (el `_id` de la factura ya la distingue dentro de esa tabla)."""
+    adjunto = f.get("Adjunto")
+    with st.popover("📎✅" if adjunto else "📎", help="Ver o adjuntar el PDF/imagen de esta factura"):
+        if adjunto:
+            st.caption(f"📄 {adjunto['nombre']}")
+            contenido = base64.b64decode(adjunto["contenido_b64"])
+            if adjunto["tipo"].startswith("image/"):
+                st.image(contenido, use_container_width=True)
+            elif adjunto["tipo"] == "application/pdf":
+                st.markdown(
+                    f'<iframe src="data:application/pdf;base64,{adjunto["contenido_b64"]}" '
+                    'width="100%" height="420" style="border:1px solid #CBD5E1; border-radius:6px;">'
+                    '</iframe>',
+                    unsafe_allow_html=True,
+                )
+            st.download_button(
+                "⬇️ Descargar", data=contenido, file_name=adjunto["nombre"], mime=adjunto["tipo"],
+                key=f"{key_prefix}_descargar_adjunto_{f['_id']}", use_container_width=True,
+            )
+            if st.button("🗑️ Quitar adjunto", key=f"{key_prefix}_quitar_adjunto_{f['_id']}",
+                         use_container_width=True):
+                f.pop("Adjunto", None)
+                st.rerun()
+        else:
+            st.caption(f"Formatos: {', '.join(FORMATOS_ADJUNTO_PERMITIDOS).upper()} · máx. {TAMANO_MAXIMO_ADJUNTO_MB} MB")
+            nuevo = st.file_uploader(
+                "Sube el PDF o la foto/escaneo de esta factura", type=FORMATOS_ADJUNTO_PERMITIDOS,
+                key=f"{key_prefix}_subir_adjunto_{f['_id']}",
+            )
+            if nuevo is not None:
+                contenido = nuevo.getvalue()
+                if len(contenido) > TAMANO_MAXIMO_ADJUNTO_MB * 1024 * 1024:
+                    st.error(f"El archivo pesa más de {TAMANO_MAXIMO_ADJUNTO_MB} MB; sube una versión más ligera.")
+                else:
+                    f["Adjunto"] = {
+                        "nombre": nuevo.name,
+                        "tipo": nuevo.type or _mime_adjunto(nuevo.name),
+                        "contenido_b64": base64.b64encode(contenido).decode("ascii"),
+                    }
+                    st.success("Adjunto guardado.")
+                    st.rerun()
 
 
 def mes_es(fecha_str) -> str:
@@ -1193,8 +1268,8 @@ def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> N
         else "##### 🧾 Facturas agregadas (compartidas entre los gastos del grupo)"
     )
     if facturas:
-        anchos_facturas = [1.6, 1.6, 1.2, 2.2, 1.1, 0.9, 1.1, 0.5]
-        titulos_facturas = ["Archivo", "UUID", "RFC Emisor", "Concepto", "Fecha", "IVA", "Monto Total", ""]
+        anchos_facturas = [1.5, 1.5, 1.1, 2.0, 1.0, 0.8, 1.0, 0.6, 0.5]
+        titulos_facturas = ["Archivo", "UUID", "RFC Emisor", "Concepto", "Fecha", "IVA", "Monto Total", "PDF/Img", ""]
         enc_facturas = st.columns(anchos_facturas)
         for col, titulo in zip(enc_facturas, titulos_facturas):
             col.caption(f"**{titulo}**" if titulo else "")
@@ -1209,6 +1284,8 @@ def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> N
             cols_f[5].write(money(f.get("IVA", 0)))
             cols_f[6].write(money(f.get("Monto Total", 0)))
             with cols_f[7]:
+                _factura_control_adjunto(f, f"gasto_{clave_grupo}")
+            with cols_f[8]:
                 if st.button("✕", key=f"btn_quitar_factura_{clave_grupo}_{f['_id']}",
                              help="Quitar esta factura de la lista", use_container_width=True):
                     nueva_lista = [fx for fx in facturas if fx["_id"] != f["_id"]]
@@ -2305,10 +2382,21 @@ with tab_comprobados:
                 f"{str(reg.get('Descripción Estado', ''))[:40]} · {money(reg.get('Monto Estado', 0))}{marca_incompleta}"
             ):
                 st.write(f"**Categoría:** {reg.get('Categoria', '') or '—'}  ·  **Material:** {reg.get('Material', '') or '—'}")
-                df_f = pd.DataFrame(facturas)
-                cols_f = [c for c in ["Archivo", "UUID", "RFC Emisor", "Concepto", "IVA", "Monto Total"] if c in df_f.columns]
-                st.dataframe(df_f[cols_f].style.format({"IVA": money, "Monto Total": money}),
-                             use_container_width=True, hide_index=True)
+                anchos_cf = [1.5, 1.5, 1.1, 2.0, 0.8, 1.0, 0.6]
+                titulos_cf = ["Archivo", "UUID", "RFC Emisor", "Concepto", "IVA", "Monto Total", "PDF/Img"]
+                enc_cf = st.columns(anchos_cf)
+                for col, titulo in zip(enc_cf, titulos_cf):
+                    col.caption(f"**{titulo}**")
+                for f in facturas:
+                    fila_cf = st.columns(anchos_cf)
+                    fila_cf[0].write(f.get("Archivo", ""))
+                    fila_cf[1].write(f.get("UUID", ""))
+                    fila_cf[2].write(f.get("RFC Emisor", ""))
+                    fila_cf[3].write(str(f.get("Concepto", ""))[:40])
+                    fila_cf[4].write(money(f.get("IVA", 0)))
+                    fila_cf[5].write(money(f.get("Monto Total", 0)))
+                    with fila_cf[6]:
+                        _factura_control_adjunto(f, f"comp_{reg['idx']}")
                 if propina_reg:
                     st.caption(f"Propina: {money(propina_reg)}")
                 st.caption(f"Suma de facturas{' + propina' if propina_reg else ''}: {money(suma_facturas)}  ·  Diferencia: "
