@@ -100,6 +100,11 @@ def init_state() -> None:
         "mostrar_mapeo_manual": False,
         "confirmar_reset": False,
         "autoguardado_activo": True,
+        # Marca de tiempo del último guardado manual (botón "💾 Guardar progreso" o
+        # "📥 Descargar avance (.json)"), usada sólo para el aviso de "llevas X min
+        # sin guardar" -no se persiste dentro del .json ni del autoguardado, es
+        # información de esta sesión de navegador únicamente-.
+        "ultimo_guardado": None,
         "categorias": None,
         "materiales": None,
         "categorias_solicitud": None,
@@ -617,6 +622,15 @@ def _autoguardar_si_activo() -> None:
             pass  # el autoguardado nunca debe interrumpir el flujo del usuario
 
 
+def _marcar_guardado() -> None:
+    """on_click de cualquier botón de descarga del avance (.json): registra la hora
+    para el aviso de "llevas X min sin guardar" (ver la barra de guardado en el
+    contenido principal). Streamlit llama a on_click antes de servir el archivo al
+    navegador, en el mismo rerun del clic -suficiente para este aviso, que no
+    necesita saber si la descarga terminó, sólo que se pidió-."""
+    st.session_state.ultimo_guardado = datetime.datetime.now()
+
+
 def _limpiar_seleccion_tabla_pendientes() -> None:
     """Limpia la fila seleccionada en la tabla de 'Pendientes'.
 
@@ -810,6 +824,8 @@ with st.sidebar:
             file_name=f"avance_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.json",
             mime="application/json",
             use_container_width=True,
+            key="descargar_avance_sidebar",
+            on_click=_marcar_guardado,
         )
     else:
         st.caption("Sube un estado de cuenta primero para poder guardar avance.")
@@ -968,6 +984,54 @@ if total_monto > 0:
     # plano, mostrando parte del texto en una fuente monoespaciada rara.
     texto_avance = f"Avance por monto: {money(monto_resuelto)} de {money(total_monto)}".replace("$", r"\$")
     st.progress(min(monto_resuelto / total_monto, 1.0), text=texto_avance)
+
+# ============================================================
+# BARRA DE GUARDADO
+# ============================================================
+# Streamlit sólo conserva el avance mientras la sesión del navegador siga viva
+# (se pierde al cerrar la pestaña o si el servidor se reinicia, p.ej. tras
+# inactividad en Streamlit Cloud). La única forma 100% confiable de no
+# perderlo es que la persona misma descargue el .json de vez en cuando -un
+# temporizador que descargara solo, sin un clic nuevo cada vez, choca con que
+# los navegadores bloquean o advierten ante descargas automáticas repetidas-.
+# Por eso esta barra combina un botón siempre visible (no escondido en un
+# expander) con un aviso del tiempo transcurrido desde el último guardado.
+col_aviso_guardado, col_btn_guardado = st.columns([3, 1.3])
+with col_aviso_guardado:
+    if st.session_state.ultimo_guardado is None:
+        st.markdown(
+            "<div class='warn-box'>⏰ Aún no has guardado tu avance en esta sesión.</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        minutos_sin_guardar = int(
+            (datetime.datetime.now() - st.session_state.ultimo_guardado).total_seconds() // 60
+        )
+        if minutos_sin_guardar < 10:
+            texto_transcurrido = "menos de 1 minuto" if minutos_sin_guardar == 0 else f"{minutos_sin_guardar} min"
+            st.markdown(
+                f"<div class='success-box'>✅ Último guardado hace {texto_transcurrido}.</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"<div class='warn-box'>⏰ Llevas {minutos_sin_guardar} min sin guardar tu avance. "
+                "Te recomendamos descargarlo de nuevo.</div>",
+                unsafe_allow_html=True,
+            )
+with col_btn_guardado:
+    st.download_button(
+        "💾 Guardar progreso",
+        data=sesion_a_json_bytes(_state_snapshot()),
+        file_name=f"avance_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.json",
+        mime="application/json",
+        use_container_width=True,
+        type="primary",
+        key="guardar_progreso_principal",
+        on_click=_marcar_guardado,
+        help="Descarga el avance actual como .json -guárdalo en un lugar seguro para poder continuar "
+             "más tarde o compartirlo- y marca la hora de este guardado.",
+    )
 
 st.write("")
 
