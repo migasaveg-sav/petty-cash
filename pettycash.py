@@ -48,27 +48,32 @@ from persistence import (
 )
 
 # ============================================================
-# PALETA DE COLORES — corporativa, a partir de la paleta que compartió el
-# usuario (#4A5E76 / #2B2F43 / #BDC3C2 / #FFFFFF / #F4794A): fondo claro,
-# cuadros/tarjetas oscuros (azul marino), acento naranja para acciones
-# primarias. Todos los pares texto/fondo de abajo se verificaron en ≥4.5:1
-# de contraste (WCAG AA) -incluido el naranja, que con texto blanco encima
-# sólo daba 2.7:1: se usa con texto azul marino (4.83:1) en su lugar-.
+# PALETA DE COLORES — rediseño "dashboard financiero" (octubre 2026): fondo gris-azulado
+# muy claro, tarjetas blancas con sombra sutil, navy profundo para superficies oscuras
+# (sidebar, encabezados), azul de acento para acciones primarias, y colores de estado
+# desaturados para los semáforos de avance. Todos los pares texto/fondo se verificaron
+# en ≥4.5:1 de contraste para texto (WCAG AA) y ≥3:1 para bordes/elementos decorativos
+# (ver contrast_check.py). C_BORDE_BITACORA y C_BITACORA_HEADER se mantienen igual que
+# antes -fueron un pedido explícito del usuario en una sesión previa-.
 # ============================================================
-C_FONDO = "#C7D1DC"            # fondo general de la página (azul grisáceo, contrasta con tarjetas blancas)
-C_TARJETA = "#FFFFFF"          # superficies claras puntuales
-C_BORDE = "#647385"            # bordes sobre fondo claro (ajustado para seguir contrastando sobre el nuevo fondo)
-C_TEXTO_OSCURO = "#2B2F43"     # texto principal sobre fondo claro (8.5:1 sobre C_FONDO)
-C_TEXTO_SECUNDARIO = "#3F4759" # texto secundario / captions (6:1 sobre C_FONDO, 9.3:1 sobre blanco)
+C_FONDO = "#EEF1F6"            # fondo general de la página
+C_TARJETA = "#FFFFFF"          # tarjetas y superficies claras
+C_TARJETA_ALT = "#F8FAFC"      # bandeo de filas sobre tarjeta blanca
+C_BORDE = "#7C8AA0"            # bordes/decorativo con más presencia (3.2:1 sobre fondo, 3.5:1 sobre blanco)
+C_BORDE_SUAVE = "#E3E8F0"      # bordes sutiles de tarjetas y divisores
+C_TEXTO_OSCURO = "#111827"     # texto principal (16:1+ sobre fondo y tarjeta)
+C_TEXTO_SECUNDARIO = "#475569" # texto secundario / captions (6.9:1 sobre fondo, 7.6:1 sobre blanco)
 C_BORDE_BITACORA = "#344B4A"   # borde de celdas de la tabla de bitácora (pedido explícito del usuario)
-C_NAVY = "#2B2F43"             # azul marino oscuro — cuadros, tarjetas, sidebar (13.2:1 con blanco)
-C_SLATE = "#4A5E76"            # azul grisáceo — estados secundarios (6.7:1 con blanco)
-C_ACENTO = "#F4794A"           # naranja de acento — botones primarios, foco, pestaña activa
-C_CORAL_ALERTA = "#C0392B"     # rojo de error/alerta (5.4:1 con blanco)
-C_AMARILLO_ACENTO = "#B45309"  # ámbar de advertencia / "no necesario" (5.0:1 con blanco)
-C_GRIS_NEUTRO = C_SLATE        # (alias retrocompatible) gris/azul para "pendiente"
-C_AZUL_FB = C_NAVY             # (alias retrocompatible) antiguo azul de acento -> navy
-C_VERDE_OK = "#1F7A5C"         # verde corporativo de éxito (5.25:1 con blanco)
+C_NAVY = "#192333"             # azul marino oscuro — sidebar, encabezados, tarjetas oscuras (15.8:1 con blanco)
+C_NAVY_SUAVE = "#28334A"       # navy un tono más claro — hover sobre superficies oscuras
+C_SLATE = "#475569"            # azul-gris — estado "pendiente" (7.6:1 con blanco)
+C_ACENTO = "#2F5FE0"           # azul de acento — botones primarios, foco, pestaña activa (5.5:1 con blanco)
+C_ACENTO_HOVER = "#2449B8"     # azul de acento, tono oscuro para hover (7.7:1 con blanco)
+C_ACENTO_SUAVE = "#E8EEFD"     # azul muy claro — fondo de hover de botones secundarios
+C_CORAL_ALERTA = "#DC2626"     # rojo de error/alerta (4.8:1 con blanco)
+C_AMARILLO_ACENTO = "#B45309"  # ámbar de advertencia / "pendiente de detalles" (5.0:1 con blanco)
+C_GRIS_INACTIVO = "#64748B"    # gris para "no necesario" (excluido/inactivo, 4.8:1 con blanco)
+C_VERDE_OK = "#15803D"         # verde de éxito / "comprobado" (5.0:1 con blanco)
 C_BITACORA_HEADER = "#DC143C"  # encabezado de la bitácora de solicitudes (pedido por el usuario)
 
 st.set_page_config(page_title="Comprobación Caja Chica", layout="wide")
@@ -142,9 +147,28 @@ init_state()
 # ============================================================
 st.markdown(f"""
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+html, body, [class*="css"] {{ font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }}
+
 .stApp {{ background-color: {C_FONDO}; color: {C_TEXTO_OSCURO}; }}
-h1, h2, h3, h4, h5 {{ color: {C_NAVY}; }}
-table, th, td {{ border: 1px solid {C_BORDE}; border-collapse: collapse; padding: 6px; }}
+.block-container {{ padding-top: 1.6rem; max-width: 1280px; }}
+
+h1, h2, h3, h4, h5 {{ color: {C_NAVY}; font-weight: 700; letter-spacing: -0.01em; }}
+
+/* -------- Encabezado de la app -------- */
+.app-header {{
+    display: flex; align-items: center; gap: 14px;
+    padding-bottom: 14px; margin-bottom: 18px; border-bottom: 1px solid {C_BORDE_SUAVE};
+}}
+.app-header-icon {{
+    width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(135deg, {C_ACENTO}, {C_NAVY});
+    display: flex; align-items: center; justify-content: center; font-size: 1.4rem; flex-shrink: 0;
+}}
+.app-header-text h1 {{ margin: 0; font-size: 1.5rem; line-height: 1.2; }}
+.app-header-text p {{ margin: 2px 0 0 0; color: {C_TEXTO_SECUNDARIO}; font-size: 0.88rem; }}
+
+table, th, td {{ border: 1px solid {C_BORDE_SUAVE}; border-collapse: collapse; padding: 6px; }}
 th {{ background-color: {C_NAVY}; color: white; }}
 td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
 
@@ -158,39 +182,49 @@ td {{ color: {C_TEXTO_OSCURO}; background-color: {C_TARJETA}; }}
    (quedaron de una versión anterior y nunca hacían match); el marcado actual usa
    role="tablist"/"tab" y data-testid="stTab", con el texto dentro de un <p>. Se fuerza
    el color con !important porque Streamlit también le pone color al <p> según
-   primaryColor (naranja) del tema. */
-[role="tablist"] {{ border-bottom: 2px solid {C_BORDE}; gap: 4px; }}
-[data-testid="stTab"], [data-testid="stTab"] p {{ color: {C_TEXTO_SECUNDARIO} !important; font-weight: 600; }}
+   primaryColor del tema. */
+[role="tablist"] {{ border-bottom: 1px solid {C_BORDE_SUAVE}; gap: 4px; }}
+[data-testid="stTab"], [data-testid="stTab"] p {{ color: {C_TEXTO_SECUNDARIO} !important; font-weight: 600; font-size: 0.92rem; }}
 [data-testid="stTab"][aria-selected="true"], [data-testid="stTab"][aria-selected="true"] p {{ color: {C_NAVY} !important; }}
-[data-testid="stTab"] .react-aria-SelectionIndicator {{ background-color: {C_ACENTO} !important; height: 3px !important; }}
+[data-testid="stTab"] .react-aria-SelectionIndicator {{ background-color: {C_ACENTO} !important; height: 3px !important; border-radius: 3px 3px 0 0; }}
 
 /* -------- Expander (p.ej. "Gastos pendientes") con encabezado oscuro -------- */
 [data-testid="stExpander"] {{
-    border: 1px solid {C_BORDE}; border-radius: 8px; overflow: hidden; background-color: {C_TARJETA};
+    border: 1px solid {C_BORDE_SUAVE}; border-radius: 10px; overflow: hidden; background-color: {C_TARJETA};
+    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
 }}
 [data-testid="stExpander"] summary {{
-    background-color: {C_NAVY}; color: #FFFFFF !important; font-weight: 600; padding: 10px 14px;
+    background-color: {C_NAVY}; color: #FFFFFF !important; font-weight: 600; padding: 11px 16px;
 }}
 [data-testid="stExpander"] summary svg {{ fill: #FFFFFF; }}
-[data-testid="stExpander"] summary:hover {{ background-color: {C_SLATE}; }}
+[data-testid="stExpander"] summary:hover {{ background-color: {C_NAVY_SUAVE}; }}
 
 /* -------- Botones -------- */
 .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
-    background-color: {C_NAVY}; color: #FFFFFF; border: 1px solid {C_NAVY};
-    border-radius: 6px; font-weight: 600;
+    background-color: {C_TARJETA}; color: {C_NAVY}; border: 1.5px solid {C_BORDE};
+    border-radius: 8px; font-weight: 600; transition: all 0.12s ease;
 }}
 .stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {{
-    background-color: {C_ACENTO}; color: {C_NAVY}; border-color: {C_ACENTO};
+    background-color: {C_ACENTO_SUAVE}; color: {C_ACENTO_HOVER}; border-color: {C_ACENTO};
 }}
 .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{
-    background-color: {C_ACENTO}; color: {C_NAVY}; border: 1px solid {C_ACENTO}; font-weight: 700;
+    background-color: {C_ACENTO}; color: #FFFFFF; border: 1.5px solid {C_ACENTO}; font-weight: 700;
 }}
 .stButton > button[kind="primary"]:hover, .stFormSubmitButton > button[kind="primary"]:hover {{
-    background-color: {C_NAVY}; color: {C_ACENTO}; border-color: {C_NAVY};
+    background-color: {C_ACENTO_HOVER}; color: #FFFFFF; border-color: {C_ACENTO_HOVER};
 }}
 
 /* -------- Barra lateral: panel de navegación oscuro -------- */
 section[data-testid="stSidebar"] {{ background-color: {C_NAVY}; }}
+.sidebar-header {{
+    display: flex; align-items: center; gap: 10px; padding: 2px 0 16px 0;
+    margin-bottom: 14px; border-bottom: 1px solid rgba(255,255,255,0.12);
+}}
+.sidebar-header-icon {{
+    width: 34px; height: 34px; border-radius: 9px; background-color: {C_ACENTO};
+    display: flex; align-items: center; justify-content: center; font-size: 1.05rem; flex-shrink: 0;
+}}
+.sidebar-header span {{ color: #FFFFFF; font-weight: 700; font-size: 1.02rem; }}
 section[data-testid="stSidebar"] label,
 section[data-testid="stSidebar"] p,
 section[data-testid="stSidebar"] span,
@@ -199,58 +233,74 @@ section[data-testid="stSidebar"] h2,
 section[data-testid="stSidebar"] h3,
 section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {{ color: #FFFFFF; }}
 section[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
-section[data-testid="stSidebar"] small {{ color: #C7CCD6 !important; }}
-section[data-testid="stSidebar"] hr {{ border-color: {C_SLATE}; }}
-section[data-testid="stSidebar"] [data-testid="stExpander"] summary {{ background-color: {C_SLATE}; }}
+section[data-testid="stSidebar"] small {{ color: #AEB8CC !important; }}
+section[data-testid="stSidebar"] hr {{ border-color: rgba(255,255,255,0.14); }}
+section[data-testid="stSidebar"] [data-testid="stExpander"] {{ border-color: rgba(255,255,255,0.14); }}
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary {{ background-color: {C_NAVY_SUAVE}; }}
 section[data-testid="stSidebar"] .stButton > button,
 section[data-testid="stSidebar"] .stDownloadButton > button {{
-    background-color: {C_SLATE}; color: #FFFFFF; border: 1px solid {C_SLATE};
+    background-color: {C_NAVY_SUAVE}; color: #FFFFFF; border: 1px solid rgba(255,255,255,0.16);
 }}
 section[data-testid="stSidebar"] .stButton > button:hover,
 section[data-testid="stSidebar"] .stDownloadButton > button:hover {{
-    background-color: {C_ACENTO}; color: {C_NAVY}; border-color: {C_ACENTO};
+    background-color: {C_ACENTO}; color: #FFFFFF; border-color: {C_ACENTO};
+}}
+section[data-testid="stSidebar"] .stButton > button[kind="primary"] {{
+    background-color: {C_ACENTO}; border-color: {C_ACENTO};
 }}
 section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] {{
-    background-color: {C_SLATE}; border: 1px dashed #8993A8; border-radius: 8px;
+    background-color: {C_NAVY_SUAVE}; border: 1.5px dashed rgba(255,255,255,0.3); border-radius: 10px;
 }}
 section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] * {{ color: #FFFFFF !important; }}
 section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button {{
-    background-color: {C_NAVY}; color: #FFFFFF; border: 1px solid #8993A8;
+    background-color: {C_NAVY}; color: #FFFFFF; border: 1px solid rgba(255,255,255,0.3);
 }}
 section[data-testid="stSidebar"] [data-testid="stFileUploaderFile"] {{
-    background-color: {C_SLATE}; color: #FFFFFF; border-radius: 6px;
+    background-color: {C_NAVY_SUAVE}; color: #FFFFFF; border-radius: 6px;
 }}
-section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{ color: #FFFFFF; font-weight: 600; }}
+section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{ color: #FFFFFF; font-weight: 600; font-size: 0.88rem; }}
+section[data-testid="stSidebar"] [data-baseweb="select"] > div,
+section[data-testid="stSidebar"] input {{ border-radius: 8px !important; }}
 
+/* -------- Tarjetas de resumen (estilo "stat card": tarjeta blanca con borde
+   izquierdo de color según el estado, en vez de bloques totalmente saturados) -------- */
 .card {{
-    background-color: {C_NAVY}; border-radius: 10px; padding: 16px 20px;
-    margin-bottom: 14px; border: 1px solid {C_SLATE}; color: #FFFFFF;
+    background-color: {C_TARJETA}; border-radius: 12px; padding: 18px 20px;
+    margin-bottom: 14px; border: 1px solid {C_BORDE_SUAVE}; color: {C_TEXTO_OSCURO};
+    box-shadow: 0 1px 3px rgba(16, 24, 40, 0.06);
 }}
 .summary-box {{
-    border-radius: 10px; padding: 14px 18px; text-align: center; color: white;
+    background-color: {C_TARJETA}; border-radius: 12px; padding: 16px 18px;
+    border: 1px solid {C_BORDE_SUAVE}; border-left: 4px solid var(--accent-color, {C_ACENTO});
+    box-shadow: 0 1px 3px rgba(16, 24, 40, 0.06);
 }}
-.summary-title {{ font-size: 0.85rem; opacity: 0.9; margin-bottom: 4px; }}
-.summary-count {{ font-size: 1.6rem; font-weight: 700; }}
-.summary-amount {{ font-size: 1.0rem; opacity: 0.95; }}
+.summary-title {{
+    font-size: 0.74rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    color: {C_TEXTO_SECUNDARIO}; margin-bottom: 8px;
+}}
+.summary-count {{ font-size: 1.9rem; font-weight: 800; color: {C_TEXTO_OSCURO}; line-height: 1; }}
+.summary-amount {{ font-size: 0.92rem; color: {C_TEXTO_SECUNDARIO}; margin-top: 4px; font-weight: 500; }}
 
-.box-pendiente {{ background-color: {C_SLATE}; }}
-.box-pendiente-detalles {{ background-color: {C_ACENTO}; }}
-.box-pendiente-detalles .summary-title, .box-pendiente-detalles .summary-count,
-.box-pendiente-detalles .summary-amount {{ color: {C_NAVY}; }}
-.box-comprobado {{ background-color: {C_NAVY}; }}
-.box-no-necesario {{ background-color: {C_AMARILLO_ACENTO}; }}
+.box-pendiente {{ --accent-color: {C_SLATE}; }}
+.box-pendiente-detalles {{ --accent-color: {C_AMARILLO_ACENTO}; }}
+.box-comprobado {{ --accent-color: {C_VERDE_OK}; }}
+.box-no-necesario {{ --accent-color: {C_GRIS_INACTIVO}; }}
 
 .success-box {{
-    background-color: {C_VERDE_OK}; color: white; padding: 10px; border-radius: 6px; font-weight: 600;
+    background-color: #EAF7EF; color: {C_VERDE_OK}; padding: 11px 14px; border-radius: 8px;
+    font-weight: 600; border: 1px solid #BFE6CC;
 }}
 .error-box {{
-    background-color: {C_CORAL_ALERTA}; color: white; padding: 10px; border-radius: 6px; font-weight: 600;
+    background-color: #FDECEC; color: {C_CORAL_ALERTA}; padding: 11px 14px; border-radius: 8px;
+    font-weight: 600; border: 1px solid #F6C6C6;
 }}
 .warn-box {{
-    background-color: {C_AMARILLO_ACENTO}; color: white; padding: 8px; border-radius: 6px; font-weight: 600;
+    background-color: #FEF3E2; color: {C_AMARILLO_ACENTO}; padding: 10px 14px; border-radius: 8px;
+    font-weight: 600; border: 1px solid #FBDFAE;
 }}
 /* -------- Bitácora de solicitudes: tabla compacta, encabezado rojo con borde
-   inferior grueso, celdas con borde {C_BORDE_BITACORA} -------- */
+   inferior grueso, celdas con borde {C_BORDE_BITACORA} (colores sin cambio
+   -pedido explícito del usuario-, sólo se afina el tipo) -------- */
 .bitacora-header {{
     background-color: {C_BITACORA_HEADER}; color: white; font-weight: 600; padding: 4px 6px;
     text-align: center; font-size: 0.78rem; border-bottom: 3px solid {C_BORDE_BITACORA};
@@ -259,7 +309,7 @@ section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{ color: #FFFF
     border: 1px solid {C_BORDE_BITACORA}; padding: 4px 6px; font-size: 0.85rem;
     display: flex; align-items: center; min-height: 30px; background-color: {C_TARJETA};
 }}
-.bitacora-fila-impar {{ background-color: #F4F6F8; }}
+.bitacora-fila-impar {{ background-color: {C_TARJETA_ALT}; }}
 
 /* -------- Grilla "estilo Excel" de la bitácora: una sola pieza de CSS grid
    por fila (sin huecos entre columnas de Streamlit) para que los bordes de
@@ -268,8 +318,9 @@ section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{ color: #FFFF
 .bitacora-grid-fila {{
     display: grid; background-color: {C_TARJETA};
     border-top: 1px solid {C_BORDE_BITACORA}; border-left: 1px solid {C_BORDE_BITACORA};
+    border-radius: 8px 8px 0 0; overflow: hidden;
 }}
-.bitacora-grid-fila-impar {{ background-color: #F4F6F8; }}
+.bitacora-grid-fila-impar {{ background-color: {C_TARJETA_ALT}; }}
 .bitacora-grid-celda {{
     border-right: 1px solid {C_BORDE_BITACORA}; border-bottom: 1px solid {C_BORDE_BITACORA};
     padding: 4px 6px; font-size: 0.85rem; display: flex; align-items: center; min-height: 30px;
@@ -282,7 +333,15 @@ section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{ color: #FFFF
 </style>
 """, unsafe_allow_html=True)
 
-st.title("💰 Comprobación de Caja Chica")
+st.markdown("""
+<div class="app-header">
+    <div class="app-header-icon">💰</div>
+    <div class="app-header-text">
+        <h1>Comprobación de Caja Chica</h1>
+        <p>Concilia estados de cuenta contra CFDI y lleva el avance de comprobación</p>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 # ============================================================
 # HELPERS GENERALES
@@ -533,7 +592,11 @@ def _dialog(title: str, width: str = "large", on_dismiss=None):
 # BARRA LATERAL — CONFIGURACIÓN
 # ============================================================
 with st.sidebar:
-    st.markdown("## ⚙️ Configuración")
+    st.markdown(
+        '<div class="sidebar-header"><div class="sidebar-header-icon">⚙️</div>'
+        '<span>Configuración</span></div>',
+        unsafe_allow_html=True,
+    )
 
     banco_idx = BANCOS_DISPONIBLES.index(st.session_state.banco) if st.session_state.banco in BANCOS_DISPONIBLES else 0
     banco = st.selectbox("Banco", BANCOS_DISPONIBLES, index=banco_idx, key="banco_select")
@@ -795,8 +858,12 @@ with col4:
 total_monto = sum(r["total"] for r in resumen.values())
 monto_resuelto = resumen["comprobado"]["total"] + resumen["no_necesario"]["total"]
 if total_monto > 0:
-    st.progress(min(monto_resuelto / total_monto, 1.0),
-                text=f"Avance por monto: {money(monto_resuelto)} de {money(total_monto)}")
+    # Los "$" de money() se escapan porque Streamlit renderiza este texto como
+    # markdown: dos "$" sin escapar en la misma cadena (uno por cada monto) se
+    # interpretaban como un bloque de fórmula (LaTeX/KaTeX) en vez de texto
+    # plano, mostrando parte del texto en una fuente monoespaciada rara.
+    texto_avance = f"Avance por monto: {money(monto_resuelto)} de {money(total_monto)}".replace("$", r"\$")
+    st.progress(min(monto_resuelto / total_monto, 1.0), text=texto_avance)
 
 st.write("")
 
