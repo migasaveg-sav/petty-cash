@@ -615,7 +615,10 @@ def _fusionar_catalogos(otros: dict) -> None:
 
 
 def _autoguardar_si_activo() -> None:
-    if st.session_state.autoguardado_activo and st.session_state.bank_df is not None:
+    # Se autoguarda si hay estado de cuenta O al menos una solicitud en la bitácora (la
+    # bitácora se puede capturar antes de tener el estado de cuenta).
+    hay_algo_que_guardar = st.session_state.bank_df is not None or bool(st.session_state.solicitudes)
+    if st.session_state.autoguardado_activo and hay_algo_que_guardar:
         try:
             autoguardar(_state_snapshot(), db_path=AUTOSAVE_DB)
         except Exception:
@@ -817,7 +820,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### 💾 Guardar / continuar avance")
-    if st.session_state.bank_df is not None:
+    if st.session_state.bank_df is not None or st.session_state.solicitudes:
         st.download_button(
             "📥 Descargar avance (.json)",
             data=sesion_a_json_bytes(_state_snapshot()),
@@ -828,14 +831,33 @@ with st.sidebar:
             on_click=_marcar_guardado,
         )
     else:
-        st.caption("Sube un estado de cuenta primero para poder guardar avance.")
+        st.caption("Sube un estado de cuenta o registra una solicitud en la bitácora para poder guardar avance.")
 
     json_file = st.file_uploader("Subir avance (.json)", type=["json"], key="json_uploader")
     if json_file is not None and st.button("Cargar este avance", use_container_width=True):
         try:
             data = json.loads(json_file.getvalue().decode("utf-8"))
             restaurado = cargar_sesion_dict(data)
-            if st.session_state.bank_df is not None and restaurado.get("bank_df") is not None:
+            if st.session_state.bank_df is not None and restaurado.get("bank_df") is None:
+                # Avance guardado SIN estado de cuenta (sólo bitácora/catálogos): no se puede
+                # restaurar "completo" porque borraría el estado de cuenta ya cargado; se
+                # agregan sus solicitudes a las actuales y se conserva todo lo demás.
+                st.session_state.solicitud_counter = max(
+                    st.session_state.solicitud_counter, restaurado.get("solicitud_counter", 0) or 0
+                )
+                ids_actuales = {x["id"] for x in st.session_state.solicitudes}
+                nuevas = []
+                for sol in restaurado.get("solicitudes") or []:
+                    if sol["id"] in ids_actuales:
+                        sol = {**sol, "id": next_solicitud_id()}
+                        sol["No"] = sol["id"]
+                    nuevas.append(sol)
+                    ids_actuales.add(sol["id"])
+                st.session_state.solicitudes.extend(nuevas)
+                _fusionar_catalogos(restaurado)
+                _completar_catalogos_faltantes()
+                st.success(f"Se agregaron {len(nuevas)} solicitud(es) de la bitácora del avance.")
+            elif st.session_state.bank_df is not None and restaurado.get("bank_df") is not None:
                 # Ya hay un estado de cuenta cargado en esta sesión -probablemente
                 # más reciente que el que traía este avance-: en vez de reemplazarlo
                 # por el viejo que trae el .json (perdiendo cualquier movimiento que
@@ -903,7 +925,7 @@ with st.sidebar:
     autosave_info = hay_autoguardado(AUTOSAVE_DB)
     if autosave_info:
         st.caption(f"Último autoguardado: {autosave_info['guardado_en']}")
-        if st.session_state.bank_df is None and st.button("♻️ Restaurar último autoguardado", use_container_width=True):
+        if st.session_state.bank_df is None and not st.session_state.solicitudes and st.button("♻️ Restaurar último autoguardado", use_container_width=True):
             restaurado = restaurar_autoguardado(AUTOSAVE_DB)
             if restaurado:
                 _restaurar_estado(restaurado)
@@ -937,111 +959,8 @@ with st.sidebar:
             st.rerun()
 
 # ============================================================
-# CONTENIDO PRINCIPAL
-# ============================================================
-df = st.session_state.bank_df
-if df is None:
-    st.info("👈 Sube un estado de cuenta desde el panel de la izquierda para comenzar.")
-    st.stop()
-
-resumen = resumen_estados(df, st.session_state.estados)
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.markdown(f"""
-    <div class="summary-box box-pendiente">
-        <div class="summary-title">⏳ SIN COMPROBAR</div>
-        <div class="summary-count">{resumen['pendiente']['count']}</div>
-        <div class="summary-amount">{money(resumen['pendiente']['total'])}</div>
-    </div>""", unsafe_allow_html=True)
-with col2:
-    st.markdown(f"""
-    <div class="summary-box box-pendiente-detalles">
-        <div class="summary-title">🧾 PENDIENTE DE DETALLES</div>
-        <div class="summary-count">{resumen['pendiente_detalles']['count']}</div>
-        <div class="summary-amount">{money(resumen['pendiente_detalles']['total'])}</div>
-    </div>""", unsafe_allow_html=True)
-with col3:
-    st.markdown(f"""
-    <div class="summary-box box-comprobado">
-        <div class="summary-title">✅ COMPROBADOS</div>
-        <div class="summary-count">{resumen['comprobado']['count']}</div>
-        <div class="summary-amount">{money(resumen['comprobado']['total'])}</div>
-    </div>""", unsafe_allow_html=True)
-with col4:
-    st.markdown(f"""
-    <div class="summary-box box-no-necesario">
-        <div class="summary-title">🚫 NO NECESARIOS</div>
-        <div class="summary-count">{resumen['no_necesario']['count']}</div>
-        <div class="summary-amount">{money(resumen['no_necesario']['total'])}</div>
-    </div>""", unsafe_allow_html=True)
-
-total_monto = sum(r["total"] for r in resumen.values())
-monto_resuelto = resumen["comprobado"]["total"] + resumen["no_necesario"]["total"]
-if total_monto > 0:
-    # Los "$" de money() se escapan porque Streamlit renderiza este texto como
-    # markdown: dos "$" sin escapar en la misma cadena (uno por cada monto) se
-    # interpretaban como un bloque de fórmula (LaTeX/KaTeX) en vez de texto
-    # plano, mostrando parte del texto en una fuente monoespaciada rara.
-    texto_avance = f"Avance por monto: {money(monto_resuelto)} de {money(total_monto)}".replace("$", r"\$")
-    st.progress(min(monto_resuelto / total_monto, 1.0), text=texto_avance)
-
-# ============================================================
-# BARRA DE GUARDADO
-# ============================================================
-# Streamlit sólo conserva el avance mientras la sesión del navegador siga viva
-# (se pierde al cerrar la pestaña o si el servidor se reinicia, p.ej. tras
-# inactividad en Streamlit Cloud). La única forma 100% confiable de no
-# perderlo es que la persona misma descargue el .json de vez en cuando -un
-# temporizador que descargara solo, sin un clic nuevo cada vez, choca con que
-# los navegadores bloquean o advierten ante descargas automáticas repetidas-.
-# Por eso esta barra combina un botón siempre visible (no escondido en un
-# expander) con un aviso del tiempo transcurrido desde el último guardado.
-col_aviso_guardado, col_btn_guardado = st.columns([3, 1.3])
-with col_aviso_guardado:
-    if st.session_state.ultimo_guardado is None:
-        st.markdown(
-            "<div class='warn-box'>⏰ Aún no has guardado tu avance en esta sesión.</div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        minutos_sin_guardar = int(
-            (datetime.datetime.now() - st.session_state.ultimo_guardado).total_seconds() // 60
-        )
-        if minutos_sin_guardar < 10:
-            texto_transcurrido = "menos de 1 minuto" if minutos_sin_guardar == 0 else f"{minutos_sin_guardar} min"
-            st.markdown(
-                f"<div class='success-box'>✅ Último guardado hace {texto_transcurrido}.</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f"<div class='warn-box'>⏰ Llevas {minutos_sin_guardar} min sin guardar tu avance. "
-                "Te recomendamos descargarlo de nuevo.</div>",
-                unsafe_allow_html=True,
-            )
-with col_btn_guardado:
-    st.download_button(
-        "💾 Guardar progreso",
-        data=sesion_a_json_bytes(_state_snapshot()),
-        file_name=f"avance_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.json",
-        mime="application/json",
-        use_container_width=True,
-        type="primary",
-        key="guardar_progreso_principal",
-        on_click=_marcar_guardado,
-        help="Descarga el avance actual como .json -guárdalo en un lugar seguro para poder continuar "
-             "más tarde o compartirlo- y marca la hora de este guardado.",
-    )
-
-st.write("")
-
-tab_pendientes, tab_detalles, tab_comprobados, tab_no_necesarios, tab_resumen = st.tabs(
-    ["⏳ Pendientes", "🧾 Pendiente de detalles", "✅ Comprobados", "🚫 No necesarios", "📊 Resumen y descarga"]
-)
-
-
-# ============================================================
-# DIÁLOGO: TRABAJAR UN GASTO
+# BITÁCORA DE SOLICITUDES (definida antes del contenido principal para poder
+# mostrarse SIEMPRE, haya o no un estado de cuenta cargado)
 # ============================================================
 def _solicitud_por_id(solicitud_id):
     if solicitud_id is None:
@@ -1105,6 +1024,473 @@ def _eliminar_solicitud(solicitud_id: int) -> None:
     _autoguardar_si_activo()
 
 
+def _en_orden_de_estado_de_cuenta(registros: list[dict]) -> list[dict]:
+    """Ordena registros (comprobados, no necesarios) según la posición del movimiento
+    en el estado de cuenta (`idx`, la fila del archivo del banco), para que el Excel
+    siga el mismo orden en que se realizaron los gastos y no el orden en que se fueron
+    comprobando. `sorted` es estable: si varios registros comparten `idx` conservan su
+    orden relativo, y los que no traen `idx` se van al final."""
+    return sorted(registros, key=lambda r: (r.get("idx") is None, r.get("idx") if r.get("idx") is not None else 0))
+
+
+# ============================================================
+# BITÁCORA DE SOLICITUDES DE REEMBOLSO
+# ============================================================
+def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -> bytes:
+    """Arma el Excel de la bitácora con el mismo formato/orden que la hoja "Details"
+    de la plantilla que compartió el usuario: columnas A-I son los datos de la
+    solicitud (No., Applicant, Category, Description, Linked Request No., Number of
+    Days, Total Number of People, Employee Name y Material -en el lugar donde la
+    plantilla trae "Client Name", que aquí no se captura-); columnas J-N son la
+    comprobación ya hecha con el estado de cuenta/XML (Payment Date, Expense Outflow
+    Amt, No., CFDI Folio, Reimbursement Cap); se agrega una columna "Status" extra al
+    final para saber de un vistazo qué sigue pendiente."""
+    from io import BytesIO
+
+    def _registros_vinculados(sol: dict) -> list[dict]:
+        """Gastos vinculados a esta solicitud -normalmente uno solo, o varios
+        cuando se comprobaron juntos compartiendo 1 sola factura- con su lista de
+        facturas cada uno. Incluye también un gasto en "pendiente_detalles": ya
+        tiene factura emparejada aunque todavía falten los datos administrativos."""
+        if sol.get("estado") not in ("comprobado", "pendiente_detalles"):
+            return []
+        registros = []
+        for i in _idx_vinculado_lista(sol):
+            registro = next((c for c in concatenados if c["idx"] == i), None)
+            if registro is not None:
+                registros.append(registro)
+        return registros
+
+    def _comprobacion_de(sol: dict, registro: dict, factura: dict | None, primera_registro: bool) -> dict:
+        """Una FACTURA por fila (antes: todos los UUID de un gasto concatenados en una
+        sola celda «CFDI Folio» con '; '.join). Payment Date/Expense Outflow Amt/el
+        No. del banco sólo van en la primera fila DE CADA GASTO del grupo (igual
+        que en la hoja «Comprobados»; si la solicitud se vinculó a varios gastos,
+        cada uno tiene su propia primera fila), CFDI Folio y Reimbursement Cap son
+        siempre por factura."""
+        if factura is None:
+            return {}
+        return {
+            "Payment Date": (registro.get("Fecha Estado", "")) if primera_registro else None,
+            "Expense Outflow Amt": (
+                round(abs(float(registro.get("Monto Estado", 0) or 0)), 2)
+            ) if primera_registro else None,
+            "Bank No": sol["No"] if primera_registro else None,
+            "CFDI Folio": factura.get("UUID", ""),
+            "Reimbursement Cap": round(factura.get("Monto Total", 0) or 0, 2),
+        }
+
+    def _fila_admin(sol: dict, mostrar: bool) -> dict:
+        """Columnas A-I (datos de la solicitud): sólo se muestran en la primera
+        fila de la solicitud completa -si se vinculó a varios gastos, las demás
+        filas (de ese mismo gasto o de los siguientes) las dejan en blanco, igual
+        que ya pasaba entre facturas de un mismo gasto-."""
+        if not mostrar:
+            return {
+                "No": None, "Applicant": "", "Category": "", "Description": "",
+                "Linked Request No": "", "Number of Days": None,
+                "Total Number of People": None, "Employee Name": "", "Material": "",
+                "Status": "",
+            }
+        return {
+            "No": sol.get("No"),
+            "Applicant": sol.get("Applicant") or "",
+            "Category": sol.get("Category") or "",
+            "Description": sol.get("Description") or "",
+            "Linked Request No": sol.get("Request Number") or "",
+            "Number of Days": sol.get("Number of Days", 0),
+            "Total Number of People": sol.get("Number of People", 0),
+            "Employee Name": sol.get("Employee Name") or "",
+            "Material": sol.get("Material") or "",
+            "Status": ({
+                "comprobado": "Comprobado",
+                "pendiente_detalles": "Pendiente detalles",
+            }.get(sol.get("estado"), "Pendiente")),
+        }
+
+    columnas_df = [
+        "No", "Applicant", "Category", "Description", "Linked Request No",
+        "Number of Days", "Total Number of People", "Employee Name", "Material",
+        "Payment Date", "Expense Outflow Amt", "Bank No", "CFDI Folio",
+        "Reimbursement Cap", "Status",
+    ]
+    encabezados = [
+        "No.", "Applicant", "Category", "Description", "Linked Request No.",
+        "Number of Days", "Total Number of People", "Employee Name", "Material",
+        "Payment Date", "Expense Outflow Amt", "No.", "CFDI Folio",
+        "Reimbursement Cap (With IVA)", "Status",
+    ]
+
+    filas = []
+    for sol in solicitudes:
+        registros = _registros_vinculados(sol)
+        if not registros:
+            filas.append(_fila_admin(sol, True))
+            continue
+        primera_de_sol = True
+        for registro in registros:
+            facturas_registro = registro.get("Facturas", []) or []
+            for j, factura in enumerate([*facturas_registro] or [None]):
+                primera_registro = j == 0
+                fila = _fila_admin(sol, primera_de_sol)
+                fila.update(_comprobacion_de(sol, registro, factura, primera_registro))
+                filas.append(fila)
+                primera_de_sol = False
+
+    df = pd.DataFrame(filas, columns=columnas_df) if filas else pd.DataFrame(columns=columnas_df)
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Details")
+        workbook = writer.book
+        ws = writer.sheets["Details"]
+
+        header_fmt = workbook.add_format({
+            "bold": True, "bg_color": C_BITACORA_HEADER, "font_color": "white",
+            "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True,
+        })
+        for col_idx, titulo in enumerate(encabezados):
+            ws.write(0, col_idx, titulo, header_fmt)
+
+        money_fmt = workbook.add_format({"num_format": "$#,##0.00"})
+        for nombre in ("Expense Outflow Amt", "Reimbursement Cap"):
+            col_idx = columnas_df.index(nombre)
+            ws.set_column(col_idx, col_idx, 20, money_fmt)
+
+        anchos = {
+            "No": 6, "Applicant": 14, "Category": 24, "Description": 26,
+            "Linked Request No": 24, "Number of Days": 12, "Total Number of People": 14,
+            "Employee Name": 24, "Material": 16, "Payment Date": 14, "Bank No": 8,
+            "CFDI Folio": 38, "Status": 12,
+        }
+        for nombre, ancho in anchos.items():
+            ws.set_column(columnas_df.index(nombre), columnas_df.index(nombre), ancho)
+
+        # -------- Hojas extra: "No necesarios" y "Por comprobar" --------
+        # Con los gastos emparejados automáticamente ya representados en "Details"
+        # (como "Pendiente detalles"), este Excel de la bitácora cubre prácticamente
+        # lo mismo que el de "Resumen y descargas"; se agregan estas dos hojas para
+        # que sea igual de completo sin tener que descargar los dos por separado.
+        no_necesarios = _en_orden_de_estado_de_cuenta(st.session_state.get("no_necesarios", []))
+        cols_nn = ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
+        df_nn_todo = pd.DataFrame(no_necesarios)
+        cols_nn_presentes = [c for c in cols_nn if c in df_nn_todo.columns]
+        if cols_nn_presentes:
+            df_nn_todo[cols_nn_presentes].to_excel(writer, index=False, sheet_name="No necesarios")
+        else:
+            pd.DataFrame(columns=cols_nn).to_excel(writer, index=False, sheet_name="No necesarios")
+
+        bank_df = st.session_state.get("bank_df")
+        estados = st.session_state.get("estados", {})
+        cols_pend = ["Fecha", "Descripción", "Monto", "Saldo"]
+        if bank_df is not None:
+            df_pend_todo = bank_df[bank_df.index.map(lambda i: estados.get(i) == "pendiente")]
+            cols_pend_presentes = [c for c in cols_pend if c in df_pend_todo.columns]
+        else:
+            df_pend_todo = pd.DataFrame(columns=cols_pend)
+            cols_pend_presentes = cols_pend
+        (df_pend_todo[cols_pend_presentes] if cols_pend_presentes else df_pend_todo).to_excel(
+            writer, index=False, sheet_name="Por comprobar"
+        )
+
+    return output.getvalue()
+
+
+# Anchos/títulos de la parte "de datos" de la bitácora (todo lo que NO es un
+# botón de acción) — se dibuja como una sola grilla CSS continua (sin huecos
+# entre columnas) para que luzca como una hoja de cálculo real; las dos
+# últimas columnas (estado/comprobar y eliminar) siguen siendo widgets nativos
+# de Streamlit y se colocan aparte, en su propio st.columns.
+_ANCHOS_BITACORA_DATOS = [0.6, 1.4, 1.7, 2.0, 1.4, 0.7, 0.8, 1.6, 1.2]
+_ANCHO_BITACORA_ESTADO = 1.8
+_ANCHO_BITACORA_BORRAR = 0.5
+_TITULOS_BITACORA_DATOS = [
+    "No.", "Applicant", "Category", "Description", "Request #",
+    "Días", "Personas", "Employee", "Material",
+]
+
+
+def _bitacora_grid_fila(valores, es_encabezado: bool, impar: bool = False) -> str:
+    """Arma una fila de la bitácora como una grilla CSS de una sola pieza
+    (mismas proporciones que _ANCHOS_BITACORA_DATOS), para que los bordes de
+    celda queden continuos de extremo a extremo, como en Excel."""
+    plantilla = " ".join(f"{a}fr" for a in _ANCHOS_BITACORA_DATOS)
+    clase_celda = "bitacora-grid-celda-header" if es_encabezado else "bitacora-grid-celda"
+    celdas = "".join(f"<div class='{clase_celda}'>{v}</div>" for v in valores)
+    clase_fila = "bitacora-grid-fila"
+    if impar and not es_encabezado:
+        clase_fila += " bitacora-grid-fila-impar"
+    return f"<div class='{clase_fila}' style='grid-template-columns: {plantilla};'>{celdas}</div>"
+
+
+def _mostrar_seccion_solicitudes() -> None:
+    num_solicitudes = len(st.session_state.solicitudes)
+    with st.expander(f"🧾 Bitácora de solicitudes ({num_solicitudes})", expanded=True):
+        st.markdown("### 📝 Nueva solicitud de reembolso")
+        st.caption(
+            "Registra aquí cada gasto conforme se va realizando, antes de tener el estado de cuenta "
+            "o la factura. Queda guardado en la bitácora de abajo; cuando el movimiento ya aparezca "
+            "en el estado de cuenta, usa su botón «🔗 Comprobar gasto» para vincularlo y adjuntar la "
+            "factura, igual que con cualquier otro gasto pendiente."
+        )
+        v = st.session_state.solicitud_form_version
+        with st.container(border=True):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                applicant = _selector_catalogo("Applicant", "aplicantes", "", f"sol_applicant_{v}")
+            with c2:
+                category = _selector_catalogo("Category", "categorias_solicitud", "", f"sol_category_{v}")
+            with c3:
+                employee = _selector_catalogo("Employee name", "empleados", "", f"sol_employee_{v}")
+
+            c4, c5, c6 = st.columns(3)
+            with c4:
+                material = _selector_catalogo("Material", "materiales", "", f"sol_material_{v}")
+            with c5:
+                description = st.text_input("Description", key=f"sol_description_{v}")
+            with c6:
+                request_number = st.text_input("Request number", key=f"sol_request_{v}")
+
+            c7, c8, _c9 = st.columns(3)
+            with c7:
+                number_of_days = st.number_input("Number of days", min_value=0, step=1, key=f"sol_days_{v}")
+            with c8:
+                number_of_people = st.number_input("Number of people", min_value=0, step=1, key=f"sol_people_{v}")
+
+            if st.button("➕ Agregar a la bitácora", key=f"sol_btn_guardar_{v}", type="primary"):
+                if not applicant.strip():
+                    st.error("«Applicant» es obligatorio.")
+                else:
+                    nuevo_no = next_solicitud_id()
+                    st.session_state.solicitudes.append({
+                        "id": nuevo_no,
+                        "No": nuevo_no,
+                        "Applicant": applicant.strip(),
+                        "Category": category,
+                        "Description": description.strip(),
+                        "Material": material,
+                        "Employee Name": employee,
+                        "Request Number": request_number.strip(),
+                        "Number of Days": int(number_of_days),
+                        "Number of People": int(number_of_people),
+                        "estado": "pendiente",
+                        "idx_vinculado": None,
+                    })
+                    _limpiar_formulario_solicitud()
+                    _autoguardar_si_activo()
+                    st.success(f"Solicitud #{nuevo_no} agregada a la bitácora.")
+                    st.rerun()
+
+        if not st.session_state.solicitudes:
+            st.caption("Todavía no hay solicitudes registradas en la bitácora.")
+        else:
+            st.markdown("##### 🧾 Bitácora de solicitudes")
+            st.caption("Mismo orden de columnas que la hoja «Details» de la plantilla (Material ocupa el "
+                       "lugar de «Client Name», que aquí no se captura).")
+
+            if st.session_state.solicitud_en_proceso is not None:
+                sol_activa = _solicitud_por_id(st.session_state.solicitud_en_proceso)
+                if sol_activa is not None:
+                    st.markdown(
+                        f"<div class='warn-box'>🔗 Vinculando la solicitud #{sol_activa['No']} "
+                        f"({sol_activa['Applicant']} · {sol_activa['Category']}): selecciona uno o más gastos "
+                        f"(si son varios, van a compartir la misma factura) en la tabla de «Gastos pendientes» "
+                        f"de abajo y pulsa «Abrir».</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("Cancelar vinculación", key="btn_cancelar_vinculacion"):
+                        st.session_state.solicitud_en_proceso = None
+                        st.rerun()
+                else:
+                    st.session_state.solicitud_en_proceso = None
+
+            col_grid_enc, col_estado_enc, col_borrar_enc = st.columns(
+                [sum(_ANCHOS_BITACORA_DATOS), _ANCHO_BITACORA_ESTADO, _ANCHO_BITACORA_BORRAR]
+            )
+            with col_grid_enc:
+                st.markdown(
+                    _bitacora_grid_fila(_TITULOS_BITACORA_DATOS, es_encabezado=True),
+                    unsafe_allow_html=True,
+                )
+            for col_suelta in (col_estado_enc, col_borrar_enc):
+                with col_suelta:
+                    st.markdown("<div class='bitacora-header'>&nbsp;</div>", unsafe_allow_html=True)
+
+            def _celda(valor) -> str:
+                return f"<div class='bitacora-fila'>{valor}</div>"
+
+            for fila_n, sol in enumerate(st.session_state.solicitudes):
+                valores = [
+                    f"#{sol['No']}", sol["Applicant"] or "—", sol["Category"] or "—",
+                    sol.get("Description") or "—", sol["Request Number"] or "—",
+                    sol["Number of Days"], sol["Number of People"],
+                    sol["Employee Name"] or "—", sol["Material"] or "—",
+                ]
+                col_grid, col_estado, col_borrar = st.columns(
+                    [sum(_ANCHOS_BITACORA_DATOS), _ANCHO_BITACORA_ESTADO, _ANCHO_BITACORA_BORRAR]
+                )
+                with col_grid:
+                    st.markdown(
+                        _bitacora_grid_fila(valores, es_encabezado=False, impar=(fila_n % 2 == 1)),
+                        unsafe_allow_html=True,
+                    )
+                with col_estado:
+                    idxs_vinc_txt = ", ".join(f"#{i}" for i in _idx_vinculado_lista(sol))
+                    if sol["estado"] == "comprobado":
+                        st.markdown(_celda(f"✅ {idxs_vinc_txt}"), unsafe_allow_html=True)
+                    elif sol["estado"] == "pendiente_detalles":
+                        # La creó (o la retomó) el emparejamiento automático: ya está
+                        # vinculada a un gasto, sólo falta completar sus datos en la
+                        # pestaña "🧾 Pendiente de detalles" (no tiene sentido volver a
+                        # ofrecer "Comprobar" porque el vínculo ya existe).
+                        st.markdown(_celda(f"🧾 {idxs_vinc_txt} (faltan datos)"), unsafe_allow_html=True)
+                    else:
+                        ya_vinculando_otra = st.session_state.solicitud_en_proceso not in (None, sol["id"])
+                        # Comprobar un gasto necesita el estado de cuenta (se vincula a uno de
+                        # sus movimientos): sin él, el botón se ve pero no se puede usar.
+                        sin_estado_de_cuenta = st.session_state.bank_df is None
+                        if st.button("🔗 Comprobar", key=f"btn_comprobar_sol_{sol['id']}",
+                                     disabled=ya_vinculando_otra or sin_estado_de_cuenta,
+                                     help="Sube un estado de cuenta para poder vincular este gasto."
+                                     if sin_estado_de_cuenta else None,
+                                     use_container_width=True):
+                            st.session_state.solicitud_en_proceso = sol["id"]
+                            st.rerun()
+                with col_borrar:
+                    if st.button("✕", key=f"btn_eliminar_sol_{sol['id']}", help="Eliminar este registro de la bitácora",
+                                 use_container_width=True):
+                        _eliminar_solicitud(sol["id"])
+                        st.rerun()
+
+            st.caption(
+                "El .xlsx incluye la hoja «Details» (con todos los gastos, incluidos los que ya "
+                "tienen factura emparejada automáticamente pero siguen esperando estos datos) más "
+                "«No necesarios» y «Por comprobar»."
+            )
+            st.download_button(
+                "📥 Descargar bitácora (formato Details, .xlsx)",
+                data=_bitacora_a_excel_bytes(st.session_state.solicitudes, st.session_state.concatenados),
+                file_name=f"bitacora_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="btn_descargar_solicitudes",
+            )
+    st.divider()
+
+
+def _mostrar_barra_guardado() -> None:
+    """Barra "💾 Guardar progreso" + aviso de tiempo sin guardar (ver comentario abajo)."""
+    # Streamlit sólo conserva el avance mientras la sesión del navegador siga viva
+    # (se pierde al cerrar la pestaña o si el servidor se reinicia, p.ej. tras
+    # inactividad en Streamlit Cloud). La única forma 100% confiable de no
+    # perderlo es que la persona misma descargue el .json de vez en cuando -un
+    # temporizador que descargara solo, sin un clic nuevo cada vez, choca con que
+    # los navegadores bloquean o advierten ante descargas automáticas repetidas-.
+    # Por eso esta barra combina un botón siempre visible (no escondido en un
+    # expander) con un aviso del tiempo transcurrido desde el último guardado.
+    col_aviso_guardado, col_btn_guardado = st.columns([3, 1.3])
+    with col_aviso_guardado:
+        if st.session_state.ultimo_guardado is None:
+            st.markdown(
+                "<div class='warn-box'>⏰ Aún no has guardado tu avance en esta sesión.</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            minutos_sin_guardar = int(
+                (datetime.datetime.now() - st.session_state.ultimo_guardado).total_seconds() // 60
+            )
+            if minutos_sin_guardar < 10:
+                texto_transcurrido = "menos de 1 minuto" if minutos_sin_guardar == 0 else f"{minutos_sin_guardar} min"
+                st.markdown(
+                    f"<div class='success-box'>✅ Último guardado hace {texto_transcurrido}.</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f"<div class='warn-box'>⏰ Llevas {minutos_sin_guardar} min sin guardar tu avance. "
+                    "Te recomendamos descargarlo de nuevo.</div>",
+                    unsafe_allow_html=True,
+                )
+    with col_btn_guardado:
+        st.download_button(
+            "💾 Guardar progreso",
+            data=sesion_a_json_bytes(_state_snapshot()),
+            file_name=f"avance_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json",
+            use_container_width=True,
+            type="primary",
+            key="guardar_progreso_principal",
+            on_click=_marcar_guardado,
+            help="Descarga el avance actual como .json -guárdalo en un lugar seguro para poder continuar "
+                 "más tarde o compartirlo- y marca la hora de este guardado.",
+        )
+
+
+# ============================================================
+# CONTENIDO PRINCIPAL
+# ============================================================
+df = st.session_state.bank_df
+if df is None:
+    st.info("👈 Sube un estado de cuenta desde el panel de la izquierda para comenzar.")
+    # La bitácora de solicitudes no depende del estado de cuenta (se registra el gasto
+    # al hacerlo, antes de que el banco lo muestre), así que se queda siempre disponible.
+    if st.session_state.solicitudes:
+        _mostrar_barra_guardado()
+    _mostrar_seccion_solicitudes()
+    st.stop()
+
+resumen = resumen_estados(df, st.session_state.estados)
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.markdown(f"""
+    <div class="summary-box box-pendiente">
+        <div class="summary-title">⏳ SIN COMPROBAR</div>
+        <div class="summary-count">{resumen['pendiente']['count']}</div>
+        <div class="summary-amount">{money(resumen['pendiente']['total'])}</div>
+    </div>""", unsafe_allow_html=True)
+with col2:
+    st.markdown(f"""
+    <div class="summary-box box-pendiente-detalles">
+        <div class="summary-title">🧾 PENDIENTE DE DETALLES</div>
+        <div class="summary-count">{resumen['pendiente_detalles']['count']}</div>
+        <div class="summary-amount">{money(resumen['pendiente_detalles']['total'])}</div>
+    </div>""", unsafe_allow_html=True)
+with col3:
+    st.markdown(f"""
+    <div class="summary-box box-comprobado">
+        <div class="summary-title">✅ COMPROBADOS</div>
+        <div class="summary-count">{resumen['comprobado']['count']}</div>
+        <div class="summary-amount">{money(resumen['comprobado']['total'])}</div>
+    </div>""", unsafe_allow_html=True)
+with col4:
+    st.markdown(f"""
+    <div class="summary-box box-no-necesario">
+        <div class="summary-title">🚫 NO NECESARIOS</div>
+        <div class="summary-count">{resumen['no_necesario']['count']}</div>
+        <div class="summary-amount">{money(resumen['no_necesario']['total'])}</div>
+    </div>""", unsafe_allow_html=True)
+
+total_monto = sum(r["total"] for r in resumen.values())
+monto_resuelto = resumen["comprobado"]["total"] + resumen["no_necesario"]["total"]
+if total_monto > 0:
+    # Los "$" de money() se escapan porque Streamlit renderiza este texto como
+    # markdown: dos "$" sin escapar en la misma cadena (uno por cada monto) se
+    # interpretaban como un bloque de fórmula (LaTeX/KaTeX) en vez de texto
+    # plano, mostrando parte del texto en una fuente monoespaciada rara.
+    texto_avance = f"Avance por monto: {money(monto_resuelto)} de {money(total_monto)}".replace("$", r"\$")
+    st.progress(min(monto_resuelto / total_monto, 1.0), text=texto_avance)
+
+_mostrar_barra_guardado()
+
+st.write("")
+
+tab_pendientes, tab_detalles, tab_comprobados, tab_no_necesarios, tab_resumen = st.tabs(
+    ["⏳ Pendientes", "🧾 Pendiente de detalles", "✅ Comprobados", "🚫 No necesarios", "📊 Resumen y descarga"]
+)
+
+
+# ============================================================
+# DIÁLOGO: TRABAJAR UN GASTO
+# ============================================================
 def _cerrar_dialogo_trabajar_gasto() -> None:
     """Callback de on_dismiss: se ejecuta cuando el usuario cierra el diálogo con
     la "X", con ESC o haciendo clic afuera (a diferencia de los botones internos
@@ -1485,178 +1871,6 @@ def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> N
         )
 
 
-def _en_orden_de_estado_de_cuenta(registros: list[dict]) -> list[dict]:
-    """Ordena registros (comprobados, no necesarios) según la posición del movimiento
-    en el estado de cuenta (`idx`, la fila del archivo del banco), para que el Excel
-    siga el mismo orden en que se realizaron los gastos y no el orden en que se fueron
-    comprobando. `sorted` es estable: si varios registros comparten `idx` conservan su
-    orden relativo, y los que no traen `idx` se van al final."""
-    return sorted(registros, key=lambda r: (r.get("idx") is None, r.get("idx") if r.get("idx") is not None else 0))
-
-
-# ============================================================
-# BITÁCORA DE SOLICITUDES DE REEMBOLSO
-# ============================================================
-def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -> bytes:
-    """Arma el Excel de la bitácora con el mismo formato/orden que la hoja "Details"
-    de la plantilla que compartió el usuario: columnas A-I son los datos de la
-    solicitud (No., Applicant, Category, Description, Linked Request No., Number of
-    Days, Total Number of People, Employee Name y Material -en el lugar donde la
-    plantilla trae "Client Name", que aquí no se captura-); columnas J-N son la
-    comprobación ya hecha con el estado de cuenta/XML (Payment Date, Expense Outflow
-    Amt, No., CFDI Folio, Reimbursement Cap); se agrega una columna "Status" extra al
-    final para saber de un vistazo qué sigue pendiente."""
-    from io import BytesIO
-
-    def _registros_vinculados(sol: dict) -> list[dict]:
-        """Gastos vinculados a esta solicitud -normalmente uno solo, o varios
-        cuando se comprobaron juntos compartiendo 1 sola factura- con su lista de
-        facturas cada uno. Incluye también un gasto en "pendiente_detalles": ya
-        tiene factura emparejada aunque todavía falten los datos administrativos."""
-        if sol.get("estado") not in ("comprobado", "pendiente_detalles"):
-            return []
-        registros = []
-        for i in _idx_vinculado_lista(sol):
-            registro = next((c for c in concatenados if c["idx"] == i), None)
-            if registro is not None:
-                registros.append(registro)
-        return registros
-
-    def _comprobacion_de(sol: dict, registro: dict, factura: dict | None, primera_registro: bool) -> dict:
-        """Una FACTURA por fila (antes: todos los UUID de un gasto concatenados en una
-        sola celda «CFDI Folio» con '; '.join). Payment Date/Expense Outflow Amt/el
-        No. del banco sólo van en la primera fila DE CADA GASTO del grupo (igual
-        que en la hoja «Comprobados»; si la solicitud se vinculó a varios gastos,
-        cada uno tiene su propia primera fila), CFDI Folio y Reimbursement Cap son
-        siempre por factura."""
-        if factura is None:
-            return {}
-        return {
-            "Payment Date": (registro.get("Fecha Estado", "")) if primera_registro else None,
-            "Expense Outflow Amt": (
-                round(abs(float(registro.get("Monto Estado", 0) or 0)), 2)
-            ) if primera_registro else None,
-            "Bank No": sol["No"] if primera_registro else None,
-            "CFDI Folio": factura.get("UUID", ""),
-            "Reimbursement Cap": round(factura.get("Monto Total", 0) or 0, 2),
-        }
-
-    def _fila_admin(sol: dict, mostrar: bool) -> dict:
-        """Columnas A-I (datos de la solicitud): sólo se muestran en la primera
-        fila de la solicitud completa -si se vinculó a varios gastos, las demás
-        filas (de ese mismo gasto o de los siguientes) las dejan en blanco, igual
-        que ya pasaba entre facturas de un mismo gasto-."""
-        if not mostrar:
-            return {
-                "No": None, "Applicant": "", "Category": "", "Description": "",
-                "Linked Request No": "", "Number of Days": None,
-                "Total Number of People": None, "Employee Name": "", "Material": "",
-                "Status": "",
-            }
-        return {
-            "No": sol.get("No"),
-            "Applicant": sol.get("Applicant") or "",
-            "Category": sol.get("Category") or "",
-            "Description": sol.get("Description") or "",
-            "Linked Request No": sol.get("Request Number") or "",
-            "Number of Days": sol.get("Number of Days", 0),
-            "Total Number of People": sol.get("Number of People", 0),
-            "Employee Name": sol.get("Employee Name") or "",
-            "Material": sol.get("Material") or "",
-            "Status": ({
-                "comprobado": "Comprobado",
-                "pendiente_detalles": "Pendiente detalles",
-            }.get(sol.get("estado"), "Pendiente")),
-        }
-
-    columnas_df = [
-        "No", "Applicant", "Category", "Description", "Linked Request No",
-        "Number of Days", "Total Number of People", "Employee Name", "Material",
-        "Payment Date", "Expense Outflow Amt", "Bank No", "CFDI Folio",
-        "Reimbursement Cap", "Status",
-    ]
-    encabezados = [
-        "No.", "Applicant", "Category", "Description", "Linked Request No.",
-        "Number of Days", "Total Number of People", "Employee Name", "Material",
-        "Payment Date", "Expense Outflow Amt", "No.", "CFDI Folio",
-        "Reimbursement Cap (With IVA)", "Status",
-    ]
-
-    filas = []
-    for sol in solicitudes:
-        registros = _registros_vinculados(sol)
-        if not registros:
-            filas.append(_fila_admin(sol, True))
-            continue
-        primera_de_sol = True
-        for registro in registros:
-            facturas_registro = registro.get("Facturas", []) or []
-            for j, factura in enumerate([*facturas_registro] or [None]):
-                primera_registro = j == 0
-                fila = _fila_admin(sol, primera_de_sol)
-                fila.update(_comprobacion_de(sol, registro, factura, primera_registro))
-                filas.append(fila)
-                primera_de_sol = False
-
-    df = pd.DataFrame(filas, columns=columnas_df) if filas else pd.DataFrame(columns=columnas_df)
-
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Details")
-        workbook = writer.book
-        ws = writer.sheets["Details"]
-
-        header_fmt = workbook.add_format({
-            "bold": True, "bg_color": C_BITACORA_HEADER, "font_color": "white",
-            "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True,
-        })
-        for col_idx, titulo in enumerate(encabezados):
-            ws.write(0, col_idx, titulo, header_fmt)
-
-        money_fmt = workbook.add_format({"num_format": "$#,##0.00"})
-        for nombre in ("Expense Outflow Amt", "Reimbursement Cap"):
-            col_idx = columnas_df.index(nombre)
-            ws.set_column(col_idx, col_idx, 20, money_fmt)
-
-        anchos = {
-            "No": 6, "Applicant": 14, "Category": 24, "Description": 26,
-            "Linked Request No": 24, "Number of Days": 12, "Total Number of People": 14,
-            "Employee Name": 24, "Material": 16, "Payment Date": 14, "Bank No": 8,
-            "CFDI Folio": 38, "Status": 12,
-        }
-        for nombre, ancho in anchos.items():
-            ws.set_column(columnas_df.index(nombre), columnas_df.index(nombre), ancho)
-
-        # -------- Hojas extra: "No necesarios" y "Por comprobar" --------
-        # Con los gastos emparejados automáticamente ya representados en "Details"
-        # (como "Pendiente detalles"), este Excel de la bitácora cubre prácticamente
-        # lo mismo que el de "Resumen y descargas"; se agregan estas dos hojas para
-        # que sea igual de completo sin tener que descargar los dos por separado.
-        no_necesarios = _en_orden_de_estado_de_cuenta(st.session_state.get("no_necesarios", []))
-        cols_nn = ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
-        df_nn_todo = pd.DataFrame(no_necesarios)
-        cols_nn_presentes = [c for c in cols_nn if c in df_nn_todo.columns]
-        if cols_nn_presentes:
-            df_nn_todo[cols_nn_presentes].to_excel(writer, index=False, sheet_name="No necesarios")
-        else:
-            pd.DataFrame(columns=cols_nn).to_excel(writer, index=False, sheet_name="No necesarios")
-
-        bank_df = st.session_state.get("bank_df")
-        estados = st.session_state.get("estados", {})
-        cols_pend = ["Fecha", "Descripción", "Monto", "Saldo"]
-        if bank_df is not None:
-            df_pend_todo = bank_df[bank_df.index.map(lambda i: estados.get(i) == "pendiente")]
-            cols_pend_presentes = [c for c in cols_pend if c in df_pend_todo.columns]
-        else:
-            df_pend_todo = pd.DataFrame(columns=cols_pend)
-            cols_pend_presentes = cols_pend
-        (df_pend_todo[cols_pend_presentes] if cols_pend_presentes else df_pend_todo).to_excel(
-            writer, index=False, sheet_name="Por comprobar"
-        )
-
-    return output.getvalue()
-
-
 def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
     """Excel del historial completo -pensado para descargarse desde «✅ Comprobados»,
     y también el que se ofrece en «📊 Resumen y descarga»- con el mismo formato
@@ -1811,181 +2025,6 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
         )
 
     return output.getvalue()
-
-
-# Anchos/títulos de la parte "de datos" de la bitácora (todo lo que NO es un
-# botón de acción) — se dibuja como una sola grilla CSS continua (sin huecos
-# entre columnas) para que luzca como una hoja de cálculo real; las dos
-# últimas columnas (estado/comprobar y eliminar) siguen siendo widgets nativos
-# de Streamlit y se colocan aparte, en su propio st.columns.
-_ANCHOS_BITACORA_DATOS = [0.6, 1.4, 1.7, 2.0, 1.4, 0.7, 0.8, 1.6, 1.2]
-_ANCHO_BITACORA_ESTADO = 1.8
-_ANCHO_BITACORA_BORRAR = 0.5
-_TITULOS_BITACORA_DATOS = [
-    "No.", "Applicant", "Category", "Description", "Request #",
-    "Días", "Personas", "Employee", "Material",
-]
-
-
-def _bitacora_grid_fila(valores, es_encabezado: bool, impar: bool = False) -> str:
-    """Arma una fila de la bitácora como una grilla CSS de una sola pieza
-    (mismas proporciones que _ANCHOS_BITACORA_DATOS), para que los bordes de
-    celda queden continuos de extremo a extremo, como en Excel."""
-    plantilla = " ".join(f"{a}fr" for a in _ANCHOS_BITACORA_DATOS)
-    clase_celda = "bitacora-grid-celda-header" if es_encabezado else "bitacora-grid-celda"
-    celdas = "".join(f"<div class='{clase_celda}'>{v}</div>" for v in valores)
-    clase_fila = "bitacora-grid-fila"
-    if impar and not es_encabezado:
-        clase_fila += " bitacora-grid-fila-impar"
-    return f"<div class='{clase_fila}' style='grid-template-columns: {plantilla};'>{celdas}</div>"
-
-
-def _mostrar_seccion_solicitudes() -> None:
-    num_solicitudes = len(st.session_state.solicitudes)
-    with st.expander(f"🧾 Bitácora de solicitudes ({num_solicitudes})", expanded=True):
-        st.markdown("### 📝 Nueva solicitud de reembolso")
-        st.caption(
-            "Registra aquí cada gasto conforme se va realizando, antes de tener el estado de cuenta "
-            "o la factura. Queda guardado en la bitácora de abajo; cuando el movimiento ya aparezca "
-            "en el estado de cuenta, usa su botón «🔗 Comprobar gasto» para vincularlo y adjuntar la "
-            "factura, igual que con cualquier otro gasto pendiente."
-        )
-        v = st.session_state.solicitud_form_version
-        with st.container(border=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                applicant = _selector_catalogo("Applicant", "aplicantes", "", f"sol_applicant_{v}")
-            with c2:
-                category = _selector_catalogo("Category", "categorias_solicitud", "", f"sol_category_{v}")
-            with c3:
-                employee = _selector_catalogo("Employee name", "empleados", "", f"sol_employee_{v}")
-
-            c4, c5, c6 = st.columns(3)
-            with c4:
-                material = _selector_catalogo("Material", "materiales", "", f"sol_material_{v}")
-            with c5:
-                description = st.text_input("Description", key=f"sol_description_{v}")
-            with c6:
-                request_number = st.text_input("Request number", key=f"sol_request_{v}")
-
-            c7, c8, _c9 = st.columns(3)
-            with c7:
-                number_of_days = st.number_input("Number of days", min_value=0, step=1, key=f"sol_days_{v}")
-            with c8:
-                number_of_people = st.number_input("Number of people", min_value=0, step=1, key=f"sol_people_{v}")
-
-            if st.button("➕ Agregar a la bitácora", key=f"sol_btn_guardar_{v}", type="primary"):
-                if not applicant.strip():
-                    st.error("«Applicant» es obligatorio.")
-                else:
-                    nuevo_no = next_solicitud_id()
-                    st.session_state.solicitudes.append({
-                        "id": nuevo_no,
-                        "No": nuevo_no,
-                        "Applicant": applicant.strip(),
-                        "Category": category,
-                        "Description": description.strip(),
-                        "Material": material,
-                        "Employee Name": employee,
-                        "Request Number": request_number.strip(),
-                        "Number of Days": int(number_of_days),
-                        "Number of People": int(number_of_people),
-                        "estado": "pendiente",
-                        "idx_vinculado": None,
-                    })
-                    _limpiar_formulario_solicitud()
-                    _autoguardar_si_activo()
-                    st.success(f"Solicitud #{nuevo_no} agregada a la bitácora.")
-                    st.rerun()
-
-        if not st.session_state.solicitudes:
-            st.caption("Todavía no hay solicitudes registradas en la bitácora.")
-        else:
-            st.markdown("##### 🧾 Bitácora de solicitudes")
-            st.caption("Mismo orden de columnas que la hoja «Details» de la plantilla (Material ocupa el "
-                       "lugar de «Client Name», que aquí no se captura).")
-
-            if st.session_state.solicitud_en_proceso is not None:
-                sol_activa = _solicitud_por_id(st.session_state.solicitud_en_proceso)
-                if sol_activa is not None:
-                    st.markdown(
-                        f"<div class='warn-box'>🔗 Vinculando la solicitud #{sol_activa['No']} "
-                        f"({sol_activa['Applicant']} · {sol_activa['Category']}): selecciona uno o más gastos "
-                        f"(si son varios, van a compartir la misma factura) en la tabla de «Gastos pendientes» "
-                        f"de abajo y pulsa «Abrir».</div>",
-                        unsafe_allow_html=True,
-                    )
-                    if st.button("Cancelar vinculación", key="btn_cancelar_vinculacion"):
-                        st.session_state.solicitud_en_proceso = None
-                        st.rerun()
-                else:
-                    st.session_state.solicitud_en_proceso = None
-
-            col_grid_enc, col_estado_enc, col_borrar_enc = st.columns(
-                [sum(_ANCHOS_BITACORA_DATOS), _ANCHO_BITACORA_ESTADO, _ANCHO_BITACORA_BORRAR]
-            )
-            with col_grid_enc:
-                st.markdown(
-                    _bitacora_grid_fila(_TITULOS_BITACORA_DATOS, es_encabezado=True),
-                    unsafe_allow_html=True,
-                )
-            for col_suelta in (col_estado_enc, col_borrar_enc):
-                with col_suelta:
-                    st.markdown("<div class='bitacora-header'>&nbsp;</div>", unsafe_allow_html=True)
-
-            def _celda(valor) -> str:
-                return f"<div class='bitacora-fila'>{valor}</div>"
-
-            for fila_n, sol in enumerate(st.session_state.solicitudes):
-                valores = [
-                    f"#{sol['No']}", sol["Applicant"] or "—", sol["Category"] or "—",
-                    sol.get("Description") or "—", sol["Request Number"] or "—",
-                    sol["Number of Days"], sol["Number of People"],
-                    sol["Employee Name"] or "—", sol["Material"] or "—",
-                ]
-                col_grid, col_estado, col_borrar = st.columns(
-                    [sum(_ANCHOS_BITACORA_DATOS), _ANCHO_BITACORA_ESTADO, _ANCHO_BITACORA_BORRAR]
-                )
-                with col_grid:
-                    st.markdown(
-                        _bitacora_grid_fila(valores, es_encabezado=False, impar=(fila_n % 2 == 1)),
-                        unsafe_allow_html=True,
-                    )
-                with col_estado:
-                    idxs_vinc_txt = ", ".join(f"#{i}" for i in _idx_vinculado_lista(sol))
-                    if sol["estado"] == "comprobado":
-                        st.markdown(_celda(f"✅ {idxs_vinc_txt}"), unsafe_allow_html=True)
-                    elif sol["estado"] == "pendiente_detalles":
-                        # La creó (o la retomó) el emparejamiento automático: ya está
-                        # vinculada a un gasto, sólo falta completar sus datos en la
-                        # pestaña "🧾 Pendiente de detalles" (no tiene sentido volver a
-                        # ofrecer "Comprobar" porque el vínculo ya existe).
-                        st.markdown(_celda(f"🧾 {idxs_vinc_txt} (faltan datos)"), unsafe_allow_html=True)
-                    else:
-                        ya_vinculando_otra = st.session_state.solicitud_en_proceso not in (None, sol["id"])
-                        if st.button("🔗 Comprobar", key=f"btn_comprobar_sol_{sol['id']}", disabled=ya_vinculando_otra,
-                                     use_container_width=True):
-                            st.session_state.solicitud_en_proceso = sol["id"]
-                            st.rerun()
-                with col_borrar:
-                    if st.button("✕", key=f"btn_eliminar_sol_{sol['id']}", help="Eliminar este registro de la bitácora",
-                                 use_container_width=True):
-                        _eliminar_solicitud(sol["id"])
-                        st.rerun()
-
-            st.caption(
-                "El .xlsx incluye la hoja «Details» (con todos los gastos, incluidos los que ya "
-                "tienen factura emparejada automáticamente pero siguen esperando estos datos) más "
-                "«No necesarios» y «Por comprobar»."
-            )
-            st.download_button(
-                "📥 Descargar bitácora (formato Details, .xlsx)",
-                data=_bitacora_a_excel_bytes(st.session_state.solicitudes, st.session_state.concatenados),
-                file_name=f"bitacora_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="btn_descargar_solicitudes",
-            )
-    st.divider()
 
 
 # ============================================================
