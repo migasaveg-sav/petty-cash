@@ -35,7 +35,14 @@ from catalog import (
     catalogo_inicial,
 )
 from cfdi import CFDIParseError, parse_cfdi
-from matching import DIFERENCIA_ACEPTABLE, calcular_matches_automaticos, checksum_reconciliacion, resumen_estados
+from matching import (
+    DIFERENCIA_ACEPTABLE,
+    LIMITE_REEMBOLSO_DEFAULT,
+    calcular_matches_automaticos,
+    checksum_reconciliacion,
+    resumen_estados,
+    resumen_gasto_bitacora,
+)
 from persistence import (
     CAMPOS_SESION,
     autoguardar,
@@ -100,6 +107,9 @@ def init_state() -> None:
         "mostrar_mapeo_manual": False,
         "confirmar_reset": False,
         "autoguardado_activo": True,
+        # Monto de gasto acumulado en la bitácora a partir del cual toca solicitar el
+        # reembolso (editable en la propia bitácora; sólo de esta sesión de navegador).
+        "limite_reembolso": LIMITE_REEMBOLSO_DEFAULT,
         # Marca de tiempo del último guardado manual (botón "💾 Guardar progreso" o
         # "📥 Descargar avance (.json)"), usada sólo para el aviso de "llevas X min
         # sin guardar" -no se persiste dentro del .json ni del autoguardado, es
@@ -310,6 +320,9 @@ section[data-testid="stSidebar"] input {{ border-radius: 8px !important; }}
     color: {C_TEXTO_SECUNDARIO}; margin-bottom: 8px;
 }}
 .summary-count {{ font-size: 1.9rem; font-weight: 800; color: {C_TEXTO_OSCURO}; line-height: 1; }}
+.summary-amount-big {{ font-size: 1.7rem; font-weight: 800; color: {C_TEXTO_OSCURO}; line-height: 1.1; }}
+.limite-barra {{ height: 8px; background: {C_BORDE_SUAVE}; border-radius: 4px; margin: 8px 0 6px 0; overflow: hidden; }}
+.limite-barra > div {{ height: 100%; border-radius: 4px; }}
 .summary-amount {{ font-size: 0.92rem; color: {C_TEXTO_SECUNDARIO}; margin-top: 4px; font-weight: 500; }}
 
 .box-pendiente {{ --accent-color: {C_SLATE}; }}
@@ -1201,11 +1214,11 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
 # entre columnas) para que luzca como una hoja de cálculo real; las dos
 # últimas columnas (estado/comprobar y eliminar) siguen siendo widgets nativos
 # de Streamlit y se colocan aparte, en su propio st.columns.
-_ANCHOS_BITACORA_DATOS = [0.6, 1.4, 1.7, 2.0, 1.4, 0.7, 0.8, 1.6, 1.2]
+_ANCHOS_BITACORA_DATOS = [0.6, 1.35, 1.3, 1.5, 1.6, 1.1, 1.1, 0.6, 0.7, 1.5, 1.1]
 _ANCHO_BITACORA_ESTADO = 1.8
 _ANCHO_BITACORA_BORRAR = 0.5
 _TITULOS_BITACORA_DATOS = [
-    "No.", "Applicant", "Category", "Description", "Request #",
+    "No.", "Fecha", "Applicant", "Category", "Description", "Monto", "Request #",
     "Días", "Personas", "Employee", "Material",
 ]
 
@@ -1223,9 +1236,93 @@ def _bitacora_grid_fila(valores, es_encabezado: bool, impar: bool = False) -> st
     return f"<div class='{clase_fila}' style='grid-template-columns: {plantilla};'>{celdas}</div>"
 
 
+def _fecha_corta(valor) -> str:
+    """AAAA-MM-DD (como se guarda en la solicitud) -> DD/MM/AAAA para mostrarla."""
+    try:
+        return datetime.date.fromisoformat(str(valor)[:10]).strftime("%d/%m/%Y")
+    except ValueError:
+        return "—"
+
+
+def _mostrar_tarjetas_gasto_bitacora() -> None:
+    """Tarjetas del gasto tentativo registrado en la bitácora (día, semana y acumulado
+    contra el límite de reembolso) hasta la fecha de consulta. Es información de
+    control para saber cuándo se llega al monto de solicitar el reembolso (por
+    default $50,000): no se mezcla con la comprobación real del estado de cuenta."""
+    col_fecha, col_limite, _relleno = st.columns([1, 1, 2])
+    with col_fecha:
+        fecha_consulta = st.date_input(
+            "📅 Consultar gasto hasta", value=datetime.date.today(), key="bitacora_fecha_consulta",
+            help="Los totales incluyen lo registrado hasta esta fecha.",
+        )
+    with col_limite:
+        limite = st.number_input(
+            "🎯 Límite para solicitar reembolso", min_value=1.0, step=1000.0, format="%.2f",
+            value=float(st.session_state.limite_reembolso), key="bitacora_limite_reembolso",
+        )
+        st.session_state.limite_reembolso = float(limite)
+
+    r = resumen_gasto_bitacora(st.session_state.solicitudes, fecha_consulta)
+    pct = r["acumulado"] / limite if limite else 0.0
+    if pct >= 1:
+        color, aviso = C_CORAL_ALERTA, f"Superaste el límite por {money(r['acumulado'] - limite)}: ya toca solicitar el reembolso."
+    elif pct >= 0.8:
+        color, aviso = C_AMARILLO_ACENTO, f"Te faltan {money(limite - r['acumulado'])} para el límite: prepara el reembolso."
+    else:
+        color, aviso = C_VERDE_OK, f"Te faltan {money(limite - r['acumulado'])} para el límite."
+    ancho_barra = min(pct, 1.0) * 100
+
+    def _registros(n: int) -> str:
+        return f"{n} registro" + ("" if n == 1 else "s")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(f"""
+        <div class="summary-box" style="--accent-color: {C_ACENTO};">
+            <div class="summary-title">📆 GASTO DEL DÍA</div>
+            <div class="summary-amount-big">{money(r['dia'])}</div>
+            <div class="summary-amount">{fecha_consulta.strftime('%d/%m/%Y')} · {_registros(r['n_dia'])}</div>
+        </div>""", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""
+        <div class="summary-box" style="--accent-color: {C_SLATE};">
+            <div class="summary-title">🗓️ GASTO DE LA SEMANA</div>
+            <div class="summary-amount-big">{money(r['semana'])}</div>
+            <div class="summary-amount">Del {r['inicio_semana'].strftime('%d/%m')} al {fecha_consulta.strftime('%d/%m')} · {_registros(r['n_semana'])}</div>
+        </div>""", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""
+        <div class="summary-box" style="--accent-color: {color};">
+            <div class="summary-title">💰 ACUMULADO ({pct * 100:.0f}% DEL LÍMITE)</div>
+            <div class="summary-amount-big">{money(r['acumulado'])}</div>
+            <div class="summary-amount">de {money(limite)} · {_registros(r['n_acumulado'])}</div>
+            <div class="limite-barra"><div style="width: {ancho_barra:.1f}%; background: {color};"></div></div>
+            <div class="summary-amount" style="color: {color}; font-weight: 600;">{aviso}</div>
+        </div>""", unsafe_allow_html=True)
+    if r["sin_fecha"]:
+        st.caption(
+            f"{r['sin_fecha']} solicitud(es) sin fecha (capturadas antes de que existiera ese campo) cuentan en el "
+            "acumulado pero no en el día ni en la semana."
+        )
+    if r["por_dia"] and st.checkbox("Ver desglose por día", key="bitacora_ver_desglose_dia"):
+        st.dataframe(
+            pd.DataFrame(
+                [(f.strftime("%d/%m/%Y"), money(total), n) for f, total, n in r["por_dia"]],
+                columns=["Fecha", "Monto", "Registros"],
+            ),
+            hide_index=True, use_container_width=True,
+        )
+    st.divider()
+
+
 def _mostrar_seccion_solicitudes() -> None:
     num_solicitudes = len(st.session_state.solicitudes)
-    with st.expander(f"🧾 Bitácora de solicitudes ({num_solicitudes})", expanded=True):
+    total_registrado = sum(float(x.get("Monto") or 0) for x in st.session_state.solicitudes)
+    etiqueta_exp = f"🧾 Bitácora de solicitudes ({num_solicitudes})"
+    if total_registrado > 0:
+        etiqueta_exp += f" · Acumulado {money(total_registrado)}"
+    with st.expander(etiqueta_exp, expanded=True):
+        _mostrar_tarjetas_gasto_bitacora()
         st.markdown("### 📝 Nueva solicitud de reembolso")
         st.caption(
             "Registra aquí cada gasto conforme se va realizando, antes de tener el estado de cuenta "
@@ -1251,11 +1348,22 @@ def _mostrar_seccion_solicitudes() -> None:
             with c6:
                 request_number = st.text_input("Request number", key=f"sol_request_{v}")
 
-            c7, c8, _c9 = st.columns(3)
+            c7, c8, c9, c10 = st.columns(4)
             with c7:
                 number_of_days = st.number_input("Number of days", min_value=0, step=1, key=f"sol_days_{v}")
             with c8:
                 number_of_people = st.number_input("Number of people", min_value=0, step=1, key=f"sol_people_{v}")
+            with c9:
+                fecha_gasto = st.date_input(
+                    "Fecha del gasto", value=datetime.date.today(), key=f"sol_fecha_{v}",
+                    help="Día en que se hizo el gasto; con ella se calculan el gasto del día y de la semana.",
+                )
+            with c10:
+                monto_tentativo = st.number_input(
+                    "Monto", min_value=0.0, step=1.0, format="%.2f", key=f"sol_monto_{v}",
+                    help="Monto aproximado del gasto, sólo informativo: sirve para llevar el acumulado "
+                         "hacia el límite de reembolso. La comprobación real se hace con el estado de cuenta y los XML.",
+                )
 
             if st.button("➕ Agregar a la bitácora", key=f"sol_btn_guardar_{v}", type="primary"):
                 if not applicant.strip():
@@ -1273,6 +1381,8 @@ def _mostrar_seccion_solicitudes() -> None:
                         "Request Number": request_number.strip(),
                         "Number of Days": int(number_of_days),
                         "Number of People": int(number_of_people),
+                        "Fecha": fecha_gasto.isoformat(),
+                        "Monto": round(float(monto_tentativo or 0), 2),
                         "estado": "pendiente",
                         "idx_vinculado": None,
                     })
@@ -1321,8 +1431,8 @@ def _mostrar_seccion_solicitudes() -> None:
 
             for fila_n, sol in enumerate(st.session_state.solicitudes):
                 valores = [
-                    f"#{sol['No']}", sol["Applicant"] or "—", sol["Category"] or "—",
-                    sol.get("Description") or "—", sol["Request Number"] or "—",
+                    f"#{sol['No']}", _fecha_corta(sol.get("Fecha")), sol["Applicant"] or "—", sol["Category"] or "—",
+                    sol.get("Description") or "—", money(sol.get("Monto") or 0), sol["Request Number"] or "—",
                     sol["Number of Days"], sol["Number of People"],
                     sol["Employee Name"] or "—", sol["Material"] or "—",
                 ]
