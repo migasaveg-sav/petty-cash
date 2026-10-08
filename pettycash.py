@@ -38,6 +38,8 @@ from cfdi import CFDIParseError, parse_cfdi
 from matching import (
     DIFERENCIA_ACEPTABLE,
     LIMITE_REEMBOLSO_DEFAULT,
+    ordenar_registros_por_comprobacion,
+    ordenar_registros_por_fecha,
     calcular_matches_automaticos,
     checksum_reconciliacion,
     resumen_estados,
@@ -638,6 +640,11 @@ def _autoguardar_si_activo() -> None:
             pass  # el autoguardado nunca debe interrumpir el flujo del usuario
 
 
+def _ahora_iso() -> str:
+    """Marca de tiempo (texto ISO, hasta segundos) de cuándo se comprobó un gasto."""
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
 def _marcar_guardado() -> None:
     """on_click de cualquier botón de descarga del avance (.json): registra la hora
     para el aviso de "llevas X min sin guardar" (ver la barra de guardado en el
@@ -1037,15 +1044,6 @@ def _eliminar_solicitud(solicitud_id: int) -> None:
     _autoguardar_si_activo()
 
 
-def _en_orden_de_estado_de_cuenta(registros: list[dict]) -> list[dict]:
-    """Ordena registros (comprobados, no necesarios) según la posición del movimiento
-    en el estado de cuenta (`idx`, la fila del archivo del banco), para que el Excel
-    siga el mismo orden en que se realizaron los gastos y no el orden en que se fueron
-    comprobando. `sorted` es estable: si varios registros comparten `idx` conservan su
-    orden relativo, y los que no traen `idx` se van al final."""
-    return sorted(registros, key=lambda r: (r.get("idx") is None, r.get("idx") if r.get("idx") is not None else 0))
-
-
 # ============================================================
 # BITÁCORA DE SOLICITUDES DE REEMBOLSO
 # ============================================================
@@ -1184,7 +1182,7 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
         # (como "Pendiente detalles"), este Excel de la bitácora cubre prácticamente
         # lo mismo que el de "Resumen y descargas"; se agregan estas dos hojas para
         # que sea igual de completo sin tener que descargar los dos por separado.
-        no_necesarios = _en_orden_de_estado_de_cuenta(st.session_state.get("no_necesarios", []))
+        no_necesarios = ordenar_registros_por_fecha(st.session_state.get("no_necesarios", []))
         cols_nn = ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
         df_nn_todo = pd.DataFrame(no_necesarios)
         cols_nn_presentes = [c for c in cols_nn if c in df_nn_todo.columns]
@@ -1936,6 +1934,7 @@ def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> N
                             "Facturas": facturas_por_idx[i],
                             "Propina": propina_por_idx[i],
                             "Solicitud": sol,
+                            "Fecha Comprobación": _ahora_iso(),
                         }
                         if es_grupo:
                             registro["GrupoCompartido"] = clave_grupo
@@ -1990,7 +1989,7 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
     vinculado a una solicitud se usan los datos administrativos (Applicant, Category,
     etc.) de esa solicitud; si no, se usan los que el propio gasto haya capturado -por
     ejemplo los completados en «🧾 Pendiente de detalles»- y si tampoco los tiene,
-    quedan en blanco. Se agregan además las hojas «No necesarios» y «Sin comprobar»
+    quedan en blanco. Se agregan además las hojas «No necesarios» y «Pendientes»
     para que sea un solo archivo con todo el historial."""
     from io import BytesIO
 
@@ -2025,19 +2024,19 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
         "Number of Days", "Total Number of People", "Employee Name", "Material",
         "Payment Date", "Expense Outflow Amt", "Propina", "Bank No", "Invoice Date", "CFDI Folio",
         "IVA", "ISR Retenido", "IVA Retenido", "ISH",
-        "Reimbursement Cap", "Status",
+        "Reimbursement Cap", "Status", "Comprobado el",
     ]
     encabezados = [
         "No.", "Applicant", "Category", "Description", "Linked Request No.",
         "Number of Days", "Total Number of People", "Employee Name", "Material",
         "Payment Date", "Expense Outflow Amt", "Propina", "No.", "Invoice date", "CFDI Folio",
         "IVA", "ISR Retenido", "IVA Retenido", "ISH",
-        "Reimbursement Cap (With IVA)", "Status",
+        "Reimbursement Cap (With IVA)", "Status", "Comprobado el",
     ]
 
-    filas = []
-    # Mismo orden que el estado de cuenta (no el orden en que se fue comprobando cada gasto).
-    for registro in _en_orden_de_estado_de_cuenta(concatenados):
+    def _construir_filas(registros: list[dict]) -> list[dict]:
+      filas = []
+      for registro in registros:
         admin = _datos_admin(registro)
         # Sin solicitud vinculada no hay número de solicitud -se usa el número del
         # movimiento bancario como identificador de la fila, para no dejarla en blanco.
@@ -2072,9 +2071,22 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
                 "ISH": round(f.get("ISH", 0) or 0, 2),
                 "Reimbursement Cap": round(f.get("Monto Total", 0) or 0, 2),
                 "Status": status if primera else "",
+                "Comprobado el": (
+                    str(registro.get("Fecha Comprobación") or "").replace("T", " ") if primera else None
+                ),
             })
+      return filas
 
-    df_comp = pd.DataFrame(filas, columns=columnas_df) if filas else pd.DataFrame(columns=columnas_df)
+    def _df_de(registros: list[dict]) -> pd.DataFrame:
+        filas = _construir_filas(registros)
+        return pd.DataFrame(filas, columns=columnas_df) if filas else pd.DataFrame(columns=columnas_df)
+
+    # Dos vistas del mismo historial: por fecha del gasto (para ver cómo se fue gastando)
+    # y por fecha de comprobación (para ver cuánto se ha ido comprobando/pagando y cuándo).
+    hojas_comprobados = [
+        ("Comprobados por fecha", _df_de(ordenar_registros_por_fecha(concatenados))),
+        ("Comprobados por comprobación", _df_de(ordenar_registros_por_comprobacion(concatenados))),
+    ]
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -2086,33 +2098,35 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
         money_fmt = workbook.add_format({"num_format": "$#,##0.00"})
         bold_fmt = workbook.add_format({"bold": True})
 
-        df_comp.to_excel(writer, index=False, sheet_name="Comprobados")
-        ws = writer.sheets["Comprobados"]
-        for col_idx, titulo in enumerate(encabezados):
-            ws.write(0, col_idx, titulo, header_fmt)
         columnas_dinero = ["Expense Outflow Amt", "Propina", "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap"]
-        for nombre in columnas_dinero:
-            col_idx = columnas_df.index(nombre)
-            ws.set_column(col_idx, col_idx, 16, money_fmt)
         anchos = {
             "No": 6, "Applicant": 14, "Category": 24, "Description": 26,
             "Linked Request No": 24, "Number of Days": 12, "Total Number of People": 14,
             "Employee Name": 24, "Material": 16, "Payment Date": 14, "Bank No": 8,
-            "Invoice Date": 14, "CFDI Folio": 38, "Status": 14,
+            "Invoice Date": 14, "CFDI Folio": 38, "Status": 14, "Comprobado el": 19,
         }
-        for nombre, ancho in anchos.items():
-            ws.set_column(columnas_df.index(nombre), columnas_df.index(nombre), ancho)
-        if not df_comp.empty:
-            fila_total = len(df_comp) + 1
-            ws.write(fila_total, 0, "Total", bold_fmt)
-            ws.write(fila_total, columnas_df.index("Expense Outflow Amt"),
-                     df_comp["Expense Outflow Amt"].dropna().sum(), money_fmt)
-            ws.write(fila_total, columnas_df.index("Propina"),
-                     df_comp["Propina"].dropna().sum(), money_fmt)
-            for nombre in ("IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap"):
-                ws.write(fila_total, columnas_df.index(nombre), df_comp[nombre].sum(), money_fmt)
+        for nombre_hoja, df_comp in hojas_comprobados:
+            df_comp.to_excel(writer, index=False, sheet_name=nombre_hoja)
+            ws = writer.sheets[nombre_hoja]
+            for col_idx, titulo in enumerate(encabezados):
+                ws.write(0, col_idx, titulo, header_fmt)
+            for nombre in columnas_dinero:
+                col_idx = columnas_df.index(nombre)
+                ws.set_column(col_idx, col_idx, 16, money_fmt)
+            for nombre, ancho in anchos.items():
+                ws.set_column(columnas_df.index(nombre), columnas_df.index(nombre), ancho)
+            ws.freeze_panes(1, 0)
+            if not df_comp.empty:
+                fila_total = len(df_comp) + 1
+                ws.write(fila_total, 0, "Total", bold_fmt)
+                ws.write(fila_total, columnas_df.index("Expense Outflow Amt"),
+                         df_comp["Expense Outflow Amt"].dropna().sum(), money_fmt)
+                ws.write(fila_total, columnas_df.index("Propina"),
+                         df_comp["Propina"].dropna().sum(), money_fmt)
+                for nombre in ("IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap"):
+                    ws.write(fila_total, columnas_df.index(nombre), df_comp[nombre].sum(), money_fmt)
 
-        no_necesarios = _en_orden_de_estado_de_cuenta(st.session_state.get("no_necesarios", []))
+        no_necesarios = ordenar_registros_por_fecha(st.session_state.get("no_necesarios", []))
         cols_nn = ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
         df_nn_todo = pd.DataFrame(no_necesarios)
         cols_nn_presentes = [c for c in cols_nn if c in df_nn_todo.columns]
@@ -2126,12 +2140,17 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
         cols_pend = ["Fecha", "Descripción", "Monto", "Saldo"]
         if bank_df is not None:
             df_pend_todo = bank_df[bank_df.index.map(lambda i: estados.get(i) == "pendiente")]
+            if "Fecha" in df_pend_todo.columns:
+                # Del más antiguo al más reciente (a igual fecha, el orden del estado de cuenta).
+                df_pend_todo = df_pend_todo.iloc[
+                    pd.to_datetime(df_pend_todo["Fecha"], errors="coerce").argsort(kind="stable")
+                ]
             cols_pend_presentes = [c for c in cols_pend if c in df_pend_todo.columns]
         else:
             df_pend_todo = pd.DataFrame(columns=cols_pend)
             cols_pend_presentes = cols_pend
         (df_pend_todo[cols_pend_presentes] if cols_pend_presentes else df_pend_todo).to_excel(
-            writer, index=False, sheet_name="Sin comprobar"
+            writer, index=False, sheet_name="Pendientes"
         )
 
     return output.getvalue()
@@ -2359,6 +2378,7 @@ with tab_pendientes:
                     "Material": material,
                     "Facturas": [factura],
                     "Solicitud": None,
+                    "Fecha Comprobación": _ahora_iso(),
                     "OrigenAutoMatch": True,
                     # Se queda en "pendiente_detalles" hasta completar esos datos en esa
                     # pestaña, en vez de darlo por "comprobado" de una vez.
@@ -2516,6 +2536,8 @@ with tab_detalles:
                             reg["Categoria"] = categoria_d
                             reg["Material"] = material_d
                             reg["DetallesPendientes"] = False
+                            # La comprobación queda completa hasta este momento.
+                            reg["Fecha Comprobación"] = _ahora_iso()
                             st.session_state.clasificacion_por_gasto[idx_d] = {
                                 "categoria": categoria_d, "material": material_d,
                             }
@@ -2562,8 +2584,9 @@ with tab_comprobados:
             data=_historial_excel_bytes(st.session_state.concatenados),
             file_name=f"Comprobaciones_{datetime.datetime.now().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Mismo formato «Details» que la bitácora de solicitudes; incluye también "
-                 "las hojas «No necesarios» y «Sin comprobar».",
+            help="Formato «Details». Incluye 4 hojas: «Comprobados por fecha» (por fecha del gasto), "
+                 "«Comprobados por comprobación» (en el orden en que se fueron comprobando), "
+                 "«No necesarios» y «Pendientes».",
             key="btn_descargar_historial_comprobados",
         )
         st.divider()
@@ -2716,9 +2739,9 @@ with tab_resumen:
     st.divider()
     st.markdown("##### 📥 Descargar Excel del historial")
     st.caption(
-        "Mismo formato «Details» que la bitácora de solicitudes, con todos los gastos "
-        "comprobados (vengan o no de una solicitud), más las hojas «No necesarios» y "
-        "«Sin comprobar»."
+        "Formato «Details», con todos los gastos comprobados (vengan o no de una solicitud) en dos hojas: "
+        "«Comprobados por fecha» (del gasto más antiguo al más reciente) y «Comprobados por comprobación» "
+        "(en el orden en que se fueron comprobando, con la fecha y hora de cada uno); más «No necesarios» y «Pendientes»."
     )
 
     if st.session_state.concatenados or st.session_state.no_necesarios:
