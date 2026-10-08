@@ -51,3 +51,41 @@ def test_desglose_por_dia_mas_reciente_primero():
 def test_semana_cuando_la_consulta_es_lunes():
     r = resumen_gasto_bitacora([_sol("2026-10-04", 7), _sol("2026-10-05", 3)], D(2026, 10, 5))
     assert r["inicio_semana"] == D(2026, 10, 5) and r["semana"] == 3 and r["dia"] == 3
+
+
+# ---- Orden de las hojas de comprobados ----
+from matching import ordenar_registros_por_comprobacion, ordenar_registros_por_fecha
+
+
+def _reg(idx, fecha, comprobado=None):
+    r = {"idx": idx, "Fecha Estado": fecha}
+    if comprobado:
+        r["Fecha Comprobación"] = comprobado
+    return r
+
+
+def test_orden_por_fecha_del_gasto_aunque_el_estado_de_cuenta_venga_al_reves():
+    # estado de cuenta del más reciente al más antiguo (idx 0 = más nuevo)
+    regs = [_reg(0, "2026-10-05"), _reg(1, "2026-10-01"), _reg(2, "2026-10-03"), _reg(3, "2026-10-03")]
+    assert [r["idx"] for r in ordenar_registros_por_fecha(regs)] == [1, 2, 3, 0]
+
+
+def test_orden_por_fecha_acepta_formatos_y_manda_ilegibles_al_final():
+    regs = [_reg(0, ""), _reg(1, "03/10/2026"), _reg(2, pd_ts := __import__("pandas").Timestamp("2026-10-02")), _reg(3, "basura")]
+    assert [r["idx"] for r in ordenar_registros_por_fecha(regs)] == [2, 1, 0, 3]
+
+
+def test_orden_por_comprobacion_usa_la_hora_y_los_viejos_sin_marca_van_primero():
+    regs = [
+        _reg(5, "2026-10-01", "2026-10-08T12:00:00"),
+        _reg(7, "2026-09-01"),                          # sin marca (guardado antes del campo)
+        _reg(2, "2026-10-09", "2026-10-08T09:30:00"),
+        _reg(1, "2026-09-02"),                          # sin marca: conserva su orden relativo
+    ]
+    assert [r["idx"] for r in ordenar_registros_por_comprobacion(regs)] == [7, 1, 2, 5]
+
+
+def test_fecha_iso_no_se_voltea_como_dia_mes():
+    # 2026-10-03 debe ser 3 de octubre (no 10 de marzo) y 2026-03-10 el 10 de marzo.
+    regs = [_reg(0, "2026-10-03"), _reg(1, "2026-03-10"), _reg(2, "03/10/2026")]
+    assert [r["idx"] for r in ordenar_registros_por_fecha(regs)] == [1, 0, 2]
