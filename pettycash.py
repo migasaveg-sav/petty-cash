@@ -1485,6 +1485,15 @@ def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> N
         )
 
 
+def _en_orden_de_estado_de_cuenta(registros: list[dict]) -> list[dict]:
+    """Ordena registros (comprobados, no necesarios) según la posición del movimiento
+    en el estado de cuenta (`idx`, la fila del archivo del banco), para que el Excel
+    siga el mismo orden en que se realizaron los gastos y no el orden en que se fueron
+    comprobando. `sorted` es estable: si varios registros comparten `idx` conservan su
+    orden relativo, y los que no traen `idx` se van al final."""
+    return sorted(registros, key=lambda r: (r.get("idx") is None, r.get("idx") if r.get("idx") is not None else 0))
+
+
 # ============================================================
 # BITÁCORA DE SOLICITUDES DE REEMBOLSO
 # ============================================================
@@ -1623,7 +1632,7 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
         # (como "Pendiente detalles"), este Excel de la bitácora cubre prácticamente
         # lo mismo que el de "Resumen y descargas"; se agregan estas dos hojas para
         # que sea igual de completo sin tener que descargar los dos por separado.
-        no_necesarios = st.session_state.get("no_necesarios", [])
+        no_necesarios = _en_orden_de_estado_de_cuenta(st.session_state.get("no_necesarios", []))
         cols_nn = ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
         df_nn_todo = pd.DataFrame(no_necesarios)
         cols_nn_presentes = [c for c in cols_nn if c in df_nn_todo.columns]
@@ -1703,7 +1712,8 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
     ]
 
     filas = []
-    for registro in concatenados:
+    # Mismo orden que el estado de cuenta (no el orden en que se fue comprobando cada gasto).
+    for registro in _en_orden_de_estado_de_cuenta(concatenados):
         admin = _datos_admin(registro)
         # Sin solicitud vinculada no hay número de solicitud -se usa el número del
         # movimiento bancario como identificador de la fila, para no dejarla en blanco.
@@ -1778,7 +1788,7 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
             for nombre in ("IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap"):
                 ws.write(fila_total, columnas_df.index(nombre), df_comp[nombre].sum(), money_fmt)
 
-        no_necesarios = st.session_state.get("no_necesarios", [])
+        no_necesarios = _en_orden_de_estado_de_cuenta(st.session_state.get("no_necesarios", []))
         cols_nn = ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
         df_nn_todo = pd.DataFrame(no_necesarios)
         cols_nn_presentes = [c for c in cols_nn if c in df_nn_todo.columns]
