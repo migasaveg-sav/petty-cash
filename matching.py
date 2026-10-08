@@ -3,6 +3,7 @@ resúmenes por estado. Lógica pura, sin Streamlit.
 """
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
 import pandas as pd
@@ -98,6 +99,75 @@ def resumen_estados(df: pd.DataFrame, estados: dict[int, str]) -> dict[str, dict
         total = float(sub["Monto"].abs().sum()) if not sub.empty else 0.0
         resumen[estado] = {"count": len(idxs), "total": total}
     return resumen
+
+
+# Monto acumulado de gasto a partir del cual se debe solicitar el reembolso (caja chica).
+LIMITE_REEMBOLSO_DEFAULT = 50000.0
+
+
+def _fecha_de_solicitud(sol: dict) -> datetime.date | None:
+    """Fecha del gasto registrado en la bitácora (guardada como texto ISO AAAA-MM-DD,
+    o ya como date). None si no la tiene o no se puede leer -p. ej. solicitudes
+    registradas antes de que existiera este campo-."""
+    valor = sol.get("Fecha")
+    if isinstance(valor, datetime.datetime):
+        return valor.date()
+    if isinstance(valor, datetime.date):
+        return valor
+    if isinstance(valor, str) and valor.strip():
+        try:
+            return datetime.date.fromisoformat(valor.strip()[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _monto_de_solicitud(sol: dict) -> float:
+    try:
+        return float(sol.get("Monto") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def resumen_gasto_bitacora(solicitudes: list[dict], fecha_consulta: datetime.date) -> dict[str, Any]:
+    """Gasto TENTATIVO registrado en la bitácora de solicitudes hasta `fecha_consulta`:
+    el del propio día, el de la semana (lunes a `fecha_consulta`) y el acumulado de
+    todo lo registrado hasta esa fecha -es lo que se compara contra el límite de
+    reembolso-. Las solicitudes sin fecha (anteriores a este campo) no se pueden ubicar
+    en un día ni semana, pero sí cuentan en el acumulado (y se reportan en `sin_fecha`).
+    Los registros con fecha posterior a la de consulta no se incluyen.
+    Devuelve además `por_dia`: lista [(fecha, total, cantidad)] más reciente primero."""
+    inicio_semana = fecha_consulta - datetime.timedelta(days=fecha_consulta.weekday())
+    dia = semana = acumulado = 0.0
+    n_dia = n_semana = n_acumulado = n_sin_fecha = 0
+    por_dia: dict[datetime.date, list] = {}
+    for sol in solicitudes:
+        monto = _monto_de_solicitud(sol)
+        fecha = _fecha_de_solicitud(sol)
+        if fecha is None:
+            acumulado += monto
+            n_acumulado += 1
+            n_sin_fecha += 1
+            continue
+        if fecha > fecha_consulta:
+            continue
+        acumulado += monto
+        n_acumulado += 1
+        acum_dia = por_dia.setdefault(fecha, [0.0, 0])
+        acum_dia[0] += monto
+        acum_dia[1] += 1
+        if fecha >= inicio_semana:
+            semana += monto
+            n_semana += 1
+        if fecha == fecha_consulta:
+            dia += monto
+            n_dia += 1
+    return {
+        "dia": round(dia, 2), "semana": round(semana, 2), "acumulado": round(acumulado, 2),
+        "n_dia": n_dia, "n_semana": n_semana, "n_acumulado": n_acumulado, "sin_fecha": n_sin_fecha,
+        "inicio_semana": inicio_semana,
+        "por_dia": [(f, round(v[0], 2), v[1]) for f, v in sorted(por_dia.items(), reverse=True)],
+    }
 
 
 def diferencia_gasto_facturas(
