@@ -101,6 +101,45 @@ def resumen_estados(df: pd.DataFrame, estados: dict[int, str]) -> dict[str, dict
     return resumen
 
 
+def _fecha_movimiento(registro: dict) -> pd.Timestamp:
+    """Fecha del movimiento bancario de un registro (puede ser Timestamp, texto ISO o
+    DD/MM/AAAA según venga de la sesión o de un .json). NaT si no se puede leer."""
+    valor = registro.get("Fecha Estado")
+    if valor is None or valor == "":
+        return pd.NaT
+    try:
+        # Ojo: con dayfirst=True pandas también voltea fechas ISO (2026-10-03 -> 3 de
+        # marzo), así que sólo se usa en texto que NO empieza con AAAA-: "03/10/2026"
+        # es formato mexicano DD/MM/AAAA, no MM/DD/AAAA.
+        es_texto_no_iso = isinstance(valor, str) and not valor.strip()[:4].isdigit()
+        return pd.to_datetime(valor, errors="coerce", dayfirst=es_texto_no_iso)
+    except (TypeError, ValueError):
+        return pd.NaT
+
+
+def ordenar_registros_por_fecha(registros: list[dict]) -> list[dict]:
+    """Del gasto más antiguo al más reciente (fecha del movimiento en el estado de
+    cuenta); a igual fecha, por la posición del movimiento en el estado de cuenta
+    (`idx`). Los que no tienen una fecha legible van al final, también por `idx`."""
+    def clave(r: dict):
+        f = _fecha_movimiento(r)
+        idx = r.get("idx")
+        idx = idx if isinstance(idx, (int, float)) else 10**9
+        return (pd.isna(f), f if not pd.isna(f) else pd.Timestamp.min, idx)
+    return sorted(registros, key=clave)
+
+
+def ordenar_registros_por_comprobacion(registros: list[dict]) -> list[dict]:
+    """En el orden en que se fueron comprobando (campo `Fecha Comprobación`, texto ISO).
+    Los registros que no lo traen -guardados antes de que existiera ese campo- se
+    consideran los más antiguos y conservan su orden original en la lista; a igual
+    fecha también se respeta el orden original (`sorted` es estable)."""
+    def clave(r: dict):
+        ts = r.get("Fecha Comprobación") or ""
+        return (bool(ts), str(ts))
+    return sorted(registros, key=clave)
+
+
 # Monto acumulado de gasto a partir del cual se debe solicitar el reembolso (caja chica).
 LIMITE_REEMBOLSO_DEFAULT = 50000.0
 
