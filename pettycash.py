@@ -645,6 +645,15 @@ def _ahora_iso() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+def _nombre_archivo_avance() -> str:
+    """Nombre del .json de avance: «AVANCE PETTY CASH AAAA-MM-DD HH-MM.json». La hora usa
+    guion (no «:») porque los dos puntos no son válidos en nombres de archivo de Windows.
+    Se calcula cuando la página se dibuja, no en el instante exacto del clic (Streamlit
+    no permite calcularlo al hacer clic), así que puede diferir por unos minutos si la
+    página estuvo abierta sin actividad."""
+    return f"AVANCE PETTY CASH {datetime.datetime.now().strftime('%Y-%m-%d %H-%M')}.json"
+
+
 def _marcar_guardado() -> None:
     """on_click de cualquier botón de descarga del avance (.json): registra la hora
     para el aviso de "llevas X min sin guardar" (ver la barra de guardado en el
@@ -844,7 +853,7 @@ with st.sidebar:
         st.download_button(
             "📥 Descargar avance (.json)",
             data=sesion_a_json_bytes(_state_snapshot()),
-            file_name=f"avance_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            file_name=_nombre_archivo_avance(),
             mime="application/json",
             use_container_width=True,
             key="descargar_avance_sidebar",
@@ -1522,7 +1531,7 @@ def _mostrar_barra_guardado() -> None:
         st.download_button(
             "💾 Guardar progreso",
             data=sesion_a_json_bytes(_state_snapshot()),
-            file_name=f"avance_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            file_name=_nombre_archivo_avance(),
             mime="application/json",
             use_container_width=True,
             type="primary",
