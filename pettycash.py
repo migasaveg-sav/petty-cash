@@ -47,10 +47,12 @@ from matching import (
 )
 from persistence import (
     CAMPOS_SESION,
+    ahora_cdmx,
     autoguardar,
     borrar_autoguardado,
     cargar_sesion_dict,
     hay_autoguardado,
+    hoy_cdmx,
     restaurar_autoguardado,
     sesion_a_json_bytes,
     sesion_vacia,
@@ -642,7 +644,7 @@ def _autoguardar_si_activo() -> None:
 
 def _ahora_iso() -> str:
     """Marca de tiempo (texto ISO, hasta segundos) de cuándo se comprobó un gasto."""
-    return datetime.datetime.now().isoformat(timespec="seconds")
+    return ahora_cdmx().isoformat(timespec="seconds")
 
 
 def _nombre_archivo_avance() -> str:
@@ -651,7 +653,7 @@ def _nombre_archivo_avance() -> str:
     Se calcula cuando la página se dibuja, no en el instante exacto del clic (Streamlit
     no permite calcularlo al hacer clic), así que puede diferir por unos minutos si la
     página estuvo abierta sin actividad."""
-    return f"AVANCE PETTY CASH {datetime.datetime.now().strftime('%Y-%m-%d %H-%M')}.json"
+    return f"AVANCE PETTY CASH {ahora_cdmx().strftime('%Y-%m-%d %H-%M')}.json"
 
 
 def _marcar_guardado() -> None:
@@ -660,7 +662,7 @@ def _marcar_guardado() -> None:
     contenido principal). Streamlit llama a on_click antes de servir el archivo al
     navegador, en el mismo rerun del clic -suficiente para este aviso, que no
     necesita saber si la descarga terminó, sólo que se pidió-."""
-    st.session_state.ultimo_guardado = datetime.datetime.now()
+    st.session_state.ultimo_guardado = ahora_cdmx()
 
 
 def _limpiar_seleccion_tabla_pendientes() -> None:
@@ -1259,7 +1261,7 @@ def _mostrar_tarjetas_gasto_bitacora() -> None:
     col_fecha, col_limite, _relleno = st.columns([1, 1, 2])
     with col_fecha:
         fecha_consulta = st.date_input(
-            "📅 Consultar gasto hasta", value=datetime.date.today(), key="bitacora_fecha_consulta",
+            "📅 Consultar gasto hasta", value=hoy_cdmx(), key="bitacora_fecha_consulta",
             help="Los totales incluyen lo registrado hasta esta fecha.",
         )
     with col_limite:
@@ -1362,7 +1364,7 @@ def _mostrar_seccion_solicitudes() -> None:
                 number_of_people = st.number_input("Number of people", min_value=0, step=1, key=f"sol_people_{v}")
             with c9:
                 fecha_gasto = st.date_input(
-                    "Fecha del gasto", value=datetime.date.today(), key=f"sol_fecha_{v}",
+                    "Fecha del gasto", value=hoy_cdmx(), key=f"sol_fecha_{v}",
                     help="Día en que se hizo el gasto; con ella se calculan el gasto del día y de la semana.",
                 )
             with c10:
@@ -1487,7 +1489,7 @@ def _mostrar_seccion_solicitudes() -> None:
             st.download_button(
                 "📥 Descargar bitácora (formato Details, .xlsx)",
                 data=_bitacora_a_excel_bytes(st.session_state.solicitudes, st.session_state.concatenados),
-                file_name=f"bitacora_caja_chica_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                file_name=f"bitacora_caja_chica_{ahora_cdmx().strftime('%Y%m%d_%H%M')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="btn_descargar_solicitudes",
             )
@@ -1513,7 +1515,7 @@ def _mostrar_barra_guardado() -> None:
             )
         else:
             minutos_sin_guardar = int(
-                (datetime.datetime.now() - st.session_state.ultimo_guardado).total_seconds() // 60
+                (ahora_cdmx() - st.session_state.ultimo_guardado).total_seconds() // 60
             )
             if minutos_sin_guardar < 10:
                 texto_transcurrido = "menos de 1 minuto" if minutos_sin_guardar == 0 else f"{minutos_sin_guardar} min"
@@ -1826,7 +1828,7 @@ def dialog_trabajar_gasto(idxs: list[int], solicitud_id: int | None = None) -> N
 
     with st.expander("✏️ Agregar comprobación manual (sin XML)"):
         with st.form(f"manual_form_{clave_grupo}", clear_on_submit=True):
-            mf_fecha = st.date_input("Fecha de factura", value=datetime.date.today())
+            mf_fecha = st.date_input("Fecha de factura", value=hoy_cdmx())
             mf_uuid = st.text_input("UUID (opcional)")
             mf_concepto = st.text_input("Concepto/Descripción")
             mf_rfc = st.text_input("RFC Emisor")
@@ -2591,7 +2593,7 @@ with tab_comprobados:
         st.download_button(
             label="📥 Descargar Excel del historial",
             data=_historial_excel_bytes(st.session_state.concatenados),
-            file_name=f"Comprobaciones_{datetime.datetime.now().strftime('%Y%m%d')}.xlsx",
+            file_name=f"Comprobaciones_{ahora_cdmx().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             help="Formato «Details». Incluye 4 hojas: «Comprobados por fecha» (por fecha del gasto), "
                  "«Comprobados por comprobación» (en el orden en que se fueron comprobando), "
@@ -2757,7 +2759,7 @@ with tab_resumen:
         st.download_button(
             label="📥 Descargar Excel (todo el historial)",
             data=_historial_excel_bytes(st.session_state.concatenados),
-            file_name=f"Comprobaciones_{datetime.datetime.now().strftime('%Y%m%d')}.xlsx",
+            file_name=f"Comprobaciones_{ahora_cdmx().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="btn_descargar_historial_resumen",
         )
