@@ -76,6 +76,22 @@ def _json_default(obj: Any) -> Any:
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
+# Hora de la Ciudad de México (UTC-6, sin horario de verano desde 2022). El servidor donde
+# corre la app (p. ej. Streamlit Cloud) suele estar en UTC, así que no se puede confiar en
+# `datetime.now()` a secas: después de las 6 pm de la CDMX ya marcaría el día siguiente.
+ZONA_CDMX = datetime.timezone(datetime.timedelta(hours=-6))
+
+
+def ahora_cdmx() -> datetime.datetime:
+    """Fecha y hora actuales en la CDMX (UTC-6), sin zona horaria adjunta (naive) para
+    poder compararlas y restarlas entre sí sin sorpresas."""
+    return datetime.datetime.now(ZONA_CDMX).replace(tzinfo=None)
+
+
+def hoy_cdmx() -> datetime.date:
+    return ahora_cdmx().date()
+
+
 def construir_sesion_dict(state: dict[str, Any]) -> dict[str, Any]:
     """Empaqueta todo el estado de trabajo (incluyendo el propio estado de cuenta) en
     un dict serializable. `state` es un dict plano equivalente a st.session_state
@@ -83,7 +99,7 @@ def construir_sesion_dict(state: dict[str, Any]) -> dict[str, Any]:
     df = state.get("bank_df")
     data: dict[str, Any] = {
         "version": 2,
-        "guardado_en": datetime.datetime.now().isoformat(timespec="seconds"),
+        "guardado_en": ahora_cdmx().isoformat(timespec="seconds"),
         "bank_df": df.to_dict(orient="split") if df is not None else None,
     }
     for campo in CAMPOS_SESION:
@@ -389,7 +405,7 @@ def autoguardar(state: dict[str, Any], db_path: str = DB_DEFAULT_PATH) -> None:
         conn.execute(
             "INSERT INTO autosave (id, payload, guardado_en) VALUES (1, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, guardado_en = excluded.guardado_en",
-            (payload, datetime.datetime.now().isoformat(timespec="seconds")),
+            (payload, ahora_cdmx().isoformat(timespec="seconds")),
         )
         conn.commit()
     finally:
