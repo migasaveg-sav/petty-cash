@@ -42,6 +42,8 @@ from matching import (
     ordenar_registros_por_fecha,
     calcular_matches_automaticos,
     checksum_reconciliacion,
+    diferencia_de_registro,
+    tiene_diferencia,
     resumen_estados,
     resumen_gasto_bitacora,
 )
@@ -1058,6 +1060,33 @@ def _eliminar_solicitud(solicitud_id: int) -> None:
 # ============================================================
 # BITÁCORA DE SOLICITUDES DE REEMBOLSO
 # ============================================================
+# Amarillo tenue con el que se resaltan, en los Excel de salida, los gastos que se
+# comprobaron con una diferencia (dentro de la tolerancia) entre el cargo y sus facturas.
+C_DIFERENCIA_AMARILLO = "#FFF2CC"
+
+
+def _resaltar_filas_excel(workbook, ws, df: pd.DataFrame, filas_resaltar: list[bool],
+                          columnas_dinero: list[str]) -> None:
+    """Reescribe con fondo amarillo tenue las filas de `df` marcadas en `filas_resaltar`
+    (la fila i de `df` está en la fila i+1 de la hoja, debajo del encabezado). Se
+    reescribe celda por celda porque xlsxwriter no permite cambiar el formato de una
+    celda ya escrita; las celdas vacías se escriben en blanco para que el color
+    cubra toda la fila."""
+    fmt_texto = workbook.add_format({"bg_color": C_DIFERENCIA_AMARILLO})
+    fmt_dinero = workbook.add_format({"bg_color": C_DIFERENCIA_AMARILLO, "num_format": "$#,##0.00"})
+    valores = df.astype(object).where(df.notna(), None).values.tolist()
+    for i, marcada in enumerate(filas_resaltar):
+        if not marcada:
+            continue
+        for j, columna in enumerate(df.columns):
+            fmt = fmt_dinero if columna in columnas_dinero else fmt_texto
+            valor = valores[i][j]
+            if valor is None or valor == "":
+                ws.write_blank(i + 1, j, None, fmt)
+            else:
+                ws.write(i + 1, j, valor, fmt)
+
+
 def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -> bytes:
     """Arma el Excel de la bitácora con el mismo formato/orden que la hoja "Details"
     de la plantilla que compartió el usuario: columnas A-I son los datos de la
@@ -1144,10 +1173,12 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
     ]
 
     filas = []
+    filas_resaltar: list[bool] = []
     for sol in solicitudes:
         registros = _registros_vinculados(sol)
         if not registros:
             filas.append(_fila_admin(sol, True))
+            filas_resaltar.append(False)
             continue
         primera_de_sol = True
         for registro in registros:
@@ -1157,6 +1188,7 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
                 fila = _fila_admin(sol, primera_de_sol)
                 fila.update(_comprobacion_de(sol, registro, factura, primera_registro))
                 filas.append(fila)
+                filas_resaltar.append(tiene_diferencia(registro))
                 primera_de_sol = False
 
     df = pd.DataFrame(filas, columns=columnas_df) if filas else pd.DataFrame(columns=columnas_df)
@@ -1187,6 +1219,9 @@ def _bitacora_a_excel_bytes(solicitudes: list[dict], concatenados: list[dict]) -
         }
         for nombre, ancho in anchos.items():
             ws.set_column(columnas_df.index(nombre), columnas_df.index(nombre), ancho)
+
+        # Gastos comprobados con diferencia (dentro de la tolerancia): fila en amarillo tenue.
+        _resaltar_filas_excel(workbook, ws, df, filas_resaltar, ["Expense Outflow Amt", "Reimbursement Cap"])
 
         # -------- Hojas extra: "No necesarios" y "Por comprobar" --------
         # Con los gastos emparejados automáticamente ya representados en "Details"
@@ -2035,14 +2070,14 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
         "Number of Days", "Total Number of People", "Employee Name", "Material",
         "Payment Date", "Expense Outflow Amt", "Propina", "Bank No", "Invoice Date", "CFDI Folio",
         "IVA", "ISR Retenido", "IVA Retenido", "ISH",
-        "Reimbursement Cap", "Status", "Comprobado el",
+        "Reimbursement Cap", "Status", "Comprobado el", "Diferencia",
     ]
     encabezados = [
         "No.", "Applicant", "Category", "Description", "Linked Request No.",
         "Number of Days", "Total Number of People", "Employee Name", "Material",
         "Payment Date", "Expense Outflow Amt", "Propina", "No.", "Invoice date", "CFDI Folio",
         "IVA", "ISR Retenido", "IVA Retenido", "ISH",
-        "Reimbursement Cap (With IVA)", "Status", "Comprobado el",
+        "Reimbursement Cap (With IVA)", "Status", "Comprobado el", "Diferencia",
     ]
 
     def _construir_filas(registros: list[dict]) -> list[dict]:
@@ -2053,6 +2088,7 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
         # movimiento bancario como identificador de la fila, para no dejarla en blanco.
         no_fila = admin["No_bitacora"] if admin["No_bitacora"] is not None else registro["idx"]
         status = "Pendiente detalles" if registro.get("DetallesPendientes") else "Comprobado"
+        con_diferencia = tiene_diferencia(registro)
         for i, factura in enumerate(registro.get("Facturas") or [None]):
             primera = i == 0
             f = factura or {}
@@ -2085,12 +2121,18 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
                 "Comprobado el": (
                     str(registro.get("Fecha Comprobación") or "").replace("T", " ") if primera else None
                 ),
+                # Cargo - facturas - propina; sólo en gastos con diferencia (el resto queda vacío).
+                "Diferencia": (
+                    diferencia_de_registro(registro) if (primera and con_diferencia) else None
+                ),
+                "_resaltar": con_diferencia,
             })
       return filas
 
     def _df_de(registros: list[dict]) -> pd.DataFrame:
         filas = _construir_filas(registros)
-        return pd.DataFrame(filas, columns=columnas_df) if filas else pd.DataFrame(columns=columnas_df)
+        cols = [*columnas_df, "_resaltar"]
+        return pd.DataFrame(filas, columns=cols) if filas else pd.DataFrame(columns=cols)
 
     # Dos vistas del mismo historial: por fecha del gasto (para ver cómo se fue gastando)
     # y por fecha de comprobación (para ver cuánto se ha ido comprobando/pagando y cuándo).
@@ -2109,7 +2151,7 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
         money_fmt = workbook.add_format({"num_format": "$#,##0.00"})
         bold_fmt = workbook.add_format({"bold": True})
 
-        columnas_dinero = ["Expense Outflow Amt", "Propina", "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap"]
+        columnas_dinero = ["Expense Outflow Amt", "Propina", "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap", "Diferencia"]
         anchos = {
             "No": 6, "Applicant": 14, "Category": 24, "Description": 26,
             "Linked Request No": 24, "Number of Days": 12, "Total Number of People": 14,
@@ -2117,6 +2159,8 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
             "Invoice Date": 14, "CFDI Folio": 38, "Status": 14, "Comprobado el": 19,
         }
         for nombre_hoja, df_comp in hojas_comprobados:
+            filas_resaltar = df_comp["_resaltar"].astype(bool).tolist()
+            df_comp = df_comp.drop(columns="_resaltar")
             df_comp.to_excel(writer, index=False, sheet_name=nombre_hoja)
             ws = writer.sheets[nombre_hoja]
             for col_idx, titulo in enumerate(encabezados):
@@ -2127,6 +2171,8 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
             for nombre, ancho in anchos.items():
                 ws.set_column(columnas_df.index(nombre), columnas_df.index(nombre), ancho)
             ws.freeze_panes(1, 0)
+            # Gastos comprobados con diferencia (dentro de la tolerancia): fila en amarillo tenue.
+            _resaltar_filas_excel(workbook, ws, df_comp, filas_resaltar, columnas_dinero)
             if not df_comp.empty:
                 fila_total = len(df_comp) + 1
                 ws.write(fila_total, 0, "Total", bold_fmt)
@@ -2136,6 +2182,8 @@ def _historial_excel_bytes(concatenados: list[dict]) -> bytes:
                          df_comp["Propina"].dropna().sum(), money_fmt)
                 for nombre in ("IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap"):
                     ws.write(fila_total, columnas_df.index(nombre), df_comp[nombre].sum(), money_fmt)
+                ws.write(fila_total, columnas_df.index("Diferencia"),
+                         df_comp["Diferencia"].dropna().sum(), money_fmt)
 
         no_necesarios = ordenar_registros_por_fecha(st.session_state.get("no_necesarios", []))
         cols_nn = ["Fecha Estado", "Descripción Estado", "Monto Estado", "Categoria", "Material"]
@@ -2597,7 +2645,8 @@ with tab_comprobados:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             help="Formato «Details». Incluye 4 hojas: «Comprobados por fecha» (por fecha del gasto), "
                  "«Comprobados por comprobación» (en el orden en que se fueron comprobando), "
-                 "«No necesarios» y «Pendientes».",
+                 "«No necesarios» y «Pendientes». Los gastos comprobados con una diferencia "
+                 f"(hasta {money(DIFERENCIA_ACEPTABLE)}) salen resaltados en amarillo tenue.",
             key="btn_descargar_historial_comprobados",
         )
         st.divider()
