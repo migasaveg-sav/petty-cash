@@ -89,3 +89,41 @@ def test_fecha_iso_no_se_voltea_como_dia_mes():
     # 2026-10-03 debe ser 3 de octubre (no 10 de marzo) y 2026-03-10 el 10 de marzo.
     regs = [_reg(0, "2026-10-03"), _reg(1, "2026-03-10"), _reg(2, "03/10/2026")]
     assert [r["idx"] for r in ordenar_registros_por_fecha(regs)] == [1, 0, 2]
+
+
+# ---- Tolerancia de 50 centavos y resaltado de diferencias ----
+from matching import (  # noqa: E402
+    DIFERENCIA_ACEPTABLE as _TOL,
+    calcular_matches_automaticos as _cma,
+    diferencia_de_registro,
+    tiene_diferencia,
+)
+
+
+def _reg_dif(monto, totales, propina=0.0):
+    return {"Monto Estado": monto, "Facturas": [{"Monto Total": t} for t in totales], "Propina": propina}
+
+
+def test_tolerancia_es_50_centavos():
+    assert _TOL == 0.50
+
+
+def test_tiene_diferencia():
+    assert not tiene_diferencia(_reg_dif(-100.00, [100.00]))
+    assert tiene_diferencia(_reg_dif(-100.00, [99.70]))
+    assert tiene_diferencia(_reg_dif(-100.00, [100.50]))
+    # la propina cuenta como parte de lo comprobado
+    assert not tiene_diferencia(_reg_dif(-110.00, [100.00], propina=10.0))
+    assert diferencia_de_registro(_reg_dif(-100.00, [99.70])) == 0.30
+
+
+def test_match_automatico_exacto_hasta_50_centavos():
+    import pandas as pd
+    df = pd.DataFrame({"Monto": [-100.50, -200.51]}, index=[0, 1])
+    pool = [
+        {"_id": "A", "Monto Total": 100.00},
+        {"_id": "B", "Monto Total": 200.00},
+    ]
+    res = {s["idx"]: s for s in _cma(df, [0, 1], pool, {})}
+    assert res[0]["tipo"] == "exacto" and res[0]["diferencia"] == 0.50
+    assert res[1]["tipo"] == "revision" and res[1]["diferencia"] == 0.51
