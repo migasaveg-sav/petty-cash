@@ -18,10 +18,11 @@ UMBRAL_SUGERENCIA_PCT = 0.30
 # que todavía se considera "cuadrado" -tanto para clasificar una sugerencia del
 # emparejamiento automático como "exacto" (en vez de "a revisar"), como para que el
 # diálogo "Trabajar gasto" deje comprobar un gasto, como para el checksum de
-# reconciliación (qué comprobados quedan "descuadrados"). Antes era 1 centavo (0.01);
-# a petición del usuario ahora tolera hasta 5 centavos (0.05) de diferencia por
-# redondeos menores, sin exigir que cuadre al centavo exacto.
-DIFERENCIA_ACEPTABLE = 0.05
+# reconciliación (qué comprobados quedan "descuadrados"). Antes era 1 centavo (0.01),
+# luego 5 centavos (0.05); a petición del usuario ahora tolera hasta 50 centavos
+# (0.50) de diferencia, y los gastos que se comprueban con una diferencia se
+# resaltan en amarillo tenue en el Excel de salida (ver `tiene_diferencia`).
+DIFERENCIA_ACEPTABLE = 0.50
 
 ESTADOS = ("pendiente", "pendiente_detalles", "comprobado", "no_necesario")
 
@@ -221,6 +222,22 @@ def diferencia_gasto_facturas(
     nunca cuadraría contra su(s) factura(s)-. Redondeada a centavos."""
     suma_facturas = sum(f.get("Monto Total", 0.0) for f in facturas) + (propina or 0.0)
     return round(abs(monto_gasto) - suma_facturas, 2)
+
+
+def diferencia_de_registro(registro: dict[str, Any]) -> float:
+    """Diferencia (gasto - facturas - propina) de un registro de `concatenados`."""
+    return diferencia_gasto_facturas(
+        registro.get("Monto Estado", 0.0),
+        registro.get("Facturas", []),
+        registro.get("Propina", 0.0),
+    )
+
+
+def tiene_diferencia(registro: dict[str, Any]) -> bool:
+    """True si el registro se comprobó con una diferencia distinta de cero (aunque esté
+    dentro de la tolerancia). Se usa para resaltar esos gastos en el Excel de salida.
+    La diferencia ya viene redondeada a centavos, así que cualquier valor != 0 cuenta."""
+    return abs(diferencia_de_registro(registro)) >= 0.005
 
 
 def checksum_reconciliacion(
