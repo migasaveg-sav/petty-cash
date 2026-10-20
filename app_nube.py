@@ -518,11 +518,38 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
     filas = ev.selection.rows if ev and ev.selection else []
     if filas and not cerrado:
         sel = vista.iloc[filas]
-        b1, b2, _ = st.columns([1.4, 1.4, 3])
+        solo_pend = not bool((sel["estado"] != "pendiente").any())
+        mismo_mes = sel["periodo_id"].nunique() == 1
+        b0, b1, b2 = st.columns([1.6, 1.4, 1.4])
+        if b0.button("🔗 Comprobar seleccionados", type="primary", key="mov_cmp", disabled=not (solo_pend and mismo_mes)):
+            _comprobar_desde_estado(sb, cuenta, periodo, sel)
+        if not solo_pend:
+            st.caption("Para comprobar, selecciona solo movimientos pendientes.")
+        elif not mismo_mes:
+            st.caption("Para comprobar juntos, los movimientos deben ser del mismo mes.")
+        else:
+            st.caption("Se creará una solicitud nueva con estos movimientos y se abrirá la ventana de comprobación.")
         if b1.button("🚫 Marcar no necesario", key="mov_nn", disabled=bool((sel["estado"] != "pendiente").any())):
             _cambiar(sb, sel["id"].tolist(), "no_necesario")
         if b2.button("↩️ Regresar a pendiente", key="mov_pend", disabled=bool((sel["estado"] != "no_necesario").any())):
             _cambiar(sb, sel["id"].tolist(), "pendiente")
+
+
+def _comprobar_desde_estado(sb, cuenta: dict, periodo: dict, sel: pd.DataFrame) -> None:
+    """Crea una solicitud con los movimientos elegidos y abre directamente el paso 2 de la comprobación."""
+    try:
+        fecha = pd.to_datetime(sel["fecha"]).min().date()
+        desc = " / ".join(dict.fromkeys(sel["descripcion"].astype(str)))[:200]
+        per_id = sel["periodo_id"].iloc[0]
+        sol = db.crear_solicitud(sb, cuenta["id"], per_id, {
+            "fecha": fecha, "monto": round(float(sel["monto"].abs().sum()), 2), "description": desc})
+    except db.ErrorNube as e:
+        st.error(str(e))
+        return
+    _limpiar_comprobacion()
+    st.session_state.comprobando = sol
+    st.session_state.cmp_movs = sel["id"].tolist()
+    st.rerun()
 
 
 def _cambiar(sb, ids: list[str], estado: str) -> None:
