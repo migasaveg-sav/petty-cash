@@ -76,7 +76,14 @@ def iniciar_sesion(sb, email: str, password: str) -> str:
     try:
         resp = sb.auth.sign_in_with_password({"email": email.strip(), "password": password})
     except Exception as e:
-        raise ErrorNube("Correo o contraseña incorrectos.") from e
+        texto = str(e)
+        bajo = texto.lower()
+        if "invalid login credentials" in bajo or "invalid_credentials" in bajo:
+            raise ErrorNube("Correo o contraseña incorrectos.") from e
+        if "not confirmed" in bajo:
+            raise ErrorNube("El correo aún no está confirmado. En Supabase marca el usuario como confirmado.") from e
+        raise ErrorNube("No se pudo iniciar sesión por un problema de conexión o configuración "
+                        f"(revisa SUPABASE_URL y SUPABASE_KEY en Secrets). Detalle: {texto[:200]}") from e
     if not getattr(resp, "user", None):
         raise ErrorNube("Correo o contraseña incorrectos.")
     return str(resp.user.id)
@@ -442,3 +449,40 @@ def descargar_adjunto(sb, ruta: str) -> bytes:
         return sb.storage.from_(BUCKET).download(ruta)
     except Exception as e:
         raise ErrorNube(f"No se pudo descargar el archivo: {_mensaje(e)}") from e
+
+
+# ----------------------------------------------------------------------
+# Envío del estado de cuenta a revisión (005_envios_estado_cuenta.sql)
+# ----------------------------------------------------------------------
+def enviar_estado_cuenta(sb, periodo_id: str, nota: str | None = None) -> str:
+    """Envía a revisión las solicitudes del mes con gastos comprobados y guarda la foto del avance."""
+    return _ejecutar(sb.rpc("enviar_estado_cuenta", {"p_periodo": periodo_id, "p_nota": nota}))
+
+
+def listar_envios(sb, cuenta_id: str | None = None, periodo_id: str | None = None) -> list[dict]:
+    q = sb.table("envios_estado_cuenta").select("*")
+    if cuenta_id:
+        q = q.eq("cuenta_id", cuenta_id)
+    if periodo_id:
+        q = q.eq("periodo_id", periodo_id)
+    return _ejecutar(q.order("enviado_en", desc=True)) or []
+
+
+COLUMNAS_REVISION = [
+    "id", "cuenta_id", "periodo_id", "fecha", "descripcion", "monto", "saldo", "estado", "gasto_id", "categoria",
+    "material", "monto_estado", "suma_facturas", "diferencia", "tiene_diferencia", "propina", "solicitud_id",
+    "solicitud_numero", "solicitud_estado", "employee_name", "solicitud_descripcion", "request_number",
+    "lote_id", "lote_numero", "lote_estado", "fecha_pago", "referencia_pago",
+]
+
+
+def listar_movimientos_revision(sb, cuenta_id: str, periodo_id: str) -> pd.DataFrame:
+    """Todo el estado de cuenta del mes, un renglón por movimiento, con su solicitud/gasto/lote."""
+    def construir():
+        return (sb.table("v_movimientos_revision").select("*").eq("cuenta_id", cuenta_id)
+                .eq("periodo_id", periodo_id).order("fecha", desc=False).order("id", desc=False))
+    filas = _paginado(construir)
+    df = pd.DataFrame(filas, columns=COLUMNAS_REVISION) if filas else pd.DataFrame(columns=COLUMNAS_REVISION)
+    if not df.empty:
+        df["monto"] = df["monto"].astype(float)
+    return df
