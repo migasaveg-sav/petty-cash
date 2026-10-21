@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 import adjuntos as adj
+import estilos
 import nube_db as db
 from bank import BankStatementError, cargar_estado_cuenta
 from catalog import CATEGORIAS_SOLICITUD_DEFAULT, EMPLEADOS_DEFAULT, MATERIALES_DEFAULT
@@ -29,16 +30,7 @@ ESTADOS_SOLICITUD = {
 EDITABLES = ("borrador", "con_pendientes")
 
 st.set_page_config(page_title="Caja Chica — nube", page_icon="💼", layout="wide")
-st.markdown(
-    """<style>
-    .block-container {padding-top: 1.6rem; max-width: 1400px;}
-    div[data-testid="stMetric"] {background:#fff; border:1px solid #E3E8F0; border-radius:10px; padding:.6rem .9rem;}
-    .encabezado {display:flex; align-items:center; gap:.7rem; margin-bottom:.4rem;}
-    .encabezado .chip {background:linear-gradient(135deg,#2F5FE0,#192333); color:#fff; border-radius:10px; padding:.35rem .6rem; font-size:1.3rem;}
-    .encabezado h1 {margin:0; font-size:1.55rem;}
-    </style>""",
-    unsafe_allow_html=True,
-)
+estilos.aplicar()
 
 
 def money(x) -> str:
@@ -78,7 +70,7 @@ def _cliente():
 
 
 def _pantalla_login(sb) -> None:
-    st.markdown('<div class="encabezado"><span class="chip">💼</span><h1>Comprobación de Caja Chica</h1></div>', unsafe_allow_html=True)
+    st.markdown(estilos.encabezado(), unsafe_allow_html=True)
     _, centro, _ = st.columns([1, 1.2, 1])
     with centro:
         with st.form("login"):
@@ -154,9 +146,9 @@ def _tarjetas_gasto(sb, cuenta: dict) -> None:
     fecha = st.date_input("Consultar gasto hasta", value=hoy_cdmx(), key="fecha_consulta")
     res = resumen_gasto_bitacora([{"Fecha": s["fecha"], "Monto": s["monto_tentativo"]} for s in sols], fecha)
     c1, c2, c3 = st.columns(3)
-    c1.metric("Gasto del día", money(res["dia"]), f"{res['n_dia']} registro(s)", delta_color="off")
-    c2.metric("Gasto de la semana", money(res["semana"]), f"{res['n_semana']} registro(s)", delta_color="off")
-    c3.metric("Acumulado sin reembolso", money(res["acumulado"]), f"{res['n_acumulado']} registro(s)", delta_color="off")
+    c1.markdown(estilos.tarjeta("Gasto del día", estilos.money_html(res["dia"]), f"{res['n_dia']} registro(s)", "acento"), unsafe_allow_html=True)
+    c2.markdown(estilos.tarjeta("Gasto de la semana", estilos.money_html(res["semana"]), f"{res['n_semana']} registro(s)", "acento"), unsafe_allow_html=True)
+    c3.markdown(estilos.tarjeta("Acumulado sin reembolso", estilos.money_html(res["acumulado"]), f"{res['n_acumulado']} registro(s)", "rojo"), unsafe_allow_html=True)
     limite = cuenta.get("limite_reembolso")
     if limite:
         limite = float(limite)
@@ -198,10 +190,12 @@ def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
     for g in gastos:
         por_sol.setdefault(g["solicitud_id"], []).append(g)
 
+    st.markdown('<div class="bitacora-head"><div>#</div><div>Fecha</div><div>Monto</div><div>Categoría · Descripción</div>'
+                '<div>Estado</div><div>Comprobación</div></div>', unsafe_allow_html=True)
     for s in sols:
         editable = s["estado"] in EDITABLES and not cerrado
         gs = por_sol.get(s["id"], [])
-        with st.container(border=True):
+        with st.container(border=True, key=f"sol-{s['id']}"):
             top = st.columns([0.5, 1.1, 1.1, 2.6, 1.4, 1.6])
             top[0].markdown(f"**#{s['numero']}**")
             top[1].write(s["fecha"])
@@ -301,7 +295,7 @@ def _limpiar_comprobacion() -> None:
 
 def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
     st.button("← Volver a la bitácora", on_click=_limpiar_comprobacion, key="volver_cmp")
-    st.markdown(f"### 🔗 Comprobar solicitud #{sol['numero']}")
+    st.markdown(f"### 🔗 Comprobar solicitud #{sol['numero']}" if sol.get("id") else "### 🔗 Comprobar movimiento(s) del estado de cuenta")
     st.caption(f"{sol['fecha']} · {money_md(sol['monto_tentativo'])} (tentativo) · {sol.get('category') or '—'} · {sol.get('description') or ''}")
 
     # ---------- Paso 1: elegir el/los movimiento(s) del estado de cuenta ----------
@@ -452,7 +446,12 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
 
     if st.button("💾 Guardar gasto", type="primary", key="cmp_guardar"):
         subidos: list[str] = []
+        sol_nueva_id = None
         try:
+            if not sol.get("id"):  # viene del estado de cuenta: la solicitud se crea hasta guardar el gasto
+                datos_sol = {**sol["_datos"], "category": None if categoria == "—" else categoria,
+                             "material": None if material == "—" else material}
+                sol_nueva_id = db.crear_solicitud(sb, cuenta["id"], sol["_periodo_id"], datos_sol)["id"]
             mes = str(sol["fecha"])[:7]
             payload = []
             for f in facturas:
@@ -463,10 +462,15 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
                     subidos.append(ruta)
                     adjunto = {"ruta": ruta, **{k: info[k] for k in ("nombre_original", "bytes_original", "bytes_final", "sha256")}}
                 payload.append(db.factura_a_json(f["datos"], adjunto))
-            db.guardar_gasto(sb, sol["id"], elegidos, None if categoria == "—" else categoria,
+            db.guardar_gasto(sb, sol.get("id") or sol_nueva_id, elegidos, None if categoria == "—" else categoria,
                              None if material == "—" else material, propina, payload)
         except db.ErrorNube as e:
             db.borrar_adjuntos_huerfanos(sb, subidos)
+            if sol_nueva_id:
+                try:
+                    db.eliminar_solicitud(sb, sol_nueva_id)
+                except db.ErrorNube:
+                    pass
             st.error(str(e))
             return
         _limpiar_comprobacion()
@@ -504,7 +508,7 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
     c = st.columns(3)
     for col, (est, titulo) in zip(c, (("pendiente", "Pendientes"), ("comprobado", "Comprobados"), ("no_necesario", "No necesarios"))):
         sub = mes[mes["estado"] == est]
-        col.metric(f"{titulo} ({db.etiqueta_periodo(periodo)})", f"{len(sub)}", money(sub["monto"].abs().sum()), delta_color="off")
+        col.markdown(estilos.tarjeta(f"{titulo} ({db.etiqueta_periodo(periodo)})", f"{len(sub)}", estilos.money_html(sub["monto"].abs().sum()), est), unsafe_allow_html=True)
     f1, f2 = st.columns([1, 2])
     estado = f1.selectbox("Mostrar", ["pendiente", "comprobado", "no_necesario", "todos"], key="filtro_estado_mov")
     alcance = f2.radio("Periodo", ["Solo el mes seleccionado", "Todos los meses"], horizontal=True, key="alcance_mov")
@@ -514,7 +518,8 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
     vista = vista.reset_index(drop=True)
     ev = st.dataframe(vista[["fecha", "descripcion", "monto", "saldo", "estado"]], hide_index=True, use_container_width=True,
                       on_select="rerun", selection_mode="multi-row", key="tabla_mov",
-                      column_config={"monto": st.column_config.NumberColumn("Monto", format="$%.2f"), "saldo": st.column_config.NumberColumn("Saldo", format="$%.2f")})
+                      column_config={"fecha": "Fecha", "descripcion": "Descripción", "estado": "Estado",
+                                     "monto": st.column_config.NumberColumn("Monto", format="$%.2f"), "saldo": st.column_config.NumberColumn("Saldo", format="$%.2f")})
     filas = ev.selection.rows if ev and ev.selection else []
     if filas and not cerrado:
         sel = vista.iloc[filas]
@@ -536,18 +541,16 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
 
 
 def _comprobar_desde_estado(sb, cuenta: dict, periodo: dict, sel: pd.DataFrame) -> None:
-    """Crea una solicitud con los movimientos elegidos y abre directamente el paso 2 de la comprobación."""
-    try:
-        fecha = pd.to_datetime(sel["fecha"]).min().date()
-        desc = " / ".join(dict.fromkeys(sel["descripcion"].astype(str)))[:200]
-        per_id = sel["periodo_id"].iloc[0]
-        sol = db.crear_solicitud(sb, cuenta["id"], per_id, {
-            "fecha": fecha, "monto": round(float(sel["monto"].abs().sum()), 2), "description": desc})
-    except db.ErrorNube as e:
-        st.error(str(e))
-        return
+    """Abre directamente la comprobación de los movimientos elegidos. La solicitud se crea
+    (con estos datos) hasta que se guarda el gasto, para no dejar borradores vacíos."""
+    fecha = pd.to_datetime(sel["fecha"]).min().date()
+    desc = " / ".join(dict.fromkeys(sel["descripcion"].astype(str)))[:200]
+    monto = round(float(sel["monto"].abs().sum()), 2)
     _limpiar_comprobacion()
-    st.session_state.comprobando = sol
+    st.session_state.comprobando = {
+        "id": None, "numero": None, "fecha": str(fecha), "monto_tentativo": monto, "description": desc,
+        "category": None, "material": None, "_periodo_id": sel["periodo_id"].iloc[0],
+        "_datos": {"fecha": fecha, "monto": monto, "description": desc}}
     st.session_state.cmp_movs = sel["id"].tolist()
     st.rerun()
 
@@ -612,6 +615,135 @@ def _tab_lotes(sb, cuenta: dict, periodos: list[dict]) -> None:
 
 
 # ======================================================================
+# Pestaña: Enviados a comprobación (todo el estado de cuenta con su avance)
+# ======================================================================
+ICONO_MOV = {"comprobado": "🟢", "no_necesario": "⚪", "pendiente": "🟠"}
+NOMBRE_MOV = {"comprobado": "Comprobado", "no_necesario": "No necesario", "pendiente": "Pendiente"}
+NOMBRE_LOTE = {"por_pagar": "⏳ Por pagar", "pagado": "✅ Pagado", "anulado": "↩️ Anulado"}
+POR_PAGINA = 25
+
+
+def _fecha_cdmx(ts: str) -> str:
+    t = pd.to_datetime(ts, utc=True).tz_convert("America/Mexico_City")
+    return t.strftime("%Y-%m-%d %H:%M")
+
+
+def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
+    df = db.listar_movimientos_revision(sb, cuenta["id"], periodo["id"])
+    if df.empty:
+        st.info("Este mes todavía no tiene movimientos. Carga el estado de cuenta en la pestaña «Estado de cuenta».")
+        return
+    cuenta_est = df["estado"].value_counts().to_dict()
+    monto_est = df.assign(a=df["monto"].abs()).groupby("estado")["a"].sum().to_dict()
+    comp, nn, pend = (int(cuenta_est.get(k, 0)) for k in ("comprobado", "no_necesario", "pendiente"))
+    cols = st.columns(3)
+    for col, est, titulo, n in zip(cols, ("comprobado", "no_necesario", "pendiente"), ("Comprobados", "No necesarios", "Pendientes"), (comp, nn, pend)):
+        col.markdown(estilos.tarjeta(titulo, str(n), estilos.money_html(monto_est.get(est, 0)), est), unsafe_allow_html=True)
+    st.markdown(estilos.barra_progreso(comp, nn, pend), unsafe_allow_html=True)
+
+    # ---- Envío a revisión ----
+    por_enviar = df[(df["estado"] == "comprobado") & df["solicitud_estado"].isin(EDITABLES)]["solicitud_id"].nunique()
+    envios = db.listar_envios(sb, cuenta["id"], periodo["id"])
+    with st.container(border=True):
+        if envios:
+            u = envios[0]
+            st.markdown(f"**Último envío:** {_fecha_cdmx(u['enviado_en'])} · {u['comprobados']} comprobados, "
+                        f"{u['no_necesarios']} no necesarios, {u['pendientes']} pendientes · {u['solicitudes_enviadas']} solicitud(es) enviada(s)"
+                        + (f" · _{u['nota']}_" if u.get("nota") else ""))
+        else:
+            st.markdown("**Aún no has enviado este mes a revisión.**")
+        st.caption("Al enviar se mandan todas las solicitudes del mes que ya tienen gastos comprobados. El revisor verá el estado de cuenta completo, "
+                   "con lo comprobado, lo no necesario y lo que sigue pendiente, para saber cuánto falta.")
+        nota = st.text_input("Nota para el revisor (opcional)", key="env_nota", disabled=cerrado)
+        if st.button(f"📤 Enviar estado de cuenta a revisión ({por_enviar} solicitud(es) por enviar)", type="primary",
+                     key="btn_enviar_ec", disabled=cerrado or por_enviar == 0):
+            try:
+                db.enviar_estado_cuenta(sb, periodo["id"], nota)
+                if "env_nota" in st.session_state:
+                    del st.session_state["env_nota"]
+                _flash("Estado de cuenta enviado a revisión.")
+                st.rerun()
+            except db.ErrorNube as e:
+                st.error(str(e))
+        if por_enviar == 0 and not cerrado:
+            st.caption("No hay solicitudes con gastos comprobados por enviar. Comprueba gastos o espera a que el revisor devuelva alguno.")
+    if envios:
+        with st.expander(f"Historial de envíos ({len(envios)})"):
+            st.dataframe(pd.DataFrame([{
+                "Enviado": _fecha_cdmx(x["enviado_en"]), "Comprobados": x["comprobados"], "No necesarios": x["no_necesarios"],
+                "Pendientes": x["pendientes"], "Solicitudes": x["solicitudes_enviadas"], "Nota": x.get("nota") or ""} for x in envios]),
+                hide_index=True, use_container_width=True)
+
+    # ---- Desglose ----
+    st.markdown("##### Desglose del estado de cuenta")
+    f1, f2, f3 = st.columns([1.2, 2.4, 1])
+    filtro = f1.selectbox("Estado", ["Todos", "Comprobado", "No necesario", "Pendiente"], key="env_filtro")
+    texto = f2.text_input("🔎 Buscar por descripción", key="env_busca")
+    vista = df
+    if filtro != "Todos":
+        vista = vista[vista["estado"] == {v: k for k, v in NOMBRE_MOV.items()}[filtro]]
+    if texto.strip():
+        vista = vista[vista["descripcion"].str.contains(texto.strip(), case=False, na=False)]
+    paginas = max(1, -(-len(vista) // POR_PAGINA))
+    pagina = f3.selectbox("Página", list(range(1, paginas + 1)), key=f"env_pag_{filtro}_{texto}_{paginas}") if paginas > 1 else 1
+    st.caption(f"{len(vista)} movimiento(s). Haz clic en uno para ver toda su información.")
+    pag = vista.iloc[(pagina - 1) * POR_PAGINA: pagina * POR_PAGINA]
+    sol_ids = [x for x in pag["solicitud_id"].dropna().unique().tolist()]
+    gastos = {g["id"]: g for g in db.listar_gastos(sb, sol_ids)} if sol_ids else {}
+    for idx, r in pag.iterrows():
+        dif = bool(r["tiene_diferencia"]) if pd.notna(r["tiene_diferencia"]) else False
+        etiqueta = (f"{ICONO_MOV[r['estado']]} {r['fecha']}  ·  {r['descripcion']}  ·  {money_md(r['monto'])}  ·  {NOMBRE_MOV[r['estado']]}"
+                    + (f"  ·  Sol. #{int(r['solicitud_numero'])}" if pd.notna(r["solicitud_numero"]) else "") + ("  ·  🟡 diferencia" if dif else ""))
+        with st.container(key=f"mv-{r['estado']}{'-dif' if dif else ''}-{r['id']}"):
+            with st.expander(etiqueta):
+                _detalle_movimiento(sb, df, idx, r, gastos.get(r["gasto_id"]) if pd.notna(r["gasto_id"]) else None, cuenta, periodo, cerrado)
+
+
+def _detalle_movimiento(sb, df: pd.DataFrame, idx, r, g: dict | None, cuenta: dict, periodo: dict, cerrado: bool) -> None:
+    a, b, c = st.columns(3)
+    a.markdown("**🏦 Movimiento**")
+    a.write(f"{r['fecha']}  \n{r['descripcion']}")
+    a.write(f"Monto: {money_md(r['monto'])}" + (f"  \nSaldo: {money_md(r['saldo'])}" if pd.notna(r["saldo"]) else ""))
+    if r["estado"] == "no_necesario":
+        b.markdown("**Estado**")
+        b.write("Marcado como no necesario: no requiere comprobación.")
+        return
+    if r["estado"] == "pendiente":
+        b.markdown("**Estado**")
+        b.write("Aún sin comprobar.")
+        if not cerrado and b.button("🔗 Comprobar este movimiento", key=f"mvcmp_{r['id']}"):
+            _comprobar_desde_estado(sb, cuenta, periodo, df.loc[[idx]])
+        return
+    # comprobado
+    b.markdown(f"**🧾 Solicitud #{int(r['solicitud_numero'])}**")
+    b.write(ESTADOS_SOLICITUD.get(r["solicitud_estado"], r["solicitud_estado"]))
+    extra = [x for x in (r.get("employee_name"), r.get("request_number")) if x]
+    if extra:
+        b.caption(" · ".join(str(x) for x in extra))
+    if r.get("solicitud_descripcion"):
+        b.caption(str(r["solicitud_descripcion"]))
+    c.markdown("**💵 Gasto**")
+    c.write(f"{r.get('categoria') or '—'}" + (f" · {r['material']}" if r.get("material") else ""))
+    c.write(f"Cargo: {money_md(r['monto_estado'])}  \nFacturas: {money_md(r['suma_facturas'])}"
+            + (f"  \nPropina: {money_md(r['propina'])}" if float(r["propina"] or 0) else ""))
+    dif = float(r["diferencia"] or 0)
+    c.markdown(("🟡 " if r["tiene_diferencia"] else "") + f"Diferencia: **{money_md(dif)}**")
+    if pd.notna(r["lote_numero"]):
+        pago = f" · pagado el {r['fecha_pago']} (ref. {r['referencia_pago']})" if r["lote_estado"] == "pagado" else ""
+        st.info(f"🔒 Lote {int(r['lote_numero'])} · {NOMBRE_LOTE.get(r['lote_estado'], r['lote_estado'])}{pago}")
+    if g:
+        if len(g["movimientos"]) > 1:
+            st.caption(f"Este gasto cubre {len(g['movimientos'])} movimientos: "
+                       + "; ".join(f"{m['fecha']} {m['descripcion']} {money_md(m['monto'])}" for m in g["movimientos"]))
+        for f in g["facturas"]:
+            cols = st.columns([3.2, 1.2, 1])
+            cols[0].caption(f"🧾 {f.get('uuid_cfdi') or 'SIN-UUID'} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
+            cols[1].caption(money_md(f["monto_aplicado"]))
+            if f.get("adjunto") and cols[2].button("📎 Ver", key=f"venv_{g['id']}_{f['id']}"):
+                st.session_state.adj_ver = f["adjunto"]["ruta"]
+
+
+# ======================================================================
 # Revisor (Etapa 2 pendiente)
 # ======================================================================
 def _vista_revisor(sb) -> None:
@@ -622,7 +754,11 @@ def _vista_revisor(sb) -> None:
     for c in cuentas:
         sols = db.listar_solicitudes(sb, c["id"])
         cuenta_estados = pd.Series([s["estado"] for s in sols]).value_counts().to_dict() if sols else {}
-        filas.append({"Cuenta": c["nombre"], **{ESTADOS_SOLICITUD[k]: cuenta_estados.get(k, 0) for k in ESTADOS_SOLICITUD}})
+        envios = db.listar_envios(sb, c["id"])
+        u = envios[0] if envios else None
+        filas.append({"Cuenta": c["nombre"], **{ESTADOS_SOLICITUD[k]: cuenta_estados.get(k, 0) for k in ESTADOS_SOLICITUD},
+                      "Último envío": _fecha_cdmx(u["enviado_en"]) if u else "—",
+                      "Avance del envío": (f"{u['comprobados']} comprobados · {u['no_necesarios']} no necesarios · {u['pendientes']} pendientes" if u else "—")})
     st.dataframe(pd.DataFrame(filas), hide_index=True, use_container_width=True)
 
 
@@ -653,9 +789,10 @@ def main() -> None:
 
     cuenta = db.cargar_cuenta(sb, perfil["cuenta_id"]) if perfil and perfil.get("cuenta_id") else None
     cab = st.columns([5, 2, 1])
-    cab[0].markdown('<div class="encabezado"><span class="chip">💼</span><h1>Comprobación de Caja Chica</h1></div>', unsafe_allow_html=True)
+    cab[0].markdown(estilos.encabezado(), unsafe_allow_html=True)
     if perfil:
-        cab[1].markdown(f"**{perfil['nombre']}**  \n{'Revisor' if perfil['rol'] == 'revisor' else 'Aplicante · ' + (cuenta['nombre'] if cuenta else '')}")
+        rol_txt = "Revisor" if perfil["rol"] == "revisor" else "Aplicante · " + (cuenta["nombre"] if cuenta else "")
+        cab[1].markdown(f'<div class="usuario-chip"><b>{perfil["nombre"]}</b><br><small>{rol_txt}</small></div>', unsafe_allow_html=True)
     if cab[2].button("Salir", key="salir"):
         _salir(sb)
 
@@ -675,7 +812,7 @@ def main() -> None:
     actual = f"{hoy.year}-{hoy.month:02d}"
     etiquetas = [db.etiqueta_periodo(p) for p in periodos]
     with st.sidebar:
-        st.markdown(f"### 💼 {cuenta['nombre']}")
+        st.markdown(f'<div class="sidebar-header"><div class="sidebar-header-icon">💼</div><span>{cuenta["nombre"]}</span></div>', unsafe_allow_html=True)
         sel = st.selectbox("Mes", etiquetas, index=etiquetas.index(actual) if actual in etiquetas else 0, key="mes_sel")
         periodo = periodos[etiquetas.index(sel)]
         cerrado = cierre.get(periodo["id"]) == "cerrado"
@@ -688,15 +825,19 @@ def main() -> None:
         _pantalla_comprobar(sb, cuenta, st.session_state.comprobando, st.session_state.tol)
         return
 
-    # Radio horizontal en lugar de st.tabs: conserva la sección elegida después de cada acción.
-    secciones = ["🧾 Bitácora", "🏦 Estado de cuenta", "🚩 Pendientes devueltos", "💸 Lotes y pagos"]
-    vista = st.radio("Sección", secciones, horizontal=True, label_visibility="collapsed", key="seccion")
+    # Control de sección (en lugar de st.tabs) para conservar la sección elegida después de cada acción.
+    secciones = ["🧾 Bitácora", "🏦 Estado de cuenta", "📤 Enviados a comprobación", "🚩 Pendientes devueltos", "💸 Lotes y pagos"]
+    elegida = st.segmented_control("Sección", secciones, default=secciones[0], label_visibility="collapsed", key="seccion")
+    vista = elegida or st.session_state.get("_seccion_ult", secciones[0])
+    st.session_state["_seccion_ult"] = vista
     st.divider()
     if vista == secciones[0]:
         _tab_bitacora(sb, cuenta, periodo, cerrado)
     elif vista == secciones[1]:
         _tab_estado_cuenta(sb, cuenta, periodo, cerrado)
     elif vista == secciones[2]:
+        _tab_enviados(sb, cuenta, periodo, cerrado)
+    elif vista == secciones[3]:
         _tab_pendientes(sb, cuenta)
     else:
         _tab_lotes(sb, cuenta, periodos)
