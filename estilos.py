@@ -26,9 +26,10 @@ C_GRIS_INACTIVO = "#64748B"
 C_VERDE_OK = "#15803D"
 C_BITACORA_HEADER = "#DC143C"
 C_DIFERENCIA_AMARILLO = "#FFF2CC"
+C_PENDIENTE = "#7C3AED"
 
 TONOS = {  # color del borde izquierdo de las tarjetas según el estado
-    "pendiente": C_SLATE, "comprobado": C_VERDE_OK, "no_necesario": C_GRIS_INACTIVO,
+    "pendiente": C_SLATE, "comprobado": C_VERDE_OK, "no_necesario": C_GRIS_INACTIVO, "en_espera": C_PENDIENTE,
     "alerta": C_AMARILLO_ACENTO, "acento": C_ACENTO, "rojo": C_BITACORA_HEADER,
 }
 
@@ -142,12 +143,27 @@ def tarjeta(titulo: str, valor: str, sub: str = "", tono: str = "acento") -> str
             f'<div class="summary-count">{valor}</div><div class="summary-amount">{sub or "&nbsp;"}</div></div>')
 
 
-def barra_progreso(comprobados: int, no_necesarios: int, pendientes: int) -> str:
-    total = max(comprobados + no_necesarios + pendientes, 1)
+def barra_progreso(comprobados: int, no_necesarios: int, sin_comprobar: int, pendientes: int = 0) -> str:
+    total = max(comprobados + no_necesarios + sin_comprobar + pendientes, 1)
     p = lambda n: f"{n / total * 100:.2f}%"
     resuelto = (comprobados + no_necesarios) / total
     return (f'<div class="progreso"><div style="width:{p(comprobados)};background:{C_VERDE_OK}"></div>'
             f'<div style="width:{p(no_necesarios)};background:{C_GRIS_INACTIVO}"></div>'
-            f'<div style="width:{p(pendientes)};background:{C_BORDE_SUAVE}"></div></div>'
+            f'<div style="width:{p(pendientes)};background:{C_PENDIENTE}"></div>'
+            f'<div style="width:{p(sin_comprobar)};background:{C_BORDE_SUAVE}"></div></div>'
             f'<div class="leyenda-progreso"><b>{resuelto:.0%} resuelto</b> · {comprobados} comprobados · '
-            f'{no_necesarios} no necesarios · {pendientes} pendientes</div>')
+            f'{no_necesarios} no necesarios · {pendientes} pendientes · {sin_comprobar} sin comprobar</div>')
+
+
+def cuadre_html(c: dict) -> str:
+    """Línea de validación: comprobados + no necesarios + sin comprobar + pendientes = total del estado de cuenta."""
+    por = c["por_estado"]
+    n = lambda k: por[k]["n"]
+    suma = f'{n("comprobado")} + {n("no_necesario")} + {n("pendiente")} + {n("en_espera")}'
+    if c["cuadra"]:
+        return (f'<div style="border-left:5px solid {C_VERDE_OK};background:#F0FDF4;padding:8px 12px;border-radius:6px;margin:6px 0">'
+                f'<b style="color:{C_VERDE_OK}">✔ El estado de cuenta cuadra</b> · comprobados + no necesarios + sin comprobar + pendientes = '
+                f'{suma} = <b>{c["n_total"]}</b> movimientos · {money_html(c["monto_total"])}</div>')
+    return (f'<div style="border-left:5px solid {C_CORAL_ALERTA};background:#FEF2F2;padding:8px 12px;border-radius:6px;margin:6px 0">'
+            f'<b style="color:{C_CORAL_ALERTA}">✘ No cuadra</b> · {suma} = {c["n_suma"]} y el estado de cuenta tiene {c["n_total"]} movimientos '
+            f'(diferencia {c["dif_n"]} mov. / {money_html(c["dif_monto"])})</div>')
