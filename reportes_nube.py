@@ -71,6 +71,17 @@ SITUACION_SOLICITUD = {"borrador": "Borrador", "enviado_revision": "En revisión
                        "en_lote": "Aprobado (lote cerrado)", "pagado": "Pagado"}
 
 
+def _conceptos(gastos: list[dict]) -> str:
+    """Emisor / concepto de las facturas del gasto («FACEBOOK», «Aeroméxico»…), sin repetir."""
+    vistos: list[str] = []
+    for g in gastos:
+        for f in g.get("facturas") or []:
+            n = (f.get("nombre_emisor") or "").strip()
+            if n and n not in vistos:
+                vistos.append(n)
+    return ", ".join(vistos[:3]) + (f" (+{len(vistos) - 3})" if len(vistos) > 3 else "")
+
+
 def registros_bitacora(solicitudes: list[dict], gastos: list[dict], movs: pd.DataFrame) -> list[dict]:
     """Todo lo del mes en una sola lista:
       * cada solicitud: «comprobado» si ya tiene gasto, «sin comprobar» si todavía no;
@@ -91,6 +102,7 @@ def registros_bitacora(solicitudes: list[dict], gastos: list[dict], movs: pd.Dat
             filas.append({
                 "tipo": "solicitud", "id": s["id"], "estado": "comprobado", "fecha": min(fechas) if fechas else s["fecha"],
                 "numero": int(s["numero"]), "descripcion": s.get("description") or "", "empleado": s.get("employee_name") or "",
+                "concepto": _conceptos(gs), "movs": sum(len(g.get("movimientos") or []) for g in gs),
                 "categoria": gs[0].get("categoria") or s.get("category") or "",
                 "monto": round(sum(float(g["monto_estado"]) for g in gs), 2),
                 "situacion": SITUACION_SOLICITUD.get(s["estado"], s["estado"])})
@@ -98,6 +110,7 @@ def registros_bitacora(solicitudes: list[dict], gastos: list[dict], movs: pd.Dat
             filas.append({
                 "tipo": "solicitud", "id": s["id"], "estado": "sin_comprobar", "fecha": s["fecha"], "numero": int(s["numero"]),
                 "descripcion": s.get("description") or "", "empleado": s.get("employee_name") or "", "categoria": s.get("category") or "",
+                "concepto": "", "movs": 0,
                 "monto": round(float(s.get("monto_tentativo") or 0), 2), "situacion": "Solicitud sin movimiento ligado"})
     if len(movs):
         for r in movs.itertuples():
@@ -107,7 +120,7 @@ def registros_bitacora(solicitudes: list[dict], gastos: list[dict], movs: pd.Dat
             motivo = getattr(r, "motivo_espera", None)
             filas.append({
                 "tipo": "movimiento", "id": r.id, "estado": estado, "fecha": r.fecha, "numero": None,
-                "descripcion": r.descripcion, "empleado": "", "categoria": "", "monto": round(abs(float(r.monto)), 2),
+                "descripcion": r.descripcion, "empleado": "", "categoria": "", "concepto": "", "movs": 1, "monto": round(abs(float(r.monto)), 2),
                 "situacion": (str(motivo) if estado == "pendiente" and isinstance(motivo, str) and motivo
                               else "No requiere comprobación" if estado == "no_necesario" else "Movimiento del banco")})
     filas.sort(key=lambda f: (PRIORIDAD_REGISTRO[f["estado"]], str(f["fecha"]), f["numero"] or 0))
