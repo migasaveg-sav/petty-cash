@@ -62,6 +62,59 @@ def filas_por_enviar(solicitudes: list[dict], gastos: list[dict], con_pendiente_
 
 
 # ----------------------------------------------------------------------
+# Bitácora del mes: un renglón por registro, con su etiqueta
+# ----------------------------------------------------------------------
+ETIQUETA_REGISTRO = {"comprobado": "Comprobado", "no_necesario": "No necesario",
+                     "sin_comprobar": "Sin comprobar", "pendiente": "Pendiente"}
+PRIORIDAD_REGISTRO = {"sin_comprobar": 0, "pendiente": 1, "comprobado": 2, "no_necesario": 3}
+SITUACION_SOLICITUD = {"borrador": "Borrador", "enviado_revision": "En revisión", "con_pendientes": "Devuelto por el revisor",
+                       "en_lote": "Aprobado (lote cerrado)", "pagado": "Pagado"}
+
+
+def registros_bitacora(solicitudes: list[dict], gastos: list[dict], movs: pd.DataFrame) -> list[dict]:
+    """Todo lo del mes en una sola lista:
+      * cada solicitud: «comprobado» si ya tiene gasto, «sin comprobar» si todavía no;
+      * cada movimiento del estado de cuenta que NO está comprobado: «no necesario», «sin comprobar» o «pendiente»
+        (los comprobados ya salen dentro de su solicitud).
+    Primero lo que falta por comprobar (rojo), luego lo comprobado (verde) y lo no necesario, por fecha."""
+    por_sol: dict[str, list[dict]] = {}
+    for g in gastos:
+        if not g.get("eliminado"):
+            por_sol.setdefault(g["solicitud_id"], []).append(g)
+    filas: list[dict] = []
+    for s in solicitudes:
+        if s.get("eliminado"):
+            continue
+        gs = por_sol.get(s["id"], [])
+        if gs:
+            fechas = [m["fecha"] for g in gs for m in (g.get("movimientos") or [])]
+            filas.append({
+                "tipo": "solicitud", "id": s["id"], "estado": "comprobado", "fecha": min(fechas) if fechas else s["fecha"],
+                "numero": int(s["numero"]), "descripcion": s.get("description") or "", "empleado": s.get("employee_name") or "",
+                "categoria": gs[0].get("categoria") or s.get("category") or "",
+                "monto": round(sum(float(g["monto_estado"]) for g in gs), 2),
+                "situacion": SITUACION_SOLICITUD.get(s["estado"], s["estado"])})
+        else:
+            filas.append({
+                "tipo": "solicitud", "id": s["id"], "estado": "sin_comprobar", "fecha": s["fecha"], "numero": int(s["numero"]),
+                "descripcion": s.get("description") or "", "empleado": s.get("employee_name") or "", "categoria": s.get("category") or "",
+                "monto": round(float(s.get("monto_tentativo") or 0), 2), "situacion": "Solicitud sin movimiento ligado"})
+    if len(movs):
+        for r in movs.itertuples():
+            if r.estado == "comprobado":
+                continue
+            estado = {"no_necesario": "no_necesario", "en_espera": "pendiente"}.get(r.estado, "sin_comprobar")
+            motivo = getattr(r, "motivo_espera", None)
+            filas.append({
+                "tipo": "movimiento", "id": r.id, "estado": estado, "fecha": r.fecha, "numero": None,
+                "descripcion": r.descripcion, "empleado": "", "categoria": "", "monto": round(abs(float(r.monto)), 2),
+                "situacion": (str(motivo) if estado == "pendiente" and isinstance(motivo, str) and motivo
+                              else "No requiere comprobación" if estado == "no_necesario" else "Movimiento del banco")})
+    filas.sort(key=lambda f: (PRIORIDAD_REGISTRO[f["estado"]], str(f["fecha"]), f["numero"] or 0))
+    return filas
+
+
+# ----------------------------------------------------------------------
 # Cuadre del estado de cuenta
 # ----------------------------------------------------------------------
 ESTADOS_CUADRE = (("comprobado", "Comprobados"), ("no_necesario", "No necesarios"),
