@@ -128,6 +128,49 @@ def registros_bitacora(solicitudes: list[dict], gastos: list[dict], movs: pd.Dat
 
 
 # ----------------------------------------------------------------------
+# Desglose del estado de cuenta, condensado por solicitud
+# ----------------------------------------------------------------------
+def filas_desglose(df: pd.DataFrame, gastos: list[dict]) -> list[dict]:
+    """Una fila por solicitud comprobada (con el total de todos sus cargos) y una fila por cada movimiento que
+    no está comprobado (no necesario, sin comprobar, pendiente). `df` es el estado de cuenta del mes con su
+    solicitud/gasto/lote (v_movimientos_revision)."""
+    gastos_por_id = {g["id"]: g for g in gastos}
+    filas: list[dict] = []
+    if df is None or df.empty:
+        return filas
+    comp = df[df["estado"] == "comprobado"]
+    con_sol = comp[comp["solicitud_id"].notna()]
+    for sid, sub in con_sol.groupby("solicitud_id", sort=False):
+        movs = sub.drop_duplicates("id")
+        gasto_ids = list(dict.fromkeys(sub["gasto_id"].dropna()))
+        por_gasto = sub.drop_duplicates("gasto_id")
+        r0 = sub.iloc[0]
+        lote = ""
+        if pd.notna(r0["lote_numero"]):
+            lote = f"Lote de pago {int(r0['lote_numero'])}" + (f" · pagado el {r0['fecha_pago']}" if r0["lote_estado"] == "pagado" else " · por pagar")
+        filas.append({
+            "tipo": "solicitud", "id": sid, "estado": "comprobado", "fecha": min(str(x) for x in movs["fecha"]),
+            "numero": int(r0["solicitud_numero"]),
+            "descripcion": (r0.get("solicitud_descripcion") or movs.iloc[0]["descripcion"] or ""),
+            "concepto": _conceptos([gastos_por_id[g] for g in gasto_ids if g in gastos_por_id]),
+            "movs": int(len(movs)), "monto": round(float(movs["monto"].abs().sum()), 2),
+            "diferencia": round(float(pd.to_numeric(por_gasto["diferencia"], errors="coerce").fillna(0).sum()), 2),
+            "tiene_diferencia": bool(por_gasto["tiene_diferencia"].fillna(False).astype(bool).any()),
+            "situacion": " · ".join(x for x in (SITUACION_SOLICITUD.get(r0["solicitud_estado"], str(r0["solicitud_estado"])), lote) if x)})
+    resto = df[(df["estado"] != "comprobado") | (df["solicitud_id"].isna())].drop_duplicates("id")
+    for r in resto.itertuples():
+        estado = {"comprobado": "comprobado", "no_necesario": "no_necesario", "en_espera": "pendiente"}.get(r.estado, "sin_comprobar")
+        motivo = getattr(r, "motivo_espera", None)
+        filas.append({
+            "tipo": "movimiento", "id": r.id, "estado": estado, "fecha": str(r.fecha), "numero": None, "descripcion": r.descripcion,
+            "concepto": "", "movs": 1, "monto": round(abs(float(r.monto)), 2), "diferencia": 0.0, "tiene_diferencia": False,
+            "situacion": (str(motivo) if estado == "pendiente" and isinstance(motivo, str) and motivo
+                          else "No requiere comprobación" if estado == "no_necesario" else "Movimiento del banco")})
+    filas.sort(key=lambda f: (f["fecha"], f["numero"] or 0, str(f["id"])))
+    return filas
+
+
+# ----------------------------------------------------------------------
 # Cuadre del estado de cuenta
 # ----------------------------------------------------------------------
 ESTADOS_CUADRE = (("comprobado", "Comprobados"), ("no_necesario", "No necesarios"),
