@@ -372,7 +372,9 @@ def factura_a_json(f: dict, adjunto: dict | None = None) -> dict:
     return {
         "uuid_cfdi": uuid_cfdi,
         "rfc_emisor": f.get("RFC Emisor") or None,
-        "nombre_emisor": f.get("Razón Social") or f.get("Razon Social") or f.get("Nombre Emisor") or None,
+        # Una factura manual (sin XML) no trae razón social: se guarda el concepto («FACEBOOK») para poder identificarla.
+        "nombre_emisor": (f.get("Razón Social") or f.get("Razon Social") or f.get("Nombre Emisor")
+                          or ((f.get("Concepto") or "").strip()[:80] if uuid_cfdi is None else None) or None),
         "fecha_factura": fecha,
         "monto_total": round(float(f.get("Monto Total") or 0), 2),
         "iva": round(float(f.get("IVA") or 0), 2),
