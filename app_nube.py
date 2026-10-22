@@ -98,10 +98,22 @@ def _salir(sb) -> None:
 # ======================================================================
 # Utilidades de interfaz
 # ======================================================================
+def _catalogo(sb, tipo: str) -> list[str]:
+    """Catálogo en memoria de la sesión: evita una consulta a Supabase por cada selector en pantalla."""
+    cache = st.session_state.setdefault("_cat_cache", {})
+    if tipo not in cache:
+        cache[tipo] = db.cargar_catalogo(sb, tipo)
+    return cache[tipo]
+
+
+def _invalidar_catalogos() -> None:
+    st.session_state.pop("_cat_cache", None)
+
+
 def _selector_catalogo(sb, etiqueta: str, tipo: str, key: str, valor_actual: str | None = None) -> str | None:
     """Selectbox con el catálogo + una caja para agregar un valor nuevo (se guarda al
     usarlo). Regresa el valor elegido (o None)."""
-    opciones = db.cargar_catalogo(sb, tipo)
+    opciones = _catalogo(sb, tipo)
     if valor_actual and valor_actual not in opciones:
         opciones = [valor_actual, *opciones]
     sel = st.selectbox(etiqueta, ["—", *opciones], index=(opciones.index(valor_actual) + 1) if valor_actual in opciones else 0, key=f"{key}_sel")
@@ -112,8 +124,9 @@ def _selector_catalogo(sb, etiqueta: str, tipo: str, key: str, valor_actual: str
 
 
 def _guardar_catalogo_si_nuevo(sb, tipo: str, valor: str | None) -> None:
-    if valor and valor not in db.cargar_catalogo(sb, tipo):
+    if valor and valor not in _catalogo(sb, tipo):
         db.agregar_catalogo(sb, tipo, valor)
+        _invalidar_catalogos()
 
 
 def _campos_solicitud(sb, pref: str, v: dict | None = None) -> dict:
@@ -136,7 +149,9 @@ def _campos_solicitud(sb, pref: str, v: dict | None = None) -> dict:
 
 
 def _periodo_de(sb, fecha: datetime.date) -> str:
-    return db.obtener_o_crear_periodo(sb, fecha.year, fecha.month)
+    pid = db.obtener_o_crear_periodo(sb, fecha.year, fecha.month)
+    st.session_state.pop("_periodos", None)   # puede haberse creado un mes nuevo
+    return pid
 
 
 # ======================================================================
@@ -186,6 +201,11 @@ def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
     if not sols:
         st.caption("Aún no hay solicitudes en este mes.")
         return
+    por_pag = 15
+    n_pag = max((len(sols) + por_pag - 1) // por_pag, 1)
+    if n_pag > 1:
+        pag = int(st.number_input(f"Página (de {n_pag})", min_value=1, max_value=n_pag, value=1, step=1, key=f"bit_pag_{periodo['id']}"))
+        sols = sols[(pag - 1) * por_pag: pag * por_pag]
     gastos = db.listar_gastos(sb, [s["id"] for s in sols])
     por_sol: dict[str, list[dict]] = {}
     for g in gastos:
@@ -204,7 +224,7 @@ def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
             top[3].write(f"{s.get('category') or '—'} · {s.get('description') or ''}")
             top[4].write(ESTADOS_SOLICITUD.get(s["estado"], s["estado"]))
             top[5].write(f"{len(gs)} gasto(s) comprobado(s)")
-            acciones = st.columns([1.2, 1.5, 1, 4])
+            acciones = st.columns([1.2, 1.5, 1, 1.1, 3.2])
             if editable and acciones[0].button("🔗 Comprobar", key=f"cmp_{s['id']}"):
                 st.session_state.comprobando = s
                 for k in [k for k in st.session_state if k.startswith("cmp_") and k != f"cmp_{s['id']}"]:
@@ -223,24 +243,29 @@ def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
                     st.rerun()
                 except db.ErrorNube as e:
                     st.error(str(e))
-            if gs or editable:
-                with st.expander("Detalle" + (f" ({len(gs)} gasto(s))" if gs else "")):
-                    if editable:
-                        st.markdown("**Editar datos de la solicitud**")
-                        nuevos = _campos_solicitud(sb, f"ed_{s['id']}", s)
-                        if st.button("Guardar cambios", key=f"gc_{s['id']}"):
-                            try:
-                                for tipo, clave in (("categoria", "category"), ("empleado", "employee_name"), ("material", "material")):
-                                    _guardar_catalogo_si_nuevo(sb, tipo, nuevos[clave])
-                                db.actualizar_solicitud(sb, s["id"], {
-                                    "fecha": str(nuevos["fecha"]), "monto_tentativo": nuevos["monto"], "category": nuevos["category"],
-                                    "material": nuevos["material"], "employee_name": nuevos["employee_name"],
-                                    "request_number": nuevos["request_number"] or None, "description": nuevos["description"] or None,
-                                    "number_of_days": nuevos["number_of_days"], "number_of_people": nuevos["number_of_people"]})
-                                _flash("Cambios guardados.")
-                                st.rerun()
-                            except db.ErrorNube as e:
-                                st.error(str(e))
+            if editable and acciones[3].button("✏️ Editar", key=f"edit_{s['id']}"):
+                st.session_state.editando_sol = None if st.session_state.get("editando_sol") == s["id"] else s["id"]
+                st.rerun()
+            if editable and st.session_state.get("editando_sol") == s["id"]:
+                # El formulario se arma solo para la solicitud que se está editando (no para todas).
+                st.markdown("**Editar datos de la solicitud**")
+                nuevos = _campos_solicitud(sb, f"ed_{s['id']}", s)
+                if st.button("Guardar cambios", type="primary", key=f"gc_{s['id']}"):
+                    try:
+                        for tipo, clave in (("categoria", "category"), ("empleado", "employee_name"), ("material", "material")):
+                            _guardar_catalogo_si_nuevo(sb, tipo, nuevos[clave])
+                        db.actualizar_solicitud(sb, s["id"], {
+                            "fecha": str(nuevos["fecha"]), "monto_tentativo": nuevos["monto"], "category": nuevos["category"],
+                            "material": nuevos["material"], "employee_name": nuevos["employee_name"],
+                            "request_number": nuevos["request_number"] or None, "description": nuevos["description"] or None,
+                            "number_of_days": nuevos["number_of_days"], "number_of_people": nuevos["number_of_people"]})
+                        st.session_state.editando_sol = None
+                        _flash("Cambios guardados.")
+                        st.rerun()
+                    except db.ErrorNube as e:
+                        st.error(str(e))
+            if gs:
+                with st.expander(f"Detalle ({len(gs)} gasto(s))"):
                     for g in gs:
                         _detalle_gasto(sb, g, editable)
 
@@ -347,12 +372,12 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
     # ---------- Paso 2: facturas ----------
     st.markdown("#### Paso 2 · Agrega la(s) factura(s)")
     c1, c2 = st.columns(2)
-    categorias = db.cargar_catalogo(sb, "categoria")
+    categorias = _catalogo(sb, "categoria")
     cat_ini = sol.get("category")
     with c1:
         categoria = st.selectbox("Categoría", ["—", *categorias], index=(categorias.index(cat_ini) + 1) if cat_ini in categorias else 0, key="cmp_categoria")
     with c2:
-        mats = db.cargar_catalogo(sb, "material")
+        mats = _catalogo(sb, "material")
         mat_ini = sol.get("material")
         material = st.selectbox("Material", ["—", *mats], index=(mats.index(mat_ini) + 1) if mat_ini in mats else 0, key="cmp_material")
     propina = 0.0
@@ -643,6 +668,8 @@ def _importador(sb, cuenta: dict) -> None:
             st.error(f"La importación se detuvo: {e}")
             return
         st.session_state.imp_reporte = rep
+        _invalidar_catalogos()
+        st.session_state.pop("_periodos", None)
         st.session_state.imp_v = ver + 1
         st.session_state.pop("imp_clave", None)
         st.rerun()
@@ -895,7 +922,12 @@ def main() -> None:
             _salir(sb)
         return
 
-    cuenta = db.cargar_cuenta(sb, perfil["cuenta_id"]) if perfil and perfil.get("cuenta_id") else None
+    if perfil and perfil.get("cuenta_id"):
+        if "_cuenta" not in st.session_state:
+            st.session_state._cuenta = db.cargar_cuenta(sb, perfil["cuenta_id"])
+        cuenta = st.session_state._cuenta
+    else:
+        cuenta = None
     cab = st.columns([5, 2, 1])
     cab[0].markdown(estilos.encabezado(), unsafe_allow_html=True)
     if perfil:
@@ -914,8 +946,11 @@ def main() -> None:
 
     # ---- aplicante ----
     hoy = hoy_cdmx()
-    db.obtener_o_crear_periodo(sb, hoy.year, hoy.month)
-    periodos = db.listar_periodos(sb)
+    if st.session_state.get("_periodos_dia") != hoy.isoformat() or "_periodos" not in st.session_state:
+        db.obtener_o_crear_periodo(sb, hoy.year, hoy.month)
+        st.session_state._periodos = db.listar_periodos(sb)
+        st.session_state._periodos_dia = hoy.isoformat()
+    periodos = st.session_state._periodos
     cierre = db.estado_cierre(sb, cuenta["id"])
     actual = f"{hoy.year}-{hoy.month:02d}"
     etiquetas = [db.etiqueta_periodo(p) for p in periodos]
