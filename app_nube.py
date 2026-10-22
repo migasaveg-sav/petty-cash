@@ -192,12 +192,17 @@ def _nueva_tabla() -> None:
 
 def _chips_bitacora(registros: list[dict]) -> str:
     cuenta = collections.Counter(r["estado"] for r in registros)
+    movs_comp = sum(r.get("movs", 0) for r in registros if r["estado"] == "comprobado")
     chips = []
     for est in ("comprobado", "no_necesario", "sin_comprobar", "pendiente"):
         fondo, texto = ESTILO_ETIQUETA[est]
         borde = "#CBD5E1" if est == "no_necesario" else texto
+        if est == "comprobado":
+            etiqueta = f'{cuenta.get(est, 0)} gastos comprobados · {movs_comp} movimientos del banco'
+        else:
+            etiqueta = f'{cuenta.get(est, 0)} {reportes.ETIQUETA_REGISTRO[est].lower()}'
         chips.append(f'<span style="display:inline-block;background:{fondo};color:{texto};border:1px solid {borde};border-radius:999px;'
-                     f'padding:2px 12px;margin:0 6px 4px 0;font-size:.85rem;font-weight:700">{cuenta.get(est, 0)} {reportes.ETIQUETA_REGISTRO[est].lower()}</span>')
+                     f'padding:2px 12px;margin:0 6px 4px 0;font-size:.85rem;font-weight:700">{etiqueta}</span>')
     return "".join(chips)
 
 
@@ -234,21 +239,22 @@ def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
 
     f1, f2 = st.columns([1.3, 3])
     filtro = f1.selectbox("Mostrar", ["Todos", *reportes.ETIQUETA_REGISTRO.values()], key="bit_filtro")
-    texto = f2.text_input("🔎 Buscar (descripción, empleado, categoría, #)", key="bit_busca")
+    texto = f2.text_input("🔎 Buscar (descripción, concepto, empleado, categoría, #)", key="bit_busca")
     vista = registros
     if filtro != "Todos":
         clave = {v: k for k, v in reportes.ETIQUETA_REGISTRO.items()}[filtro]
         vista = [r for r in vista if r["estado"] == clave]
     if texto.strip():
         t = texto.strip().lower()
-        vista = [r for r in vista if t in " ".join(str(r[k]) for k in ("descripcion", "empleado", "categoria", "numero")).lower()]
+        vista = [r for r in vista if t in " ".join(str(r[k]) for k in ("descripcion", "concepto", "empleado", "categoria", "numero")).lower()]
     if not vista:
         st.caption("Ningún registro coincide con el filtro.")
         return
 
     tabla = pd.DataFrame([{
         "Estado": reportes.ETIQUETA_REGISTRO[r["estado"]], "Fecha": r["fecha"], "#": r["numero"], "Descripción": r["descripcion"],
-        "Empleado": r["empleado"], "Categoría": r["categoria"], "Monto": r["monto"], "Situación": r["situacion"]} for r in vista])
+        "Concepto": r["concepto"], "Empleado": r["empleado"], "Categoría": r["categoria"], "Mov.": r["movs"], "Monto": r["monto"],
+        "Situación": r["situacion"]} for r in vista])
     tabla["#"] = tabla["#"].astype("Int64")
     inverso = {v: k for k, v in reportes.ETIQUETA_REGISTRO.items()}
 
@@ -259,7 +265,8 @@ def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
     ev = st.dataframe(estilo, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 400),
                       on_select="rerun", selection_mode="single-row", key=f"tabla_bit_{st.session_state.get('bit_ver', 0)}",
                       column_config={"#": st.column_config.NumberColumn("#", format="%d", width="small"),
-                                     "Estado": st.column_config.TextColumn("Estado", width="small")})
+                                     "Estado": st.column_config.TextColumn("Estado", width="small"),
+                                     "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small", help="Movimientos del estado de cuenta que cubre el gasto")})
     filas = ev.selection.rows if ev and ev.selection else []
     if not filas:
         st.caption("Haz clic en una fila para abrir el registro y ver sus detalles (gasto, facturas y PDF).")
@@ -374,7 +381,7 @@ def _detalle_gasto(sb, g: dict, editable: bool) -> None:
         st.caption(f"🏦 {m['fecha']} · {m['descripcion']} · {money_md(m['monto'])}")
     for f in g["facturas"]:
         cols = st.columns([3, 1, 1])
-        cols[0].caption(f"🧾 {(f.get('uuid_cfdi') or 'SIN-UUID')} · {f.get('rfc_emisor') or ''} · {f.get('fecha_factura') or ''}")
+        cols[0].caption(f"🧾 {(f.get('uuid_cfdi') or 'SIN-UUID')} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
         cols[1].caption(money_md(f["monto_aplicado"]))
         if f.get("adjunto") and cols[2].button("📎 Ver", key=f"ver_{g['id']}_{f['id']}"):
             st.session_state.adj_ver = f["adjunto"]["ruta"]
