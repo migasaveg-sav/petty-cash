@@ -17,7 +17,7 @@ import adjuntos as adj
 import estilos
 import importar
 import nube_db as db
-import reportes
+import reportes_nube as reportes
 from bank import BankStatementError, cargar_estado_cuenta
 from catalog import CATEGORIAS_SOLICITUD_DEFAULT, EMPLEADOS_DEFAULT, MATERIALES_DEFAULT
 from cfdi import CFDIParseError, parse_cfdi
