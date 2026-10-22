@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from collections import OrderedDict
 from typing import Any, Callable
 
@@ -24,6 +25,18 @@ import adjuntos as adj
 import nube_db as db
 
 CAMPOS_DINERO = ("Monto Total", "IVA", "ISR Retenido", "IVA Retenido", "ISH")
+
+
+_RE_UUID = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
+
+
+def _normalizar_uuid(f: dict) -> dict:
+    """Las facturas capturadas a mano pueden traer texto libre en UUID («sin factura», «cargos de
+    facebook»). En la nube solo un UUID real identifica un CFDI; lo demás se guarda como manual (sin UUID)."""
+    u = (f.get("UUID") or "").strip()
+    if u and not _RE_UUID.match(u):
+        return {**f, "UUID": "SIN-UUID"}
+    return f
 
 
 class ErrorImportacion(Exception):
@@ -109,6 +122,7 @@ def planear(av: dict[str, Any]) -> dict[str, Any]:
         por_uuid: "OrderedDict[str, list[dict]]" = OrderedDict()
         for n, it in enumerate(items):
             for f in it.get("Facturas") or []:
+                f = _normalizar_uuid(f)
                 u = (f.get("UUID") or "").strip()
                 k = u if u and u != "SIN-UUID" else f"sin-uuid:{clave}:{n}:{f.get('_id')}"
                 por_uuid.setdefault(k, []).append(f)
@@ -144,7 +158,7 @@ def planear(av: dict[str, Any]) -> dict[str, Any]:
     if en_proceso:
         avisos.append(f"Hay facturas «en proceso» (sin guardar) en los movimientos {en_proceso}; no se importan, quedan pendientes.")
 
-    solicitudes, vinculadas = [], 0
+    solicitudes, vinculadas, sin_fecha = [], 0, 0
     for x in av.get("solicitudes") or []:
         if not isinstance(x, dict):
             continue
@@ -153,8 +167,12 @@ def planear(av: dict[str, Any]) -> dict[str, Any]:
             continue
         fecha = pd.to_datetime(x.get("Fecha"), errors="coerce")
         if pd.isna(fecha):
-            avisos.append(f"Solicitud #{x.get('id', x.get('No', '?'))} sin fecha válida; se omite.")
-            continue
+            # Avances viejos no guardaban fecha ni monto de la solicitud: se usa el día en que se guardó el avance.
+            fecha = pd.to_datetime(str(av.get("guardado_en") or "")[:10], errors="coerce")
+            if pd.isna(fecha):
+                avisos.append(f"Solicitud #{x.get('id', x.get('No', '?'))} sin fecha válida; se omite.")
+                continue
+            sin_fecha += 1
         solicitudes.append({
             "origen": x.get("id", x.get("No")),
             "fecha": fecha.date().isoformat(),
@@ -168,6 +186,8 @@ def planear(av: dict[str, Any]) -> dict[str, Any]:
             "number_of_people": int(_numero(x.get("Number of People"))),
             "applicant_origen": x.get("Applicant"),
         })
+    if sin_fecha:
+        avisos.append(f"{sin_fecha} solicitud(es) del archivo no traen fecha ni monto (versión anterior de la app): se les pone la fecha en que se guardó el avance ({str(av.get('guardado_en'))[:10]}) y monto $0; ajústalos al comprobar.")
     if vinculadas:
         avisos.append(f"{vinculadas} solicitud(es) de la bitácora ya estaban vinculadas a un gasto; se importan junto con los gastos comprobados, no por separado.") if gastos else \
             avisos.append(f"{vinculadas} solicitud(es) de la bitácora estaban vinculadas a gastos que este archivo no trae; se omiten.")
