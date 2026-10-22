@@ -7,6 +7,7 @@ Reutiliza bank.py, cfdi.py, catalog.py, matching.py y persistence.py de la app a
 from __future__ import annotations
 
 import base64
+import collections
 import datetime
 
 import pandas as pd
@@ -178,6 +179,28 @@ def _tarjetas_gasto(sb, cuenta: dict) -> None:
             st.caption(f"Faltan {money_md(limite - res['acumulado'])} para el límite de reembolso.")
 
 
+ESTILO_ETIQUETA = {   # (fondo, texto): verde = comprobado, blanco = no necesario, rojo = sin comprobar / pendiente
+    "comprobado": ("#DCFCE7", "#166534"), "no_necesario": ("#FFFFFF", "#475569"),
+    "sin_comprobar": ("#FEE2E2", "#B91C1C"), "pendiente": ("#FEE2E2", "#B91C1C"),
+}
+
+
+def _nueva_tabla() -> None:
+    """Cambia la llave de la tabla de la bitácora para que no quede seleccionada una fila que ya cambió."""
+    st.session_state["bit_ver"] = st.session_state.get("bit_ver", 0) + 1
+
+
+def _chips_bitacora(registros: list[dict]) -> str:
+    cuenta = collections.Counter(r["estado"] for r in registros)
+    chips = []
+    for est in ("comprobado", "no_necesario", "sin_comprobar", "pendiente"):
+        fondo, texto = ESTILO_ETIQUETA[est]
+        borde = "#CBD5E1" if est == "no_necesario" else texto
+        chips.append(f'<span style="display:inline-block;background:{fondo};color:{texto};border:1px solid {borde};border-radius:999px;'
+                     f'padding:2px 12px;margin:0 6px 4px 0;font-size:.85rem;font-weight:700">{cuenta.get(est, 0)} {reportes.ETIQUETA_REGISTRO[est].lower()}</span>')
+    return "".join(chips)
+
+
 def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
     _tarjetas_gasto(sb, cuenta)
     st.divider()
@@ -193,83 +216,153 @@ def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
                     db.crear_solicitud(sb, cuenta["id"], _periodo_de(sb, datos["fecha"]), datos)
                     for k in [k for k in st.session_state if k.startswith("nueva_")]:
                         del st.session_state[k]
+                    _nueva_tabla()
                     _flash("Solicitud registrada.")
                     st.rerun()
                 except db.ErrorNube as e:
                     st.error(str(e))
 
     sols = db.listar_solicitudes(sb, cuenta["id"], periodo["id"])
-    st.markdown(f"##### Solicitudes de {db.etiqueta_periodo(periodo)} ({len(sols)})")
-    if not sols:
-        st.caption("Aún no hay solicitudes en este mes.")
+    gastos = db.listar_gastos(sb, [x["id"] for x in sols]) if sols else []
+    movs = db.listar_movimientos(sb, cuenta["id"], periodo_id=periodo["id"])
+    registros = reportes.registros_bitacora(sols, gastos, movs)
+    st.markdown(f"##### Bitácora de {db.etiqueta_periodo(periodo)} ({len(registros)} registros)")
+    if not registros:
+        st.caption("Aún no hay registros en este mes. Carga el estado de cuenta o crea una solicitud.")
         return
-    por_pag = 15
-    n_pag = max((len(sols) + por_pag - 1) // por_pag, 1)
-    if n_pag > 1:
-        pag = int(st.number_input(f"Página (de {n_pag})", min_value=1, max_value=n_pag, value=1, step=1, key=f"bit_pag_{periodo['id']}"))
-        sols = sols[(pag - 1) * por_pag: pag * por_pag]
-    gastos = db.listar_gastos(sb, [s["id"] for s in sols])
-    por_sol: dict[str, list[dict]] = {}
-    for g in gastos:
-        por_sol.setdefault(g["solicitud_id"], []).append(g)
+    st.markdown(_chips_bitacora(registros), unsafe_allow_html=True)
 
-    st.markdown('<div class="bitacora-head"><div>#</div><div>Fecha</div><div>Monto</div><div>Categoría · Descripción</div>'
-                '<div>Estado</div><div>Comprobación</div></div>', unsafe_allow_html=True)
-    for s in sols:
+    f1, f2 = st.columns([1.3, 3])
+    filtro = f1.selectbox("Mostrar", ["Todos", *reportes.ETIQUETA_REGISTRO.values()], key="bit_filtro")
+    texto = f2.text_input("🔎 Buscar (descripción, empleado, categoría, #)", key="bit_busca")
+    vista = registros
+    if filtro != "Todos":
+        clave = {v: k for k, v in reportes.ETIQUETA_REGISTRO.items()}[filtro]
+        vista = [r for r in vista if r["estado"] == clave]
+    if texto.strip():
+        t = texto.strip().lower()
+        vista = [r for r in vista if t in " ".join(str(r[k]) for k in ("descripcion", "empleado", "categoria", "numero")).lower()]
+    if not vista:
+        st.caption("Ningún registro coincide con el filtro.")
+        return
+
+    tabla = pd.DataFrame([{
+        "Estado": reportes.ETIQUETA_REGISTRO[r["estado"]], "Fecha": r["fecha"], "#": r["numero"], "Descripción": r["descripcion"],
+        "Empleado": r["empleado"], "Categoría": r["categoria"], "Monto": r["monto"], "Situación": r["situacion"]} for r in vista])
+    tabla["#"] = tabla["#"].astype("Int64")
+    inverso = {v: k for k, v in reportes.ETIQUETA_REGISTRO.items()}
+
+    def _pintar(col):
+        return [f"background-color:{ESTILO_ETIQUETA[inverso[v]][0]};color:{ESTILO_ETIQUETA[inverso[v]][1]};font-weight:700;text-align:center" for v in col]
+
+    estilo = tabla.style.apply(_pintar, subset=["Estado"]).format({"Monto": "${:,.2f}"}, na_rep="—")
+    ev = st.dataframe(estilo, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 400),
+                      on_select="rerun", selection_mode="single-row", key=f"tabla_bit_{st.session_state.get('bit_ver', 0)}",
+                      column_config={"#": st.column_config.NumberColumn("#", format="%d", width="small"),
+                                     "Estado": st.column_config.TextColumn("Estado", width="small")})
+    filas = ev.selection.rows if ev and ev.selection else []
+    if not filas:
+        st.caption("Haz clic en una fila para abrir el registro y ver sus detalles (gasto, facturas y PDF).")
+        return
+    gastos_por_sol: dict[str, list[dict]] = {}
+    for g in gastos:
+        gastos_por_sol.setdefault(g["solicitud_id"], []).append(g)
+    _detalle_registro(sb, cuenta, periodo, cerrado, vista[filas[0]], {x["id"]: x for x in sols}, gastos_por_sol, movs)
+
+
+def _detalle_registro(sb, cuenta: dict, periodo: dict, cerrado: bool, r: dict, sols: dict, gastos_por_sol: dict, movs: pd.DataFrame) -> None:
+    fondo, texto = ESTILO_ETIQUETA[r["estado"]]
+    etiqueta = (f'<span style="background:{fondo};color:{texto};border:1px solid {"#CBD5E1" if r["estado"] == "no_necesario" else texto};'
+                f'border-radius:999px;padding:2px 12px;font-weight:700">{reportes.ETIQUETA_REGISTRO[r["estado"]]}</span>')
+    with st.container(border=True):
+        if r["tipo"] == "movimiento":
+            fila = movs[movs["id"] == r["id"]]
+            if fila.empty:
+                st.warning("El movimiento ya no está en la lista; vuelve a seleccionar.")
+                return
+            m = fila.iloc[0]
+            st.markdown(f"{etiqueta} &nbsp; **🏦 Movimiento del estado de cuenta** · {m['fecha']}", unsafe_allow_html=True)
+            st.write(f"{m['descripcion']}")
+            st.write(f"Monto: {money_md(m['monto'])}" + (f" · Saldo: {money_md(m['saldo'])}" if pd.notna(m["saldo"]) else ""))
+            if m["estado"] == "en_espera":
+                st.info(f"⏳ Pendiente: {m['motivo_espera']}")
+            if cerrado:
+                return
+            abiertos = m["estado"] in ("pendiente", "en_espera")
+            b0, b1, b2 = st.columns([1.4, 1.4, 1.8])
+            if abiertos and b0.button("🔗 Comprobar", type="primary", key=f"bit_cmp_{m['id']}"):
+                _nueva_tabla()
+                _comprobar_desde_estado(sb, cuenta, periodo, fila)
+            if abiertos and b1.button("🚫 No necesario", key=f"bit_nn_{m['id']}"):
+                _nueva_tabla()
+                _cambiar(sb, [m["id"]], "no_necesario")
+            if m["estado"] in ("no_necesario", "en_espera") and b2.button("↩️ Regresar a sin comprobar", key=f"bit_sc_{m['id']}"):
+                _nueva_tabla()
+                _cambiar(sb, [m["id"]], "pendiente")
+            if abiertos:
+                st.caption("Para marcarlo como pendiente (devolución u otro caso largo) usa la pestaña «Estado de cuenta».")
+            return
+
+        s = sols.get(r["id"])
+        if not s:
+            st.warning("La solicitud ya no está en la lista; vuelve a seleccionar.")
+            return
+        gs = gastos_por_sol.get(s["id"], [])
         editable = s["estado"] in EDITABLES and not cerrado
-        gs = por_sol.get(s["id"], [])
-        with st.container(border=True, key=f"sol-{s['id']}"):
-            top = st.columns([0.5, 1.1, 1.1, 2.6, 1.4, 1.6])
-            top[0].markdown(f"**#{s['numero']}**")
-            top[1].write(s["fecha"])
-            top[2].write(money_md(s["monto_tentativo"]))
-            top[3].write(f"{s.get('category') or '—'} · {s.get('description') or ''}")
-            top[4].write(ESTADOS_SOLICITUD.get(s["estado"], s["estado"]))
-            top[5].write(f"{len(gs)} gasto(s) comprobado(s)")
-            acciones = st.columns([1.2, 1.5, 1, 1.1, 3.2])
-            if editable and acciones[0].button("🔗 Comprobar", key=f"cmp_{s['id']}"):
-                st.session_state.comprobando = s
-                for k in [k for k in st.session_state if k.startswith("cmp_") and k != f"cmp_{s['id']}"]:
-                    del st.session_state[k]
+        st.markdown(f"{etiqueta} &nbsp; **Solicitud #{s['numero']}** · {s['fecha']} · {ESTADOS_SOLICITUD.get(s['estado'], s['estado'])}", unsafe_allow_html=True)
+        d1, d2, d3 = st.columns(3)
+        d1.write(f"**Categoría:** {s.get('category') or '—'}  \n**Material:** {s.get('material') or '—'}")
+        d2.write(f"**Empleado:** {s.get('employee_name') or '—'}  \n**Request:** {s.get('request_number') or '—'}")
+        d3.write(f"**Monto tentativo:** {money_md(s['monto_tentativo'])}  \n**Días / personas:** {s.get('number_of_days') or 0} / {s.get('number_of_people') or 0}")
+        if s.get("description"):
+            st.caption(s["description"])
+        acciones = st.columns([1.2, 1.6, 1.1, 1.1, 3])
+        if editable and acciones[0].button("🔗 Comprobar", type="primary" if not gs else "secondary", key=f"cmp_{s['id']}"):
+            st.session_state.comprobando = s
+            for k in [k for k in st.session_state if k.startswith("cmp_") and k != f"cmp_{s['id']}"]:
+                del st.session_state[k]
+            _nueva_tabla()
+            st.rerun()
+        if editable and gs and acciones[1].button("📤 Enviar a revisión", key=f"env_{s['id']}"):
+            try:
+                db.enviar_a_revision(sb, s["id"])
+                _nueva_tabla()
+                _flash(f"Solicitud #{s['numero']} enviada a revisión.")
                 st.rerun()
-            if editable and gs and acciones[1].button("📤 Enviar a revisión", key=f"env_{s['id']}"):
+            except db.ErrorNube as e:
+                st.error(str(e))
+        if editable and acciones[2].button("✏️ Editar", key=f"edit_{s['id']}"):
+            st.session_state.editando_sol = None if st.session_state.get("editando_sol") == s["id"] else s["id"]
+            st.rerun()
+        if editable and not gs and acciones[3].button("🗑️ Eliminar", key=f"del_{s['id']}"):
+            try:
+                db.eliminar_solicitud(sb, s["id"])
+                _nueva_tabla()
+                st.rerun()
+            except db.ErrorNube as e:
+                st.error(str(e))
+        if editable and st.session_state.get("editando_sol") == s["id"]:
+            st.markdown("**Editar datos de la solicitud**")
+            nuevos = _campos_solicitud(sb, f"ed_{s['id']}", s)
+            if st.button("Guardar cambios", type="primary", key=f"gc_{s['id']}"):
                 try:
-                    db.enviar_a_revision(sb, s["id"])
-                    _flash(f"Solicitud #{s['numero']} enviada a revisión.")
+                    for tipo, clave in (("categoria", "category"), ("empleado", "employee_name"), ("material", "material")):
+                        _guardar_catalogo_si_nuevo(sb, tipo, nuevos[clave])
+                    db.actualizar_solicitud(sb, s["id"], {
+                        "fecha": str(nuevos["fecha"]), "monto_tentativo": nuevos["monto"], "category": nuevos["category"],
+                        "material": nuevos["material"], "employee_name": nuevos["employee_name"],
+                        "request_number": nuevos["request_number"] or None, "description": nuevos["description"] or None,
+                        "number_of_days": nuevos["number_of_days"], "number_of_people": nuevos["number_of_people"]})
+                    st.session_state.editando_sol = None
+                    _nueva_tabla()
+                    _flash("Cambios guardados.")
                     st.rerun()
                 except db.ErrorNube as e:
                     st.error(str(e))
-            if editable and not gs and acciones[2].button("🗑️", key=f"del_{s['id']}", help="Eliminar solicitud"):
-                try:
-                    db.eliminar_solicitud(sb, s["id"])
-                    st.rerun()
-                except db.ErrorNube as e:
-                    st.error(str(e))
-            if editable and acciones[3].button("✏️ Editar", key=f"edit_{s['id']}"):
-                st.session_state.editando_sol = None if st.session_state.get("editando_sol") == s["id"] else s["id"]
-                st.rerun()
-            if editable and st.session_state.get("editando_sol") == s["id"]:
-                # El formulario se arma solo para la solicitud que se está editando (no para todas).
-                st.markdown("**Editar datos de la solicitud**")
-                nuevos = _campos_solicitud(sb, f"ed_{s['id']}", s)
-                if st.button("Guardar cambios", type="primary", key=f"gc_{s['id']}"):
-                    try:
-                        for tipo, clave in (("categoria", "category"), ("empleado", "employee_name"), ("material", "material")):
-                            _guardar_catalogo_si_nuevo(sb, tipo, nuevos[clave])
-                        db.actualizar_solicitud(sb, s["id"], {
-                            "fecha": str(nuevos["fecha"]), "monto_tentativo": nuevos["monto"], "category": nuevos["category"],
-                            "material": nuevos["material"], "employee_name": nuevos["employee_name"],
-                            "request_number": nuevos["request_number"] or None, "description": nuevos["description"] or None,
-                            "number_of_days": nuevos["number_of_days"], "number_of_people": nuevos["number_of_people"]})
-                        st.session_state.editando_sol = None
-                        _flash("Cambios guardados.")
-                        st.rerun()
-                    except db.ErrorNube as e:
-                        st.error(str(e))
-            if gs:
-                with st.expander(f"Detalle ({len(gs)} gasto(s))"):
-                    for g in gs:
-                        _detalle_gasto(sb, g, editable)
+        if not gs:
+            st.caption("Esta solicitud todavía no tiene gasto comprobado: pulsa «Comprobar» para ligarla a un movimiento del estado de cuenta.")
+        for g in gs:
+            _detalle_gasto(sb, g, editable)
 
 
 def _detalle_gasto(sb, g: dict, editable: bool) -> None:
@@ -288,6 +381,7 @@ def _detalle_gasto(sb, g: dict, editable: bool) -> None:
     if editable and st.button("↩️ Revertir este gasto", key=f"rev_{g['id']}"):
         try:
             db.revertir_gasto(sb, g["id"])
+            _nueva_tabla()
             _flash("Gasto revertido: los movimientos volvieron a pendientes.")
             st.rerun()
         except db.ErrorNube as e:
@@ -714,6 +808,7 @@ def _comprobar_desde_estado(sb, cuenta: dict, periodo: dict, sel: pd.DataFrame) 
 def _cambiar(sb, ids: list[str], estado: str, motivo: str | None = None) -> None:
     try:
         db.cambiar_estado_movimientos(sb, ids, estado, motivo)
+        _nueva_tabla()
         st.rerun()
     except db.ErrorNube as e:
         st.error(str(e))
