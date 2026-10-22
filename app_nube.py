@@ -14,6 +14,7 @@ import streamlit as st
 
 import adjuntos as adj
 import estilos
+import importar
 import nube_db as db
 from bank import BankStatementError, cargar_estado_cuenta
 from catalog import CATEGORIAS_SOLICITUD_DEFAULT, EMPLEADOS_DEFAULT, MATERIALES_DEFAULT
@@ -501,6 +502,10 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
             except Exception as e:
                 st.error(f"Archivo no reconocido: {e}")
 
+    if not cerrado:
+        with st.expander("📥 Importar avance anterior (.json)", expanded=False):
+            _importador(sb, cuenta)
+
     if todos.empty:
         st.info("Todavía no hay movimientos. Carga el estado de cuenta arriba.")
         return
@@ -538,6 +543,109 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
             _cambiar(sb, sel["id"].tolist(), "no_necesario")
         if b2.button("↩️ Regresar a pendiente", key="mov_pend", disabled=bool((sel["estado"] != "no_necesario").any())):
             _cambiar(sb, sel["id"].tolist(), "pendiente")
+
+
+def _importador(sb, cuenta: dict) -> None:
+    """Sube a la nube el avance (.json) de la app local: estado de cuenta, gastos comprobados con
+    sus facturas y PDF. Primero muestra una vista previa; no escribe nada hasta confirmar."""
+    ultimo = st.session_state.get("imp_reporte")
+    if ultimo:
+        partes = []
+        if ultimo["movimientos_nuevos"]:
+            partes.append(f"{ultimo['movimientos_nuevos']} movimiento(s) nuevo(s)")
+        if ultimo["gastos_importados"]:
+            partes.append(f"{ultimo['gastos_importados']} gasto(s) comprobado(s) con {ultimo['pdfs']} PDF")
+        if ultimo["no_necesarios"]:
+            partes.append(f"{ultimo['no_necesarios']} marcados como no necesarios")
+        if ultimo.get("solicitudes"):
+            partes.append(f"{ultimo['solicitudes']} solicitud(es) en borrador")
+        st.success("Importación terminada: " + (", ".join(partes) if partes else "no había nada nuevo") + ".")
+        for m in ultimo["omitidos"]:
+            st.caption(f"↷ Omitido — {m}")
+        for m in ultimo["errores"]:
+            st.warning(m)
+        if st.button("Cerrar este resumen", key="imp_cerrar_rep"):
+            del st.session_state["imp_reporte"]
+            st.rerun()
+        return
+    st.caption("Carga el avance que descargaste de la app anterior: el estado de cuenta, los gastos ya comprobados con sus facturas y los PDF, "
+               "y las solicitudes de la bitácora que aún no se comprueban. Todo queda como solicitudes en **borrador** para que lo revises y lo envíes. "
+               "Puedes repetirlo sin duplicar nada.")
+    ver = st.session_state.setdefault("imp_v", 0)
+    arch = st.file_uploader("Archivo de avance (.json)", type=["json"], key=f"imp_archivo_{ver}")
+    if arch is None:
+        return
+    try:
+        clave = (arch.name, arch.size, ver)
+        if st.session_state.get("imp_clave") != clave:
+            st.session_state.imp_plan = importar.planear(importar.leer_avance(arch.getvalue()))
+            st.session_state.imp_clave = clave
+        plan = st.session_state.imp_plan
+        diag = importar.diagnostico(sb, cuenta["id"], plan)
+    except importar.ErrorImportacion as e:
+        st.error(str(e))
+        return
+    except db.ErrorNube as e:
+        st.error(str(e))
+        return
+    except Exception as e:
+        st.error(f"No se pudo leer el avance: {e}")
+        return
+
+    guardado = str(plan["guardado_en"] or "")[:16].replace("T", " ")
+    if plan["fechas"]:
+        f0, f1 = plan["fechas"]
+        st.markdown(f"**Avance guardado el {guardado}** · formato {plan['banco'] or '—'} · movimientos del {f0} al {f1}")
+    else:
+        st.markdown(f"**Avance guardado el {guardado}** · sin estado de cuenta (solo solicitudes de la bitácora)")
+    if plan["fechas_solicitudes"]:
+        g0, g1 = plan["fechas_solicitudes"]
+        st.caption(f"Solicitudes con fecha del {g0} al {g1}: se guardan en el mes de su propia fecha.")
+    if plan["n_movimientos"]:
+        c = st.columns(4)
+        c[0].markdown(estilos.tarjeta("Movimientos", str(plan["n_movimientos"]), f"{diag['movimientos_nuevos']} nuevos · {diag['movimientos_existentes']} ya cargados", "acento"), unsafe_allow_html=True)
+        c[1].markdown(estilos.tarjeta("Gastos comprobados", str(diag["gastos_listos"]), "se importarán", "comprobado"), unsafe_allow_html=True)
+        c[2].markdown(estilos.tarjeta("Facturas", str(plan["n_facturas"]), f"{plan['n_pdfs']} con PDF · {plan['n_sin_pdf']} sin PDF", "acento"), unsafe_allow_html=True)
+        c[3].markdown(estilos.tarjeta("No necesarios", str(len(plan["no_necesarios"])), "se marcarán", "no_necesario"), unsafe_allow_html=True)
+    if plan["solicitudes"]:
+        d = st.columns(2)
+        d[0].markdown(estilos.tarjeta("Solicitudes sin comprobar", str(diag["solicitudes_nuevas"]), "se crearán en borrador", "pendiente"), unsafe_allow_html=True)
+        d[1].markdown(estilos.tarjeta("Ya en la nube", str(diag["solicitudes_existentes"]), "no se duplican", "acento"), unsafe_allow_html=True)
+        with st.expander("Ver las solicitudes del archivo"):
+            st.dataframe(pd.DataFrame(plan["solicitudes"])[["fecha", "category", "employee_name", "description", "request_number", "number_of_days", "number_of_people", "monto"]]
+                         .rename(columns={"fecha": "Fecha", "category": "Categoría", "employee_name": "Empleado", "description": "Descripción",
+                                          "request_number": "Request", "number_of_days": "Días", "number_of_people": "Personas", "monto": "Monto"}),
+                         hide_index=True, use_container_width=True)
+        aplic = sorted({str(x["applicant_origen"]) for x in plan["solicitudes"] if x.get("applicant_origen")})
+        if aplic:
+            st.caption(f"En el archivo aparecían como aplicante: {', '.join(aplic)}. En la nube quedan a nombre de quien tiene la cuenta ({cuenta['nombre']}).")
+    for a in plan["avisos"]:
+        st.warning(a)
+    if diag["gastos_ya_comprobados"]:
+        st.info(f"{len(diag['gastos_ya_comprobados'])} gasto(s) ya están comprobados en la nube y se omitirán.")
+    if diag["gastos_uuid_usado"]:
+        st.warning(f"{len(diag['gastos_uuid_usado'])} gasto(s) usan una factura (UUID) que ya existe en otro gasto de la nube y no se importarán: "
+                   + "; ".join(str(x) for x in diag["gastos_uuid_usado"]))
+    confirma = True
+    if plan["banco"] and cuenta.get("formato") and plan["banco"] != cuenta["formato"]:
+        st.warning(f"El avance es del formato «{plan['banco']}» y esta cuenta ({cuenta['nombre']}) usa «{cuenta['formato']}». "
+                   "Verifica que sea la cuenta correcta.")
+        confirma = st.checkbox("Sí, es la cuenta correcta", key="imp_confirma_cuenta")
+    nada = (diag["gastos_listos"] == 0 and diag["movimientos_nuevos"] == 0 and not plan["no_necesarios"]
+            and diag["solicitudes_nuevas"] == 0)
+    if nada:
+        st.caption("No hay nada nuevo que importar.")
+    if st.button("📥 Importar ahora", type="primary", key="imp_ejecutar", disabled=nada or not confirma):
+        barra = st.progress(0.0, text="Preparando…")
+        try:
+            rep = importar.ejecutar(sb, cuenta, plan, lambda p, t: barra.progress(p, text=t))
+        except db.ErrorNube as e:
+            st.error(f"La importación se detuvo: {e}")
+            return
+        st.session_state.imp_reporte = rep
+        st.session_state.imp_v = ver + 1
+        st.session_state.pop("imp_clave", None)
+        st.rerun()
 
 
 def _comprobar_desde_estado(sb, cuenta: dict, periodo: dict, sel: pd.DataFrame) -> None:
