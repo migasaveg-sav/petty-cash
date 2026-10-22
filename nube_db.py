@@ -228,28 +228,35 @@ def subir_estado_cuenta(sb, cuenta_id: str, df: pd.DataFrame) -> dict[str, int]:
     return {"nuevos": nuevos, "ya_existian": len(filas) - nuevos, "sin_fecha_o_monto": descartadas}
 
 
-def listar_movimientos(sb, cuenta_id: str, estado: str | None = None,
+def listar_movimientos(sb, cuenta_id: str, estado: "str | list[str] | None" = None,
                        periodo_id: str | None = None) -> pd.DataFrame:
     def construir():
         q = sb.table("movimientos").select("*").eq("cuenta_id", cuenta_id)
-        if estado:
+        if isinstance(estado, (list, tuple)):
+            q = q.in_("estado", list(estado))
+        elif estado:
             q = q.eq("estado", estado)
         if periodo_id:
             q = q.eq("periodo_id", periodo_id)
         return q.order("fecha", desc=False).order("creado_en", desc=False)
     filas = _paginado(construir)
-    cols = ["id", "fecha", "descripcion", "monto", "saldo", "estado", "periodo_id", "ocurrencia"]
+    cols = ["id", "fecha", "descripcion", "monto", "saldo", "estado", "periodo_id", "ocurrencia", "motivo_espera", "espera_desde"]
     df = pd.DataFrame(filas, columns=cols) if filas else pd.DataFrame(columns=cols)
     if not df.empty:
         df["monto"] = df["monto"].astype(float)
     return df
 
 
-def cambiar_estado_movimientos(sb, ids: list[str], estado: str) -> None:
-    if estado not in ("pendiente", "no_necesario"):
+def cambiar_estado_movimientos(sb, ids: list[str], estado: str, motivo: str | None = None) -> None:
+    """estado: 'pendiente' (sin comprobar), 'no_necesario' o 'en_espera' (la cuarta clasificación,
+    «Pendiente»: exige un motivo que explique por qué)."""
+    if estado not in ("pendiente", "no_necesario", "en_espera"):
         raise ErrorNube("Estado no permitido.")
+    if estado == "en_espera" and not (motivo or "").strip():
+        raise ErrorNube("Explica por qué el movimiento queda pendiente.")
     if ids:
-        _ejecutar(sb.table("movimientos").update({"estado": estado}).in_("id", ids))
+        cambios = {"estado": estado, "motivo_espera": (motivo or "").strip() or None if estado == "en_espera" else None}
+        _ejecutar(sb.table("movimientos").update(cambios).in_("id", ids))
 
 
 # ----------------------------------------------------------------------
@@ -334,7 +341,9 @@ def listar_gastos(sb, solicitud_ids: list[str]) -> list[dict]:
         g["facturas"] = []
         for x in gf:
             if x["gasto_id"] == g["id"] and x["factura_id"] in detalle_fact:
-                g["facturas"].append({**detalle_fact[x["factura_id"]], "monto_aplicado": x["monto_total"]})
+                g["facturas"].append({**detalle_fact[x["factura_id"]], "monto_aplicado": x["monto_total"],
+                                      "iva_aplicado": x.get("iva", 0), "isr_aplicado": x.get("isr_retenido", 0),
+                                      "iva_ret_aplicado": x.get("iva_retenido", 0), "ish_aplicado": x.get("ish", 0)})
     return gastos
 
 
@@ -472,7 +481,7 @@ COLUMNAS_REVISION = [
     "id", "cuenta_id", "periodo_id", "fecha", "descripcion", "monto", "saldo", "estado", "gasto_id", "categoria",
     "material", "monto_estado", "suma_facturas", "diferencia", "tiene_diferencia", "propina", "solicitud_id",
     "solicitud_numero", "solicitud_estado", "employee_name", "solicitud_descripcion", "request_number",
-    "lote_id", "lote_numero", "lote_estado", "fecha_pago", "referencia_pago",
+    "lote_id", "lote_numero", "lote_estado", "fecha_pago", "referencia_pago", "motivo_espera", "espera_desde",
 ]
 
 
@@ -496,3 +505,30 @@ def uuids_usados(sb, uuids: list[str]) -> set[str]:
         filas = _ejecutar(sb.table("facturas").select("uuid_cfdi").in_("uuid_cfdi", lista[i:i + 100]).eq("eliminado", False)) or []
         usados |= {f["uuid_cfdi"] for f in filas}
     return usados
+
+
+# ----------------------------------------------------------------------
+# Lotes enviados a revisión (envíos numerados) y reportes
+# ----------------------------------------------------------------------
+def listar_envio_gastos(sb, cuenta_id: str, periodo_id: str) -> list[dict]:
+    """Cada gasto de cada envío del mes con su resultado (en_revision / aprobado / devuelto)."""
+    def construir():
+        return (sb.table("v_envio_gastos").select("*").eq("cuenta_id", cuenta_id).eq("periodo_id", periodo_id)
+                .order("envio_numero", desc=False))
+    return _paginado(construir)
+
+
+def listar_envios_resumen(sb, cuenta_id: str, periodo_id: str) -> list[dict]:
+    """Un renglón por envío: monto enviado vs. aprobado para pago, devuelto, en revisión, pagado y fecha de pago."""
+    return _ejecutar(sb.table("v_envios_resumen").select("*").eq("cuenta_id", cuenta_id)
+                     .eq("periodo_id", periodo_id).order("numero", desc=False)) or []
+
+
+def solicitudes_con_pendiente_abierto(sb, cuenta_id: str) -> set[str]:
+    """Ids de solicitudes que tienen algún pendiente abierto del revisor (no se pueden reenviar)."""
+    pend = _ejecutar(sb.table("gastos_pendientes").select("gasto_id").eq("cuenta_id", cuenta_id).neq("estado", "resuelto")) or []
+    if not pend:
+        return set()
+    ids = list({p["gasto_id"] for p in pend})
+    gastos = _ejecutar(sb.table("gastos").select("solicitud_id").in_("id", ids)) or []
+    return {g["solicitud_id"] for g in gastos}
