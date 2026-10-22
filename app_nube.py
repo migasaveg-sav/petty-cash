@@ -989,28 +989,98 @@ def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
                              column_config={"Monto enviado": st.column_config.NumberColumn(format="$%.2f"),
                                             "Aprobado para pago": st.column_config.NumberColumn(format="$%.2f")})
 
-    # ---- Desglose ----
+    # ---- Desglose (una fila por solicitud comprobada; los demás movimientos, uno por fila) ----
     st.markdown("##### Desglose del estado de cuenta")
-    f1, f2, f3 = st.columns([1.2, 2.4, 1])
-    filtro = f1.selectbox("Estado", ["Todos", *NOMBRE_MOV.values()], key="env_filtro")
-    texto = f2.text_input("🔎 Buscar por descripción", key="env_busca")
-    vista = df
+    filas_d = reportes.filas_desglose(df, gastos)
+    f1, f2 = st.columns([1.2, 3])
+    filtro = f1.selectbox("Estado", ["Todos", *reportes.ETIQUETA_REGISTRO.values()], key="env_filtro")
+    texto = f2.text_input("🔎 Buscar (descripción, concepto, #)", key="env_busca")
+    vista_d = filas_d
     if filtro != "Todos":
-        vista = vista[vista["estado"] == {v: k for k, v in NOMBRE_MOV.items()}[filtro]]
+        clave = {v: k for k, v in reportes.ETIQUETA_REGISTRO.items()}[filtro]
+        vista_d = [r for r in vista_d if r["estado"] == clave]
     if texto.strip():
-        vista = vista[vista["descripcion"].str.contains(texto.strip(), case=False, na=False)]
-    paginas = max(1, -(-len(vista) // POR_PAGINA))
-    pagina = f3.selectbox("Página", list(range(1, paginas + 1)), key=f"env_pag_{filtro}_{texto}_{paginas}") if paginas > 1 else 1
-    st.caption(f"{len(vista)} movimiento(s). Haz clic en uno para ver toda su información.")
-    pag = vista.iloc[(pagina - 1) * POR_PAGINA: pagina * POR_PAGINA]
+        t = texto.strip().lower()
+        vista_d = [r for r in vista_d if t in " ".join(str(r[k]) for k in ("descripcion", "concepto", "numero", "situacion")).lower()]
+    n_sol = sum(1 for r in filas_d if r["tipo"] == "solicitud")
+    n_mov_sol = sum(r["movs"] for r in filas_d if r["tipo"] == "solicitud")
+    st.caption(f"{len(filas_d)} filas: {n_sol} solicitud(es) comprobada(s) que agrupan {n_mov_sol} movimientos, más "
+               f"{len(filas_d) - n_sol} movimiento(s) sin comprobar, pendientes o no necesarios. Haz clic en una fila para ver el detalle.")
+    if not vista_d:
+        st.caption("Ningún registro coincide con el filtro.")
+        return
+    tabla_d = pd.DataFrame([{
+        "Estado": reportes.ETIQUETA_REGISTRO[r["estado"]], "Fecha": r["fecha"], "Sol. #": r["numero"], "Descripción": r["descripcion"],
+        "Concepto": r["concepto"], "Mov.": r["movs"], "Monto": r["monto"], "Diferencia": r["diferencia"] if r["tipo"] == "solicitud" else None,
+        "Situación": r["situacion"]} for r in vista_d])
+    tabla_d["Sol. #"] = tabla_d["Sol. #"].astype("Int64")
+    inv = {v: k for k, v in reportes.ETIQUETA_REGISTRO.items()}
+
+    def _pintar_d(col):
+        return [f"background-color:{ESTILO_ETIQUETA[inv[v]][0]};color:{ESTILO_ETIQUETA[inv[v]][1]};font-weight:700;text-align:center" for v in col]
+
+    def _pintar_dif(col):
+        return [f"background-color:{estilos.C_DIFERENCIA_AMARILLO};font-weight:700" if r["tiene_diferencia"] else "" for r in vista_d]
+
+    estilo_d = (tabla_d.style.apply(_pintar_d, subset=["Estado"]).apply(_pintar_dif, subset=["Diferencia"])
+                .format({"Monto": "${:,.2f}", "Diferencia": "${:,.2f}"}, na_rep="—"))
+    ev = st.dataframe(estilo_d, hide_index=True, use_container_width=True, height=min(36 * (len(tabla_d) + 1) + 4, 420),
+                      on_select="rerun", selection_mode="single-row",
+                      key=f"tabla_env_{st.session_state.get('bit_ver', 0)}_{filtro}_{texto}",
+                      column_config={"Sol. #": st.column_config.NumberColumn("Sol. #", format="%d", width="small"),
+                                     "Estado": st.column_config.TextColumn("Estado", width="small"),
+                                     "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small", help="Movimientos del banco que forman la comprobación")})
+    sel = ev.selection.rows if ev and ev.selection else []
+    if not sel:
+        return
+    r = vista_d[sel[0]]
     gastos_por_id = {g["id"]: g for g in gastos}
-    for idx, r in pag.iterrows():
-        dif = bool(r["tiene_diferencia"]) if pd.notna(r["tiene_diferencia"]) else False
-        etiqueta = (f"{ICONO_MOV[r['estado']]} {r['fecha']}  ·  {r['descripcion']}  ·  {money_md(r['monto'])}  ·  {NOMBRE_MOV[r['estado']]}"
-                    + (f"  ·  Sol. #{int(r['solicitud_numero'])}" if pd.notna(r["solicitud_numero"]) else "") + ("  ·  🟡 diferencia" if dif else ""))
-        with st.container(key=f"mv-{r['estado']}{'-dif' if dif else ''}-{r['id']}"):
-            with st.expander(etiqueta):
-                _detalle_movimiento(sb, df, idx, r, gastos_por_id.get(r["gasto_id"]) if pd.notna(r["gasto_id"]) else None, cuenta, periodo, cerrado)
+    if r["tipo"] == "movimiento":
+        fila = df[df["id"] == r["id"]]
+        if fila.empty:
+            st.warning("El movimiento ya no está en la lista; vuelve a seleccionar.")
+            return
+        with st.container(border=True):
+            _detalle_movimiento(sb, df, fila.index[0], fila.iloc[0], None, cuenta, periodo, cerrado)
+    else:
+        _detalle_solicitud_enviada(df, r, gastos_por_id)
+
+
+def _detalle_solicitud_enviada(df: pd.DataFrame, r: dict, gastos_por_id: dict) -> None:
+    """Detalle de una comprobación (solicitud) con todos sus cargos y facturas."""
+    sub = df[df["solicitud_id"] == r["id"]]
+    if sub.empty:
+        st.warning("La solicitud ya no está en la lista; vuelve a seleccionar.")
+        return
+    r0 = sub.iloc[0]
+    movs = sub.drop_duplicates("id")
+    with st.container(border=True):
+        st.markdown(f"{_tag_html('comprobado')} &nbsp; **🧾 Solicitud #{r['numero']}** · {r['situacion']}", unsafe_allow_html=True)
+        a, b, c = st.columns(3)
+        a.write(f"**Empleado:** {r0.get('employee_name') or '—'}  \n**Request:** {r0.get('request_number') or '—'}")
+        a.caption(str(r0.get("solicitud_descripcion") or ""))
+        b.write(f"**Categoría:** {r0.get('categoria') or '—'}  \n**Material:** {r0.get('material') or '—'}")
+        gs = [gastos_por_id[g] for g in dict.fromkeys(sub["gasto_id"].dropna()) if g in gastos_por_id]
+        facturado = float(pd.to_numeric(sub.drop_duplicates("gasto_id")["suma_facturas"], errors="coerce").fillna(0).sum())
+        c.write(f"**Total de cargos:** {money_md(r['monto'])}  \n**Facturas:** {money_md(facturado)}")
+        c.markdown(("🟡 " if r["tiene_diferencia"] else "") + f"Diferencia: **{money_md(r['diferencia'])}**")
+        st.markdown(f"**🏦 Movimientos del banco que forman esta comprobación ({len(movs)})**")
+        st.dataframe(pd.DataFrame({"Fecha": movs["fecha"], "Descripción": movs["descripcion"], "Monto": movs["monto"].abs()}),
+                     hide_index=True, use_container_width=True,
+                     column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
+        for g in gs:
+            for f in g.get("facturas") or []:
+                cols = st.columns([3.2, 1.2, 1])
+                cols[0].caption(f"🧾 {f.get('uuid_cfdi') or 'SIN-UUID'} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
+                cols[1].caption(money_md(f["monto_aplicado"]))
+                if f.get("adjunto") and cols[2].button("📎 Ver", key=f"venv_{g['id']}_{f['id']}"):
+                    st.session_state.adj_ver = f["adjunto"]["ruta"]
+
+
+def _tag_html(estado: str) -> str:
+    fondo, texto = ESTILO_ETIQUETA[estado]
+    return (f'<span style="background:{fondo};color:{texto};border:1px solid {"#CBD5E1" if estado == "no_necesario" else texto};'
+            f'border-radius:999px;padding:2px 12px;font-weight:700">{reportes.ETIQUETA_REGISTRO[estado]}</span>')
 
 
 def _detalle_movimiento(sb, df: pd.DataFrame, idx, r, g: dict | None, cuenta: dict, periodo: dict, cerrado: bool) -> None:
@@ -1026,12 +1096,14 @@ def _detalle_movimiento(sb, df: pd.DataFrame, idx, r, g: dict | None, cuenta: di
         b.markdown("**Estado: pendiente**")
         b.write(str(r.get("motivo_espera") or "—"))
         if not cerrado and b.button("🔗 Comprobar este movimiento", key=f"mvcmp_{r['id']}"):
+            _nueva_tabla()
             _comprobar_desde_estado(sb, cuenta, periodo, df.loc[[idx]])
         return
     if r["estado"] == "pendiente":
         b.markdown("**Estado**")
         b.write("Aún sin comprobar.")
         if not cerrado and b.button("🔗 Comprobar este movimiento", key=f"mvcmp_{r['id']}"):
+            _nueva_tabla()
             _comprobar_desde_estado(sb, cuenta, periodo, df.loc[[idx]])
         return
     # comprobado
