@@ -486,3 +486,13 @@ def listar_movimientos_revision(sb, cuenta_id: str, periodo_id: str) -> pd.DataF
     if not df.empty:
         df["monto"] = df["monto"].astype(float)
     return df
+
+
+def uuids_usados(sb, uuids: list[str]) -> set[str]:
+    """Cuáles de estos UUID de CFDI ya están en alguna factura (que no esté eliminada)."""
+    usados: set[str] = set()
+    lista = [u for u in dict.fromkeys(uuids) if u]
+    for i in range(0, len(lista), 100):
+        filas = _ejecutar(sb.table("facturas").select("uuid_cfdi").in_("uuid_cfdi", lista[i:i + 100]).eq("eliminado", False)) or []
+        usados |= {f["uuid_cfdi"] for f in filas}
+    return usados
