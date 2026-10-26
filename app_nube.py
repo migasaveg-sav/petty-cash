@@ -1,4 +1,4 @@
-"""Comprobación de Caja Chica — versión en la nube (Etapa 1: aplicante).
+"""Comprobación de Caja Chica — versión en la nube (aplicante y revisor).
 
 Se ejecuta con:  streamlit run app_nube.py
 Requiere los secretos SUPABASE_URL y SUPABASE_KEY (clave anon/publishable).
@@ -1136,22 +1136,359 @@ def _detalle_movimiento(sb, df: pd.DataFrame, idx, r, g: dict | None, cuenta: di
 
 
 # ======================================================================
-# Revisor (Etapa 2 pendiente)
+# Revisor (Etapa 2): cola de revisión, visto bueno, lotes y pagos, cierre de mes
 # ======================================================================
+NOMBRE_SOL_REV = {"enviado_revision": "Por revisar", "con_pendientes": "Devuelta", "en_lote": "En lote · por pagar",
+                  "pagado": "Pagada", "borrador": "Borrador"}
+ESTILO_SOL_REV = {"enviado_revision": ("#DBEAFE", "#1E40AF"), "con_pendientes": ("#FEE2E2", "#B91C1C"),
+                  "en_lote": ("#FEF3C7", "#92400E"), "pagado": ("#DCFCE7", "#166534"), "borrador": ("#F1F5F9", "#475569")}
+FILTROS_COLA = {"Por revisar": "enviado_revision", "Devueltas": "con_pendientes", "En lote": "en_lote", "Pagadas": "pagado",
+                "Borrador (aplicante)": "borrador"}
+
+
+def _nueva_tabla_rev() -> None:
+    st.session_state["rev_ver"] = st.session_state.get("rev_ver", 0) + 1
+    st.session_state.pop("vb_confirm", None)
+
+
 def _vista_revisor(sb) -> None:
-    st.info("La vista completa del revisor (cola de revisión, visto bueno, lotes, pagos y cierre de mes) se construye en la Etapa 2. "
-            "Mientras tanto aquí puedes ver el avance de las cuentas.")
-    cuentas = db.listar_cuentas(sb)
+    hoy = hoy_cdmx()
+    if st.session_state.get("_periodos_dia") != hoy.isoformat() or "_periodos" not in st.session_state:
+        db.obtener_o_crear_periodo(sb, hoy.year, hoy.month)
+        st.session_state._periodos = db.listar_periodos(sb)
+        st.session_state._periodos_dia = hoy.isoformat()
+    if "_cuentas" not in st.session_state:
+        st.session_state._cuentas = db.listar_cuentas(sb)
+    periodos, cuentas = st.session_state._periodos, st.session_state._cuentas
+    if not cuentas:
+        st.warning("No hay cuentas configuradas.")
+        return
+    actual = f"{hoy.year}-{hoy.month:02d}"
+    etiquetas = [db.etiqueta_periodo(p) for p in periodos]
+    nombres = [c["nombre"] for c in cuentas]
+    with st.sidebar:
+        st.markdown('<div class="sidebar-header"><div class="sidebar-header-icon">🧮</div><span>Revisor</span></div>', unsafe_allow_html=True)
+        cuenta = cuentas[nombres.index(st.selectbox("Cuenta", nombres, key="rev_cuenta"))]
+        sel = st.selectbox("Mes", etiquetas, index=etiquetas.index(actual) if actual in etiquetas else 0, key="rev_mes")
+        periodo = periodos[etiquetas.index(sel)]
+        if cuenta.get("limite_reembolso"):
+            st.caption(f"Límite de reembolso: {money_md(cuenta['limite_reembolso'])}")
+
+    secciones = ["📥 Cola de revisión", "💸 Lotes y pagos", "📊 Resumen y cierre de mes"]
+    elegida = st.segmented_control("Sección", secciones, default=secciones[0], label_visibility="collapsed", key="rev_seccion")
+    vista = elegida or st.session_state.get("_rev_seccion_ult", secciones[0])
+    st.session_state["_rev_seccion_ult"] = vista
+    st.divider()
+    if vista == secciones[0]:
+        _cola_revision(sb, cuenta, periodo)
+    elif vista == secciones[1]:
+        _lotes_revisor(sb, cuenta, cuentas, periodos)
+    else:
+        _resumen_revisor(sb, cuentas, periodo)
+    _visor_adjunto(sb)
+
+
+def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
+    df = db.listar_movimientos_revision(sb, cuenta["id"], periodo["id"])
+    if df.empty:
+        st.info(f"{cuenta['nombre']} no tiene movimientos en {db.etiqueta_periodo(periodo)}.")
+        return
+    sols = db.listar_solicitudes(sb, cuenta["id"], periodo["id"])
+    gastos = db.listar_gastos(sb, [x["id"] for x in sols]) if sols else []
+    env_g = db.listar_envio_gastos(sb, cuenta["id"], periodo["id"])
+    pend = db.listar_pendientes_abiertos(sb, cuenta["id"])
+    tol = st.session_state.get("tol", 0.50)
+    envio_de: dict[str, int] = {}
+    for e in env_g:
+        envio_de[e["solicitud_id"]] = max(envio_de.get(e["solicitud_id"], 0), int(e["envio_numero"]))
+    filas = [{**f, "envio": envio_de.get(f["id"])} for f in reportes.filas_desglose(df, gastos) if f["tipo"] == "solicitud"]
+    # Solicitudes abiertas (borrador / sin gasto) no tienen movimiento ligado y no aparecen aquí.
+
+    # ---- Tarjetas ----
+    def _suma(estado):
+        sub = [f for f in filas if f["solicitud_estado"] == estado]
+        return len(sub), sum(f["monto"] for f in sub)
+    cols = st.columns(4)
+    for col, (estado, titulo, tono) in zip(cols, (("enviado_revision", "Por revisar", "acento"), ("con_pendientes", "Devueltas al aplicante", "rojo"),
+                                                  ("en_lote", "En lote · por pagar", "alerta"), ("pagado", "Pagadas", "comprobado"))):
+        n, m = _suma(estado)
+        col.markdown(estilos.tarjeta(titulo, str(n), estilos.money_html(m), tono), unsafe_allow_html=True)
+    cu = reportes.cuadre(df.drop_duplicates("id"))
+    st.markdown(estilos.cuadre_html(cu), unsafe_allow_html=True)
+
+    f1, f2 = st.columns([1.4, 3])
+    filtro = f1.selectbox("Mostrar", [*FILTROS_COLA, "Todas"], key="rev_filtro")
+    texto = f2.text_input("🔎 Buscar (descripción, concepto, empleado, #)", key="rev_busca")
+    vista = filas
+    if filtro != "Todas":
+        vista = [f for f in vista if f["solicitud_estado"] == FILTROS_COLA[filtro]]
+    if texto.strip():
+        t = texto.strip().lower()
+        vista = [f for f in vista if t in " ".join(str(f[k]) for k in ("descripcion", "concepto", "numero")).lower()]
+
+    limpias = [f for f in filas if f["solicitud_estado"] == "enviado_revision" and abs(f["diferencia"]) <= tol
+               and f["numero"] not in {p["solicitud_numero"] for p in pend}]
+    if limpias:
+        if st.button(f"⚡ Dar visto bueno a todas las por revisar sin diferencia ({len(limpias)} · {money_md(sum(f['monto'] for f in limpias))})",
+                     key="vb_todas"):
+            st.session_state["vb_confirm"] = tuple(f["id"] for f in limpias)
+
+    if not vista:
+        st.caption("No hay solicitudes con este filtro." if filas else "Todavía no hay solicitudes comprobadas en este mes.")
+        _confirmar_visto_bueno(sb, cuenta, periodo, {f["id"]: f for f in filas})
+        return
+    tabla = pd.DataFrame([{
+        "Estado": NOMBRE_SOL_REV.get(f["solicitud_estado"], f["solicitud_estado"]), "Sol. #": f["numero"], "Fecha": f["fecha"],
+        "Descripción": f["descripcion"], "Concepto": f["concepto"], "Mov.": f["movs"], "Monto": f["monto"], "Diferencia": f["diferencia"],
+        "Enviada en lote": f"#{f['envio']}" if f["envio"] else "—"} for f in vista])
+
+    def _pintar(col):
+        return [f"background-color:{ESTILO_SOL_REV[f['solicitud_estado']][0]};color:{ESTILO_SOL_REV[f['solicitud_estado']][1]};"
+                "font-weight:700;text-align:center" for f in vista]
+
+    def _pintar_dif(col):
+        return [f"background-color:{estilos.C_DIFERENCIA_AMARILLO};font-weight:700" if f["tiene_diferencia"] else "" for f in vista]
+
+    estilo = (tabla.style.apply(_pintar, subset=["Estado"]).apply(_pintar_dif, subset=["Diferencia"])
+              .format({"Monto": "${:,.2f}", "Diferencia": "${:,.2f}"}))
+    st.caption("Selecciona una o varias filas: con una ves el detalle y puedes devolverla; con varias das el visto bueno y se crea el lote de pago.")
+    ev = st.dataframe(estilo, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 420),
+                      on_select="rerun", selection_mode="multi-row",
+                      key=f"tabla_rev_{st.session_state.get('rev_ver', 0)}_{cuenta['id']}_{periodo['id']}_{filtro}_{texto}",
+                      column_config={"Sol. #": st.column_config.NumberColumn("Sol. #", format="%d", width="small"),
+                                     "Estado": st.column_config.TextColumn("Estado", width="small"),
+                                     "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small")})
+    sel = ev.selection.rows if ev and ev.selection else []
+    por_id = {f["id"]: f for f in filas}
+    if sel:
+        elegidas = [vista[i] for i in sel]
+        revisables = [f for f in elegidas if f["solicitud_estado"] == "enviado_revision"]
+        total = sum(f["monto"] for f in elegidas)
+        st.markdown(f"**{len(elegidas)} solicitud(es) seleccionada(s)** · {money_md(total)}")
+        if len(revisables) == len(elegidas):
+            malas = [f for f in elegidas if abs(f["diferencia"]) > tol]
+            if malas:
+                st.warning("Con diferencia mayor a la tolerancia: " + ", ".join(f"#{f['numero']}" for f in malas)
+                           + ". El sistema no deja darles visto bueno; devuélvelas al aplicante.")
+            if st.button(f"✅ Dar visto bueno y crear lote de pago ({len(elegidas)} · {money_md(total)})", type="primary", key="vb_sel"):
+                st.session_state["vb_confirm"] = tuple(f["id"] for f in elegidas)
+        else:
+            st.caption("El visto bueno solo aplica a solicitudes «Por revisar»; quita de la selección las que ya están devueltas, en lote o pagadas.")
+    _confirmar_visto_bueno(sb, cuenta, periodo, por_id)
+    if len(sel) == 1:
+        _detalle_revision(sb, cuenta, vista[sel[0]], df, gastos, pend, tol)
+
+
+def _confirmar_visto_bueno(sb, cuenta: dict, periodo: dict, por_id: dict) -> None:
+    ids = st.session_state.get("vb_confirm")
+    if not ids:
+        return
+    total = sum(por_id[i]["monto"] for i in ids if i in por_id)
+    with st.container(border=True):
+        st.warning(f"**Confirmar visto bueno** · {len(ids)} solicitud(es) de {cuenta['nombre']} · {money_md(total)}. "
+                   "Se crea el lote de pago y las solicitudes quedan **bloqueadas** (solo tú puedes desbloquear el lote mientras no esté pagado).")
+        c1, c2, _ = st.columns([1.3, 1, 3])
+        if c1.button("✅ Sí, cerrar lote", type="primary", key="vb_ok"):
+            try:
+                lote_id = db.cerrar_lote(sb, cuenta["id"], periodo["id"], list(ids))
+                _nueva_tabla_rev()
+                st.session_state.pop("_lotes_sel", None)
+                _flash(f"Lote cerrado por {money_md(total)}. Ya está en «Lotes y pagos» para registrar su pago.")
+                st.rerun()
+            except db.ErrorNube as e:
+                st.error(str(e))
+        if c2.button("Cancelar", key="vb_no"):
+            st.session_state.pop("vb_confirm", None)
+            st.rerun()
+
+
+def _detalle_revision(sb, cuenta: dict, r: dict, df: pd.DataFrame, gastos: list[dict], pend: list[dict], tol: float) -> None:
+    gastos_por_id = {g["id"]: g for g in gastos}
+    _detalle_solicitud_enviada(df, r, gastos_por_id)
+    mias = [p for p in pend if p.get("solicitud_numero") == r["numero"]]
+    for p in mias:
+        with st.container(border=True):
+            st.markdown(f"🚩 **{p['motivo']}** · {p['estado']} · gasto {money_md(p['monto_estado'])}")
+            for c in p["comentarios"]:
+                st.caption(f"💬 **{c['autor']}** ({str(c['creado_en'])[:16].replace('T', ' ')} UTC): {c['texto']}")
+            txt = st.text_input("Comentario", key=f"rcom_{p['id']}")
+            b1, b2, _ = st.columns([1, 1.6, 3])
+            if b1.button("Comentar", key=f"rcomb_{p['id']}"):
+                try:
+                    db.agregar_comentario(sb, cuenta["id"], p["id"], txt)
+                    st.rerun()
+                except db.ErrorNube as e:
+                    st.error(str(e))
+            if b2.button("✅ Dar por resuelto", key=f"rres_{p['id']}"):
+                try:
+                    db.resolver_pendiente(sb, p["id"], txt or None)
+                    _flash("Pendiente resuelto.")
+                    st.rerun()
+                except db.ErrorNube as e:
+                    st.error(str(e))
+    if r["solicitud_estado"] != "enviado_revision":
+        return
+    gs = [gastos_por_id[g] for g in r.get("gasto_ids", []) if g in gastos_por_id]
+    with st.expander("🚩 Devolver al aplicante con un pendiente"):
+        if not gs:
+            st.caption("La solicitud no tiene gastos.")
+            return
+        opciones = {g["id"]: f"{g.get('categoria') or '—'} · cargo {money_md(g['monto_estado'])} · {len(g['movimientos'])} mov." for g in gs}
+        gasto_id = st.selectbox("Gasto", list(opciones), format_func=lambda k: opciones[k], key=f"dev_g_{r['id']}") if len(gs) > 1 else gs[0]["id"]
+        motivos = _catalogo(sb, "motivo_pendiente") or MOTIVOS_DEFAULT
+        motivo = st.selectbox("Motivo", motivos, key=f"dev_m_{r['id']}")
+        coment = st.text_area("Comentario para el aplicante (qué debe corregir)", key=f"dev_c_{r['id']}")
+        if st.button("🚩 Devolver", key=f"dev_b_{r['id']}"):
+            try:
+                db.marcar_pendiente(sb, gasto_id, motivo, coment or None)
+                _nueva_tabla_rev()
+                _flash("Gasto devuelto: la solicitud regresó al aplicante con el pendiente.")
+                st.rerun()
+            except db.ErrorNube as e:
+                st.error(str(e))
+
+
+# ----------------------------------------------------------------------
+# Lotes y pagos
+# ----------------------------------------------------------------------
+def _excel_lote(lote: dict, cuenta_nombre: str, etiqueta_mes: str, gastos: list[dict]) -> bytes:
+    import io
+    filas = [{"Solicitud": g["solicitud"].get("numero"), "Fecha": g["solicitud"].get("fecha"), "Descripción": g["solicitud"].get("description") or "",
+              "Empleado": g["solicitud"].get("employee_name") or "", "Categoría": g.get("categoria") or "",
+              "Monto del cargo": float(g["monto_estado"]), "Facturas": float(g["suma_facturas"]), "Diferencia": float(g["diferencia"])} for g in gastos]
+    tabla = pd.DataFrame(filas)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        resumen = pd.DataFrame([{"Cuenta": cuenta_nombre, "Mes": etiqueta_mes, "Lote": lote["numero"], "Gastos": lote["num_gastos"],
+                                 "Monto": float(lote["monto"]), "Estado": lote["estado"], "Fecha de pago": lote.get("fecha_pago") or "",
+                                 "Referencia": lote.get("referencia_pago") or ""}])
+        resumen.to_excel(w, sheet_name="Lote", index=False)
+        tabla.to_excel(w, sheet_name="Gastos", index=False)
+        fmt = w.book.add_format({"num_format": "$#,##0.00"})
+        w.sheets["Gastos"].set_column("A:E", 18)
+        w.sheets["Gastos"].set_column("F:H", 16, fmt)
+        w.sheets["Lote"].set_column("A:H", 16)
+        w.sheets["Lote"].set_column("E:E", 16, fmt)
+    return buf.getvalue()
+
+
+def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) -> None:
+    alcance = st.radio("Mostrar", ["Esta cuenta", "Todas las cuentas"], horizontal=True, key="rev_lotes_alc")
+    lotes = db.listar_lotes(sb, cuenta["id"] if alcance.startswith("Esta") else None)
+    if not lotes:
+        st.info("Todavía no hay lotes de pago. Se crean al dar visto bueno en la cola de revisión.")
+        return
+    nombre_cta = {c["id"]: c["nombre"] for c in cuentas}
+    mes = {p["id"]: db.etiqueta_periodo(p) for p in periodos}
+    por_pagar = [l for l in lotes if l["estado"] == "por_pagar"]
+    pagados = [l for l in lotes if l["estado"] == "pagado"]
+    k = st.columns(3)
+    k[0].markdown(estilos.tarjeta("Por pagar", str(len(por_pagar)), estilos.money_html(sum(float(l["monto"]) for l in por_pagar)), "alerta"), unsafe_allow_html=True)
+    k[1].markdown(estilos.tarjeta("Pagados", str(len(pagados)), estilos.money_html(sum(float(l["monto"]) for l in pagados)), "comprobado"), unsafe_allow_html=True)
+    k[2].markdown(estilos.tarjeta("Anulados", str(sum(1 for l in lotes if l["estado"] == "anulado")), "desbloqueados", "pendiente"), unsafe_allow_html=True)
+    tabla = pd.DataFrame([{
+        "Cuenta": nombre_cta.get(l["cuenta_id"], ""), "Lote": f"{mes.get(l['periodo_id'], '')}-{l['numero']}", "Cerrado": str(l["cerrado_en"])[:10],
+        "Gastos": l["num_gastos"], "Monto": float(l["monto"]), "Estado": NOMBRE_LOTE.get(l["estado"], l["estado"]),
+        "Fecha de pago": l.get("fecha_pago") or "", "Referencia": l.get("referencia_pago") or ""} for l in lotes])
+    ev = st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 360),
+                      on_select="rerun", selection_mode="single-row", key=f"tabla_lotes_{st.session_state.get('rev_ver', 0)}_{alcance}",
+                      column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
+    sel = ev.selection.rows if ev and ev.selection else []
+    if not sel:
+        st.caption("Haz clic en un lote para ver sus gastos, registrar el pago o desbloquearlo.")
+        return
+    lote = lotes[sel[0]]
+    gastos = db.gastos_de_lote(sb, lote["id"])
+    etiqueta = f"{nombre_cta.get(lote['cuenta_id'], '')} · {mes.get(lote['periodo_id'], '')} · lote {lote['numero']}"
+    with st.container(border=True):
+        st.markdown(f"**{etiqueta}** · {NOMBRE_LOTE.get(lote['estado'], lote['estado'])} · {money_md(lote['monto'])} · {lote['num_gastos']} gasto(s)")
+        if gastos:
+            det = pd.DataFrame([{"Sol. #": g["solicitud"].get("numero"), "Descripción": g["solicitud"].get("description") or "",
+                                 "Empleado": g["solicitud"].get("employee_name") or "", "Categoría": g.get("categoria") or "",
+                                 "Cargo": float(g["monto_estado"]), "Facturas": float(g["suma_facturas"]), "Diferencia": float(g["diferencia"])} for g in gastos])
+            st.dataframe(det, hide_index=True, use_container_width=True,
+                         column_config={c: st.column_config.NumberColumn(c, format="$%.2f") for c in ("Cargo", "Facturas", "Diferencia")})
+        st.download_button("⬇️ Excel del lote (para tesorería)", _excel_lote(lote, nombre_cta.get(lote["cuenta_id"], ""), mes.get(lote["periodo_id"], ""), gastos),
+                           file_name=f"Lote_{nombre_cta.get(lote['cuenta_id'], '').replace(' ', '_')}_{mes.get(lote['periodo_id'], '')}_{lote['numero']}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"xl_lote_{lote['id']}")
+        if lote["estado"] == "pagado":
+            st.success(f"Pagado el {lote.get('fecha_pago')} · referencia {lote.get('referencia_pago')}")
+        elif lote["estado"] == "anulado":
+            st.info(f"Lote anulado: {lote.get('anulado_motivo') or ''}. Sus solicitudes regresaron a «Por revisar».")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**💸 Registrar pago**")
+                fecha = st.date_input("Fecha de pago", value=hoy_cdmx(), key=f"pg_f_{lote['id']}")
+                ref = st.text_input("Referencia / folio de pago (por ejemplo AP-MX o PY-MX)", key=f"pg_r_{lote['id']}")
+                if st.button("✅ Marcar como pagado", type="primary", key=f"pg_b_{lote['id']}"):
+                    try:
+                        db.pagar_lote(sb, lote["id"], fecha, ref)
+                        _nueva_tabla_rev()
+                        _flash("Pago registrado: el aplicante ya lo ve como pagado.")
+                        st.rerun()
+                    except db.ErrorNube as e:
+                        st.error(str(e))
+            with c2:
+                st.markdown("**↩️ Desbloquear lote**")
+                st.caption("Anula el lote y regresa sus solicitudes a «Por revisar». Solo si aún no está pagado.")
+                mot = st.text_input("Motivo (obligatorio)", key=f"ds_m_{lote['id']}")
+                if st.button("Desbloquear lote", key=f"ds_b_{lote['id']}"):
+                    try:
+                        db.desbloquear_lote(sb, lote["id"], mot)
+                        _nueva_tabla_rev()
+                        _flash("Lote desbloqueado.")
+                        st.rerun()
+                    except db.ErrorNube as e:
+                        st.error(str(e))
+
+
+# ----------------------------------------------------------------------
+# Resumen de cuentas y cierre de mes
+# ----------------------------------------------------------------------
+def _resumen_revisor(sb, cuentas: list[dict], periodo: dict) -> None:
+    cob = {c["cuenta_id"]: c for c in db.listar_cobertura(sb, periodo["id"])}
+    cierre = db.estados_cierre_periodo(sb, periodo["id"])
+    aplicantes = db.aplicantes_por_cuenta(sb)
     filas = []
     for c in cuentas:
-        sols = db.listar_solicitudes(sb, c["id"])
-        cuenta_estados = pd.Series([s["estado"] for s in sols]).value_counts().to_dict() if sols else {}
-        envios = db.listar_envios(sb, c["id"])
-        u = envios[0] if envios else None
-        filas.append({"Cuenta": c["nombre"], **{ESTADOS_SOLICITUD[k]: cuenta_estados.get(k, 0) for k in ESTADOS_SOLICITUD},
-                      "Último envío": _fecha_cdmx(u["enviado_en"]) if u else "—",
-                      "Avance del envío": (f"{u['comprobados']} comprobados · {u['no_necesarios']} no necesarios · {u['pendientes']} sin comprobar · {u.get('en_espera', 0)} pendientes" if u else "—")})
-    st.dataframe(pd.DataFrame(filas), hide_index=True, use_container_width=True)
+        sols = db.listar_solicitudes(sb, c["id"], periodo["id"])
+        cuenta_estados = collections.Counter(s["estado"] for s in sols)
+        v = cob.get(c["id"], {})
+        filas.append({
+            "Cuenta": c["nombre"], "Aplicante": aplicantes.get(c["id"], "—"), "Movimientos": int(v.get("movimientos", 0)),
+            "Sin comprobar": int(v.get("pendientes", 0)), "Pendientes": int(v.get("en_espera", 0)), "No necesarios": int(v.get("no_necesarios", 0)),
+            "Comprobados sin lote": int(v.get("comprobados_sin_lote", 0)), "En lote cerrado": int(v.get("en_lote_cerrado", 0)),
+            "Monto en lote": float(v.get("monto_en_lote", 0)), "Por revisar": cuenta_estados.get("enviado_revision", 0),
+            "Devueltas": cuenta_estados.get("con_pendientes", 0), "Mes": "🔒 Cerrado" if cierre.get(c["id"]) == "cerrado" else "Abierto"})
+    st.markdown(f"##### Cobertura de {db.etiqueta_periodo(periodo)} por cuenta")
+    st.dataframe(pd.DataFrame(filas), hide_index=True, use_container_width=True,
+                 column_config={"Monto en lote": st.column_config.NumberColumn(format="$%.2f")})
+    st.caption("Un mes se puede cerrar cuando no queda nada sin comprobar, ni comprobado sin lote cerrado, ni solicitudes abiertas o con pendientes. "
+               "Los movimientos «pendientes» (devoluciones largas) no impiden el cierre.")
+    st.markdown("##### 📅 Cierre de mes")
+    nombres = [c["nombre"] for c in cuentas]
+    c1, c2 = st.columns([1.4, 3])
+    cuenta = cuentas[nombres.index(c1.selectbox("Cuenta", nombres, key="rev_cierre_cuenta"))]
+    cerrado = cierre.get(cuenta["id"]) == "cerrado"
+    if not cerrado:
+        if c2.button(f"🔒 Cerrar {db.etiqueta_periodo(periodo)} de {cuenta['nombre']}", type="primary", key="cierre_ok"):
+            try:
+                db.cerrar_mes_cuenta(sb, periodo["id"], cuenta["id"])
+                _flash(f"Mes cerrado para {cuenta['nombre']}.")
+                st.rerun()
+            except db.ErrorNube as e:
+                st.error(str(e))
+    else:
+        c2.success("Este mes ya está cerrado (solo lectura para el aplicante).")
+        mot = st.text_input("Motivo para reabrir (obligatorio)", key="reab_m")
+        if st.button("🔓 Reabrir mes", key="reab_b"):
+            try:
+                db.reabrir_mes_cuenta(sb, periodo["id"], cuenta["id"], mot)
+                _flash("Mes reabierto.")
+                st.rerun()
+            except db.ErrorNube as e:
+                st.error(str(e))
 
 
 # ======================================================================
