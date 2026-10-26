@@ -71,6 +71,13 @@ SITUACION_SOLICITUD = {"borrador": "Borrador", "enviado_revision": "En revisión
                        "en_lote": "Aprobado (lote cerrado)", "pagado": "Pagado"}
 
 
+def _situacion_movimiento(estado: str, motivo: Any, nota: Any) -> str:
+    """Texto de la columna «Situación» de un movimiento que no está comprobado."""
+    base = (str(motivo) if estado == "pendiente" and isinstance(motivo, str) and motivo
+            else "No requiere comprobación" if estado == "no_necesario" else "Movimiento del banco")
+    return f"{base} · 💬 Revisor: {nota}" if isinstance(nota, str) and nota.strip() else base
+
+
 def _conceptos(gastos: list[dict]) -> str:
     """Emisor / concepto de las facturas del gasto («FACEBOOK», «Aeroméxico»…), sin repetir."""
     vistos: list[str] = []
@@ -121,8 +128,7 @@ def registros_bitacora(solicitudes: list[dict], gastos: list[dict], movs: pd.Dat
             filas.append({
                 "tipo": "movimiento", "id": r.id, "estado": estado, "fecha": r.fecha, "numero": None,
                 "descripcion": r.descripcion, "empleado": "", "categoria": "", "concepto": "", "movs": 1, "monto": round(abs(float(r.monto)), 2),
-                "situacion": (str(motivo) if estado == "pendiente" and isinstance(motivo, str) and motivo
-                              else "No requiere comprobación" if estado == "no_necesario" else "Movimiento del banco")})
+                "situacion": _situacion_movimiento(estado, motivo, getattr(r, "nota_revisor", None))})
     filas.sort(key=lambda f: (PRIORIDAD_REGISTRO[f["estado"]], str(f["fecha"]), f["numero"] or 0))
     return filas
 
@@ -164,8 +170,7 @@ def filas_desglose(df: pd.DataFrame, gastos: list[dict]) -> list[dict]:
         filas.append({
             "tipo": "movimiento", "id": r.id, "estado": estado, "fecha": str(r.fecha), "numero": None, "descripcion": r.descripcion,
             "concepto": "", "movs": 1, "monto": round(abs(float(r.monto)), 2), "diferencia": 0.0, "tiene_diferencia": False,
-            "situacion": (str(motivo) if estado == "pendiente" and isinstance(motivo, str) and motivo
-                          else "No requiere comprobación" if estado == "no_necesario" else "Movimiento del banco")})
+            "situacion": _situacion_movimiento(estado, motivo, getattr(r, "nota_revisor", None))})
     filas.sort(key=lambda f: (f["fecha"], f["numero"] or 0, str(f["id"])))
     return filas
 
