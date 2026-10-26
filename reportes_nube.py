@@ -150,7 +150,7 @@ def filas_desglose(df: pd.DataFrame, gastos: list[dict]) -> list[dict]:
             lote = f"Lote de pago {int(r0['lote_numero'])}" + (f" · pagado el {r0['fecha_pago']}" if r0["lote_estado"] == "pagado" else " · por pagar")
         filas.append({
             "tipo": "solicitud", "id": sid, "estado": "comprobado", "fecha": min(str(x) for x in movs["fecha"]),
-            "numero": int(r0["solicitud_numero"]),
+            "numero": int(r0["solicitud_numero"]), "solicitud_estado": str(r0["solicitud_estado"]), "gasto_ids": gasto_ids,
             "descripcion": (r0.get("solicitud_descripcion") or movs.iloc[0]["descripcion"] or ""),
             "concepto": _conceptos([gastos_por_id[g] for g in gasto_ids if g in gastos_por_id]),
             "movs": int(len(movs)), "monto": round(float(movs["monto"].abs().sum()), 2),
