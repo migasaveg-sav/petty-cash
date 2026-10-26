@@ -316,34 +316,46 @@ def enviar_a_revision(sb, solicitud_id: str) -> None:
 # ----------------------------------------------------------------------
 # Gastos
 # ----------------------------------------------------------------------
+def _en_trozos(sb, tabla: str, columnas: str, campo: str, valores: list[str], tam: int = 80) -> list[dict]:
+    """select ... where campo in (valores), en trozos para no rebasar el largo de la URL."""
+    filas: list[dict] = []
+    for i in range(0, len(valores), tam):
+        filas += _ejecutar(sb.table(tabla).select(columnas).in_(campo, valores[i:i + tam])) or []
+    return filas
+
+
 def listar_gastos(sb, solicitud_ids: list[str]) -> list[dict]:
     """Gastos (con suma de facturas y diferencia) de las solicitudes dadas, con los
     movimientos y facturas que los componen."""
     if not solicitud_ids:
         return []
-    gastos = _ejecutar(sb.table("v_gastos").select("*").in_("solicitud_id", solicitud_ids).eq("eliminado", False)) or []
+    gastos = [g for g in _en_trozos(sb, "v_gastos", "*", "solicitud_id", solicitud_ids) if not g.get("eliminado")]
     if not gastos:
         return []
     ids = [g["id"] for g in gastos]
-    movs = _ejecutar(sb.table("gasto_movimientos").select("gasto_id,movimiento_id").in_("gasto_id", ids)) or []
+    movs = _en_trozos(sb, "gasto_movimientos", "gasto_id,movimiento_id", "gasto_id", ids)
     mov_ids = list({m["movimiento_id"] for m in movs})
-    detalle_mov = {m["id"]: m for m in (_ejecutar(sb.table("movimientos").select("id,fecha,descripcion,monto").in_("id", mov_ids)) or [])} if mov_ids else {}
-    gf = _ejecutar(sb.table("gasto_facturas").select("*").in_("gasto_id", ids)) or []
+    detalle_mov = {m["id"]: m for m in _en_trozos(sb, "movimientos", "id,fecha,descripcion,monto", "id", mov_ids)} if mov_ids else {}
+    gf = _en_trozos(sb, "gasto_facturas", "*", "gasto_id", ids)
     fact_ids = list({x["factura_id"] for x in gf})
-    detalle_fact = {f["id"]: f for f in (_ejecutar(sb.table("facturas").select("*").in_("id", fact_ids)) or [])} if fact_ids else {}
+    detalle_fact = {f["id"]: f for f in _en_trozos(sb, "facturas", "*", "id", fact_ids)} if fact_ids else {}
     adj_ids = list({f["adjunto_id"] for f in detalle_fact.values() if f.get("adjunto_id")})
-    adj = {a["id"]: a for a in (_ejecutar(sb.table("adjuntos").select("id,ruta,bytes_original,bytes_final").in_("id", adj_ids)) or [])} if adj_ids else {}
+    adj = {a["id"]: a for a in _en_trozos(sb, "adjuntos", "id,ruta,bytes_original,bytes_final", "id", adj_ids)} if adj_ids else {}
     for f in detalle_fact.values():
         f["adjunto"] = adj.get(f.get("adjunto_id"))
+    movs_por_gasto: dict[str, list[dict]] = {}
+    for m in movs:
+        if m["movimiento_id"] in detalle_mov:
+            movs_por_gasto.setdefault(m["gasto_id"], []).append(detalle_mov[m["movimiento_id"]])
+    fact_por_gasto: dict[str, list[dict]] = {}
+    for x in gf:
+        if x["factura_id"] in detalle_fact:
+            fact_por_gasto.setdefault(x["gasto_id"], []).append(
+                {**detalle_fact[x["factura_id"]], "monto_aplicado": x["monto_total"], "iva_aplicado": x.get("iva", 0),
+                 "isr_aplicado": x.get("isr_retenido", 0), "iva_ret_aplicado": x.get("iva_retenido", 0), "ish_aplicado": x.get("ish", 0)})
     for g in gastos:
-        g["movimientos"] = [detalle_mov[m["movimiento_id"]] for m in movs
-                            if m["gasto_id"] == g["id"] and m["movimiento_id"] in detalle_mov]
-        g["facturas"] = []
-        for x in gf:
-            if x["gasto_id"] == g["id"] and x["factura_id"] in detalle_fact:
-                g["facturas"].append({**detalle_fact[x["factura_id"]], "monto_aplicado": x["monto_total"],
-                                      "iva_aplicado": x.get("iva", 0), "isr_aplicado": x.get("isr_retenido", 0),
-                                      "iva_ret_aplicado": x.get("iva_retenido", 0), "ish_aplicado": x.get("ish", 0)})
+        g["movimientos"] = movs_por_gasto.get(g["id"], [])
+        g["facturas"] = fact_por_gasto.get(g["id"], [])
     return gastos
 
 
@@ -382,6 +394,7 @@ def factura_a_json(f: dict, adjunto: dict | None = None) -> dict:
         "iva_retenido": round(float(f.get("IVA Retenido") or 0), 2),
         "ish": round(float(f.get("ISH") or 0), 2),
         "incompleta": bool(f.get("Incompleta")),
+        "fuente": "manual" if str(f.get("Fuente") or "").strip().lower() == "manual" or uuid_cfdi is None else "xml",
         "adjunto": adjunto,
     }
 
@@ -527,6 +540,19 @@ def borrar_adjuntos_huerfanos(sb, rutas: list[str]) -> None:
             pass
 
 
+def url_firmada(sb, ruta: str, segundos: int = 3600) -> str | None:
+    """Enlace temporal al PDF (para abrirlo en una pestaña nueva). None si no se pudo generar."""
+    try:
+        r = sb.storage.from_(BUCKET).create_signed_url(ruta, segundos)
+        url = r.get("signedURL") or r.get("signedUrl") or r.get("signed_url") if isinstance(r, dict) else None
+        if url and url.startswith("/"):
+            base = str(getattr(sb, "supabase_url", "") or "").rstrip("/")
+            url = f"{base}/storage/v1{url}" if "/storage/v1" not in url else f"{base}{url}"
+        return url
+    except Exception:
+        return None
+
+
 def descargar_adjunto(sb, ruta: str) -> bytes:
     try:
         return sb.storage.from_(BUCKET).download(ruta)
@@ -585,11 +611,13 @@ def uuids_usados(sb, uuids: list[str]) -> set[str]:
 # ----------------------------------------------------------------------
 # Lotes enviados a revisión (envíos numerados) y reportes
 # ----------------------------------------------------------------------
-def listar_envio_gastos(sb, cuenta_id: str, periodo_id: str) -> list[dict]:
-    """Cada gasto de cada envío del mes con su resultado (en_revision / aprobado / devuelto)."""
+def listar_envio_gastos(sb, cuenta_id: str, periodo_id: str | None = None) -> list[dict]:
+    """Cada gasto de cada envío (del mes dado, o de todos) con su resultado (en_revision / aprobado / devuelto)."""
     def construir():
-        return (sb.table("v_envio_gastos").select("*").eq("cuenta_id", cuenta_id).eq("periodo_id", periodo_id)
-                .order("envio_numero", desc=False))
+        q = sb.table("v_envio_gastos").select("*").eq("cuenta_id", cuenta_id)
+        if periodo_id:
+            q = q.eq("periodo_id", periodo_id)
+        return q.order("envio_numero", desc=False)
     return _paginado(construir)
 
 
