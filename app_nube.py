@@ -267,7 +267,7 @@ def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
                       column_config={"#": st.column_config.NumberColumn("#", format="%d", width="small"),
                                      "Estado": st.column_config.TextColumn("Estado", width="small"),
                                      "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small", help="Movimientos del estado de cuenta que cubre el gasto")})
-    filas = ev.selection.rows if ev and ev.selection else []
+    filas = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
     if not filas:
         st.caption("Haz clic en una fila para abrir el registro y ver sus detalles (gasto, facturas y PDF).")
         return
@@ -293,6 +293,8 @@ def _detalle_registro(sb, cuenta: dict, periodo: dict, cerrado: bool, r: dict, s
             st.write(f"Monto: {money_md(m['monto'])}" + (f" · Saldo: {money_md(m['saldo'])}" if pd.notna(m["saldo"]) else ""))
             if m["estado"] == "en_espera":
                 st.info(f"⏳ Pendiente: {m['motivo_espera']}")
+            if isinstance(m.get("nota_revisor"), str) and m["nota_revisor"].strip():
+                st.warning(f"💬 Nota del revisor: {m['nota_revisor']}")
             if cerrado:
                 return
             abiertos = m["estado"] in ("pendiente", "en_espera")
@@ -449,7 +451,7 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
             on_select="rerun", selection_mode="multi-row", key="cmp_tabla",
             column_config={"fecha": "Fecha", "descripcion": "Descripción",
                            "monto": st.column_config.NumberColumn("Monto", format="$%.2f"), "saldo": st.column_config.NumberColumn("Saldo", format="$%.2f")})
-        filas = ev.selection.rows if ev and ev.selection else []
+        filas = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
         if filas:
             sel = vista.iloc[filas]
             st.info(f"{len(sel)} movimiento(s) seleccionado(s) · total {money_md(sel['monto'].abs().sum())}"
@@ -652,12 +654,13 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
     if estado != "todos":
         vista = vista[vista["estado"] == estado]
     vista = vista.reset_index(drop=True)
-    mostrar = vista[["fecha", "descripcion", "monto", "saldo", "estado", "motivo_espera"]].assign(estado=vista["estado"].map(NOMBRE_MOV))
+    mostrar = vista[["fecha", "descripcion", "monto", "saldo", "estado", "motivo_espera", "nota_revisor"]].assign(estado=vista["estado"].map(NOMBRE_MOV))
     ev = st.dataframe(mostrar, hide_index=True, use_container_width=True,
-                      on_select="rerun", selection_mode="multi-row", key="tabla_mov",
-                      column_config={"fecha": "Fecha", "descripcion": "Descripción", "estado": "Estado", "motivo_espera": "Por qué está pendiente",
+                      on_select="rerun", selection_mode="multi-row",
+                      key=f"tabla_mov_{st.session_state.get('bit_ver', 0)}_{periodo['id']}_{estado}_{alcance}",
+                      column_config={"fecha": "Fecha", "descripcion": "Descripción", "estado": "Estado", "motivo_espera": "Por qué está pendiente", "nota_revisor": "Nota del revisor",
                                      "monto": st.column_config.NumberColumn("Monto", format="$%.2f"), "saldo": st.column_config.NumberColumn("Saldo", format="$%.2f")})
-    filas = ev.selection.rows if ev and ev.selection else []
+    filas = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
     if filas and not cerrado:
         sel = vista.iloc[filas]
         estados_sel = set(sel["estado"])
@@ -1030,7 +1033,7 @@ def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
                       column_config={"Sol. #": st.column_config.NumberColumn("Sol. #", format="%d", width="small"),
                                      "Estado": st.column_config.TextColumn("Estado", width="small"),
                                      "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small", help="Movimientos del banco que forman la comprobación")})
-    sel = ev.selection.rows if ev and ev.selection else []
+    sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista_d)]
     if not sel:
         return
     r = vista_d[sel[0]]
@@ -1174,7 +1177,7 @@ def _vista_revisor(sb) -> None:
         if cuenta.get("limite_reembolso"):
             st.caption(f"Límite de reembolso: {money_md(cuenta['limite_reembolso'])}")
 
-    secciones = ["📥 Cola de revisión", "💸 Lotes y pagos", "📊 Resumen y cierre de mes"]
+    secciones = ["📥 Cola de revisión", "🏦 Estado de cuenta", "💸 Lotes y pagos", "📊 Resumen y cierre de mes"]
     elegida = st.segmented_control("Sección", secciones, default=secciones[0], label_visibility="collapsed", key="rev_seccion")
     vista = elegida or st.session_state.get("_rev_seccion_ult", secciones[0])
     st.session_state["_rev_seccion_ult"] = vista
@@ -1182,6 +1185,8 @@ def _vista_revisor(sb) -> None:
     if vista == secciones[0]:
         _cola_revision(sb, cuenta, periodo)
     elif vista == secciones[1]:
+        _estado_cuenta_revisor(sb, cuenta, periodo)
+    elif vista == secciones[2]:
         _lotes_revisor(sb, cuenta, cuentas, periodos)
     else:
         _resumen_revisor(sb, cuentas, periodo)
@@ -1258,7 +1263,7 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
                       column_config={"Sol. #": st.column_config.NumberColumn("Sol. #", format="%d", width="small"),
                                      "Estado": st.column_config.TextColumn("Estado", width="small"),
                                      "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small")})
-    sel = ev.selection.rows if ev and ev.selection else []
+    sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
     por_id = {f["id"]: f for f in filas}
     if sel:
         elegidas = [vista[i] for i in sel]
@@ -1349,6 +1354,122 @@ def _detalle_revision(sb, cuenta: dict, r: dict, df: pd.DataFrame, gastos: list[
 
 
 # ----------------------------------------------------------------------
+# Estado de cuenta completo (el revisor ve todo como lo clasificó el aplicante y puede reclasificar)
+# ----------------------------------------------------------------------
+CLAVE_REGISTRO_MOV = {"comprobado": "comprobado", "no_necesario": "no_necesario", "pendiente": "sin_comprobar", "en_espera": "pendiente"}
+RUBROS_RECLASIF = {"Sin comprobar": "pendiente", "No necesario": "no_necesario", "Pendiente (devolución u otro caso largo)": "en_espera"}
+
+
+def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
+    df = db.listar_movimientos_revision(sb, cuenta["id"], periodo["id"])
+    if df.empty:
+        st.info(f"{cuenta['nombre']} no tiene movimientos en {db.etiqueta_periodo(periodo)}.")
+        return
+    movs = df.drop_duplicates("id").sort_values(["fecha", "id"]).reset_index(drop=True)
+    cu = reportes.cuadre(movs)
+    cols = st.columns(4)
+    for col, (est, titulo) in zip(cols, (("comprobado", "Comprobados"), ("no_necesario", "No necesarios"),
+                                         ("pendiente", "Sin comprobar"), ("en_espera", "Pendientes"))):
+        col.markdown(estilos.tarjeta(titulo, str(cu["por_estado"][est]["n"]), estilos.money_html(cu["por_estado"][est]["monto"]), est), unsafe_allow_html=True)
+    p = cu["por_estado"]
+    st.markdown(estilos.barra_progreso(p["comprobado"]["n"], p["no_necesario"]["n"], p["pendiente"]["n"], p["en_espera"]["n"]), unsafe_allow_html=True)
+    st.markdown(estilos.cuadre_html(cu), unsafe_allow_html=True)
+    st.caption("Aquí ves **todos** los cargos del estado de cuenta tal como los clasificó el aplicante. "
+               "Selecciona uno o varios para pasarlos al rubro correcto.")
+
+    f1, f2 = st.columns([1.4, 3])
+    filtro = f1.selectbox("Mostrar", ["Todos", *reportes.ETIQUETA_REGISTRO.values()], key="ecr_filtro")
+    texto = f2.text_input("🔎 Buscar por descripción o solicitud", key="ecr_busca")
+    vista = movs
+    inverso = {v: k for k, v in reportes.ETIQUETA_REGISTRO.items()}
+    if filtro != "Todos":
+        vista = vista[vista["estado"].map(CLAVE_REGISTRO_MOV) == inverso[filtro]]
+    if texto.strip():
+        t = texto.strip().lower()
+        vista = vista[(vista["descripcion"].astype(str).str.lower().str.contains(t, regex=False))
+                      | (vista["solicitud_numero"].astype(str).str.lower().str.contains(t, regex=False))]
+    vista = vista.reset_index(drop=True)
+    if vista.empty:
+        st.caption("Ningún movimiento coincide con el filtro.")
+        return
+
+    def _situacion(r) -> str:
+        if r["estado"] == "comprobado":
+            lote = ""
+            if pd.notna(r["lote_numero"]):
+                lote = f" · lote de pago {int(r['lote_numero'])}" + (" (pagado)" if r["lote_estado"] == "pagado" else " (por pagar)")
+            return reportes.SITUACION_SOLICITUD.get(r["solicitud_estado"], str(r["solicitud_estado"])) + lote
+        return reportes._situacion_movimiento(CLAVE_REGISTRO_MOV[r["estado"]], r.get("motivo_espera"), r.get("nota_revisor"))
+
+    tabla = pd.DataFrame({
+        "Estado": vista["estado"].map(CLAVE_REGISTRO_MOV).map(reportes.ETIQUETA_REGISTRO), "Fecha": vista["fecha"],
+        "Descripción": vista["descripcion"], "Monto": vista["monto"].abs(),
+        "Sol. #": pd.to_numeric(vista["solicitud_numero"], errors="coerce").astype("Int64"),
+        "Situación": [_situacion(r) for _, r in vista.iterrows()]})
+
+    def _pintar(col):
+        return [f"background-color:{ESTILO_ETIQUETA[inverso[v]][0]};color:{ESTILO_ETIQUETA[inverso[v]][1]};font-weight:700;text-align:center" for v in col]
+
+    ev = st.dataframe(tabla.style.apply(_pintar, subset=["Estado"]).format({"Monto": "${:,.2f}"}, na_rep="—"),
+                      hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 460),
+                      on_select="rerun", selection_mode="multi-row",
+                      key=f"tabla_ecr_{st.session_state.get('rev_ver', 0)}_{cuenta['id']}_{periodo['id']}_{filtro}_{texto}",
+                      column_config={"Sol. #": st.column_config.NumberColumn("Sol. #", format="%d", width="small"),
+                                     "Estado": st.column_config.TextColumn("Estado", width="small")})
+    sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
+    if not sel:
+        st.caption("Haz clic en una o varias filas para ver el detalle o cambiarlas de rubro.")
+        return
+    elegidos = vista.iloc[sel]
+    st.markdown(f"**{len(elegidos)} movimiento(s) seleccionado(s)** · {money_md(elegidos['monto'].abs().sum())}")
+
+    bloqueados = elegidos[elegidos["lote_estado"].isin(["por_pagar", "pagado"])]
+    comprobados = elegidos[elegidos["estado"] == "comprobado"]
+    gasto_ids = [g for g in dict.fromkeys(comprobados["gasto_id"].dropna())]
+    arrastrados = int(df[df["gasto_id"].isin(gasto_ids)].drop_duplicates("id").shape[0]) if gasto_ids else 0
+
+    if len(elegidos) == 1 and not comprobados.empty:
+        sols = db.listar_solicitudes(sb, cuenta["id"], periodo["id"])
+        gastos = db.listar_gastos(sb, [x["id"] for x in sols]) if sols else []
+        fila = next((f for f in reportes.filas_desglose(df, gastos) if f["tipo"] == "solicitud" and f["id"] == comprobados.iloc[0]["solicitud_id"]), None)
+        if fila:
+            _detalle_solicitud_enviada(df, fila, {g["id"]: g for g in gastos})
+    elif len(elegidos) == 1:
+        m = elegidos.iloc[0]
+        nota = m.get("nota_revisor")
+        if isinstance(nota, str) and nota.strip():
+            st.info(f"💬 Nota que dejaste: {nota}")
+
+    with st.container(border=True):
+        st.markdown("**🔀 Pasar al rubro correcto**")
+        if not bloqueados.empty:
+            st.warning(f"{len(bloqueados)} de los movimientos seleccionados están en un lote de pago cerrado. "
+                       "Desbloquea primero el lote en «Lotes y pagos».")
+        if not comprobados.empty:
+            st.warning(f"{len(comprobados)} de los seleccionados están **comprobados**. Reclasificarlos revierte su gasto completo "
+                       f"({len(gasto_ids)} gasto(s), {arrastrados} movimiento(s) en total): se eliminan sus facturas, la solicitud regresa "
+                       "al aplicante en borrador y los demás movimientos del gasto quedan «sin comprobar».")
+        r1, r2 = st.columns([1.6, 2])
+        rubro = r1.radio("Nuevo rubro", list(RUBROS_RECLASIF), key="ecr_rubro")
+        motivo_espera = None
+        if RUBROS_RECLASIF[rubro] == "en_espera":
+            motivo_espera = r2.selectbox("Por qué queda pendiente", _catalogo(sb, "motivo_espera") or MOTIVOS_ESPERA_DEFAULT, key="ecr_motivo")
+        nota = st.text_area("Nota para el aplicante (obligatoria): por qué lo cambias", key="ecr_nota")
+        ok_rev = True
+        if not comprobados.empty:
+            ok_rev = st.checkbox("Entiendo que se revierte el gasto comprobado", key="ecr_ok")
+        if st.button(f"Pasar {len(elegidos)} movimiento(s) a «{rubro.split(' (')[0]}»", type="primary", key="ecr_aplicar",
+                     disabled=not bloqueados.empty or not ok_rev):
+            try:
+                revertidos = db.reclasificar_movimientos(sb, list(elegidos["id"]), RUBROS_RECLASIF[rubro], nota, motivo_espera)
+                _nueva_tabla_rev()
+                _flash(f"{len(elegidos)} movimiento(s) reclasificado(s)" + (f"; se revirtieron {revertidos} gasto(s)." if revertidos else "."))
+                st.rerun()
+            except db.ErrorNube as e:
+                st.error(str(e))
+
+
+# ----------------------------------------------------------------------
 # Lotes y pagos
 # ----------------------------------------------------------------------
 def _excel_lote(lote: dict, cuenta_nombre: str, etiqueta_mes: str, gastos: list[dict]) -> bytes:
@@ -1393,7 +1514,7 @@ def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) 
     ev = st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 360),
                       on_select="rerun", selection_mode="single-row", key=f"tabla_lotes_{st.session_state.get('rev_ver', 0)}_{alcance}",
                       column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
-    sel = ev.selection.rows if ev and ev.selection else []
+    sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(lotes)]
     if not sel:
         st.caption("Haz clic en un lote para ver sus gastos, registrar el pago o desbloquearlo.")
         return
