@@ -383,10 +383,9 @@ def _detalle_gasto(sb, g: dict, editable: bool) -> None:
         st.caption(f"🏦 {m['fecha']} · {m['descripcion']} · {money_md(m['monto'])}")
     for f in g["facturas"]:
         cols = st.columns([3, 1, 1])
-        cols[0].caption(f"🧾 {(f.get('uuid_cfdi') or 'SIN-UUID')} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
+        cols[0].caption(f"{_etiqueta_factura(f)} · 🧾 {(f.get('uuid_cfdi') or 'SIN-UUID')} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
         cols[1].caption(money_md(f["monto_aplicado"]))
-        if f.get("adjunto") and cols[2].button("📎 Ver", key=f"ver_{g['id']}_{f['id']}"):
-            st.session_state.adj_ver = f["adjunto"]["ruta"]
+        _boton_pdf(sb, f, f"ver_{g['id']}_{f['id']}", cols[2])
     if editable and st.button("↩️ Revertir este gasto", key=f"rev_{g['id']}"):
         try:
             db.revertir_gasto(sb, g["id"])
@@ -395,6 +394,23 @@ def _detalle_gasto(sb, g: dict, editable: bool) -> None:
             st.rerun()
         except db.ErrorNube as e:
             st.error(str(e))
+
+
+def _boton_pdf(sb, f: dict, key: str, columna=None) -> None:
+    """Botón que abre el PDF de la factura en una pestaña nueva (enlace temporal firmado de Supabase).
+    Si no se puede generar el enlace, cae al visor integrado."""
+    if not f.get("adjunto"):
+        return
+    destino = columna if columna is not None else st
+    url = db.url_firmada(sb, f["adjunto"]["ruta"])
+    if url:
+        destino.link_button("📎 Abrir PDF", url)
+    elif destino.button("📎 Ver", key=key):
+        st.session_state.adj_ver = f["adjunto"]["ruta"]
+
+
+def _etiqueta_factura(f: dict) -> str:
+    return "📄 XML" if reportes.tipo_factura(f) == "xml" else "✍️ Manual"
 
 
 def _visor_adjunto(sb) -> None:
@@ -437,10 +453,22 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
         if pend.empty:
             st.info("No hay movimientos pendientes. Carga primero el estado de cuenta en la pestaña «Estado de cuenta».")
             return
-        c1, c2 = st.columns([2, 1])
+        hoy = hoy_cdmx()
+        mes_actual = f"{hoy.year}-{hoy.month:02d}"
+        meses = sorted({str(f)[:7] for f in pend["fecha"]} | {mes_actual}, reverse=True)
+        c0, c1, c2 = st.columns([1.1, 2, 1.3])
+        mes_sel = c0.selectbox("Mes del estado de cuenta", [*meses, "Todos los meses"], index=meses.index(mes_actual),
+                               key=f"cmp_mes_{sol.get('id') or 'nueva'}", help="Por omisión se muestra el mes en curso; cámbialo si aún quedan pendientes de un mes anterior.")
         texto = c1.text_input("🔎 Buscar por descripción", key="cmp_busca")
         cerca = c2.checkbox("Ordenar por cercanía al monto tentativo", value=float(sol["monto_tentativo"] or 0) > 0, key="cmp_cerca")
         vista = pend.copy()
+        if mes_sel != "Todos los meses":
+            vista = vista[vista["fecha"].astype(str).str[:7] == mes_sel]
+            otros = len(pend) - len(vista)
+            if vista.empty and otros:
+                st.info(f"No hay movimientos pendientes en {mes_sel}. Hay {otros} en otros meses: cámbialo en «Mes del estado de cuenta».")
+            elif otros:
+                st.caption(f"Mostrando {mes_sel}. Hay {otros} movimiento(s) pendiente(s) en otros meses.")
         if texto.strip():
             vista = vista[vista["descripcion"].str.contains(texto.strip(), case=False, na=False)]
         if cerca and float(sol["monto_tentativo"] or 0) > 0:
@@ -448,7 +476,7 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
         vista = vista.reset_index(drop=True)
         ev = st.dataframe(
             vista[["fecha", "descripcion", "monto", "saldo"]], hide_index=True, use_container_width=True,
-            on_select="rerun", selection_mode="multi-row", key="cmp_tabla",
+            on_select="rerun", selection_mode="multi-row", key=f"cmp_tabla_{mes_sel}",
             column_config={"fecha": "Fecha", "descripcion": "Descripción",
                            "monto": st.column_config.NumberColumn("Monto", format="$%.2f"), "saldo": st.column_config.NumberColumn("Saldo", format="$%.2f")})
         filas = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
@@ -605,6 +633,7 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
             st.error(str(e))
             return
         _limpiar_comprobacion()
+        _nueva_tabla()
         _flash("Gasto guardado. Cuando termines la solicitud, envíala a revisión.")
         st.rerun()
 
@@ -857,22 +886,7 @@ def _tab_pendientes(sb, cuenta: dict) -> None:
 
 
 def _tab_lotes(sb, cuenta: dict, periodos: list[dict]) -> None:
-    lotes = db.listar_lotes(sb, cuenta["id"])
-    if not lotes:
-        st.info("Todavía no hay lotes de reembolso para tu cuenta.")
-        return
-    etiquetas = {p["id"]: db.etiqueta_periodo(p) for p in periodos}
-    nombres = {"por_pagar": "⏳ Por pagar", "pagado": "✅ Pagado", "anulado": "↩️ Anulado"}
-    df = pd.DataFrame([{
-        "Lote": f"{etiquetas.get(l['periodo_id'], '')}-{l['numero']}", "Cerrado": str(l["cerrado_en"])[:10], "Monto": float(l["monto"]),
-        "Gastos": l["num_gastos"], "Estado": nombres.get(l["estado"], l["estado"]), "Fecha de pago": l.get("fecha_pago") or "",
-        "Referencia": l.get("referencia_pago") or ""} for l in lotes])
-    st.dataframe(df, hide_index=True, use_container_width=True, column_config={"Monto": st.column_config.NumberColumn(format="$%.2f")})
-    pagado = sum(float(l["monto"]) for l in lotes if l["estado"] == "pagado")
-    por_pagar = sum(float(l["monto"]) for l in lotes if l["estado"] == "por_pagar")
-    c1, c2 = st.columns(2)
-    c1.metric("Pagado", money(pagado))
-    c2.metric("Por pagar", money(por_pagar))
+    _lotes_pago_aplicante(sb, cuenta, periodos, None, "tab")
 
 
 # ======================================================================
@@ -887,6 +901,71 @@ POR_PAGINA = 25
 def _fecha_cdmx(ts: str) -> str:
     t = pd.to_datetime(ts, utc=True).tz_convert("America/Mexico_City")
     return t.strftime("%Y-%m-%d %H:%M")
+
+
+def periodos_todos() -> list[dict]:
+    return st.session_state.get("_periodos", [])
+
+
+def _lotes_de_envio(env_g: list[dict], envio_id: str) -> str:
+    """«Lote 1 · pagado, Lote 2 · por pagar» (los lotes de pago del revisor donde cayeron los gastos de este envío)."""
+    vistos: dict[int, str] = {}
+    for r in env_g:
+        if r["envio_id"] == envio_id and r.get("lote_numero") is not None and r.get("resultado") == "aprobado":
+            vistos[int(r["lote_numero"])] = "pagado" if r.get("lote_estado") == "pagado" else "por pagar"
+    return ", ".join(f"Lote {n} · {e}" for n, e in sorted(vistos.items())) or "—"
+
+
+def _estatus_envio(env_g: list[dict], envio_id: str) -> str:
+    n = collections.Counter()
+    for r in env_g:
+        if r["envio_id"] != envio_id:
+            continue
+        if r["resultado"] == "aprobado":
+            n["pagado" if r.get("lote_estado") == "pagado" else "por pagar"] += 1
+        elif r["resultado"] == "devuelto":
+            n["devuelto"] += 1
+        else:
+            n["en revisión"] += 1
+    return " · ".join(f"{n[k]} {k}" for k in ("pagado", "por pagar", "en revisión", "devuelto") if n[k]) or "—"
+
+
+def _lotes_pago_aplicante(sb, cuenta: dict, periodos: list[dict], periodo: dict | None, clave: str) -> None:
+    """Lotes de pago de la cuenta (de un mes o de todos): estado y si ya se pagó; al abrir uno se ven sus gastos."""
+    lotes = db.listar_lotes(sb, cuenta["id"])
+    if periodo is not None:
+        lotes = [l for l in lotes if l["periodo_id"] == periodo["id"]]
+    if not lotes:
+        st.caption("Todavía no hay lotes de pago." if periodo is None else "Todavía no hay lotes de pago este mes: se crean cuando el revisor da el visto bueno.")
+        return
+    mes = {p["id"]: db.etiqueta_periodo(p) for p in periodos}
+    pagado = sum(float(l["monto"]) for l in lotes if l["estado"] == "pagado")
+    por_pagar = sum(float(l["monto"]) for l in lotes if l["estado"] == "por_pagar")
+    k = st.columns(2)
+    k[0].markdown(estilos.tarjeta("Por pagar", str(sum(1 for l in lotes if l["estado"] == "por_pagar")), estilos.money_html(por_pagar), "alerta"), unsafe_allow_html=True)
+    k[1].markdown(estilos.tarjeta("Pagado", str(sum(1 for l in lotes if l["estado"] == "pagado")), estilos.money_html(pagado), "comprobado"), unsafe_allow_html=True)
+    tabla = pd.DataFrame([{
+        "Lote": f"{mes.get(l['periodo_id'], '')}-{l['numero']}", "Cerrado": str(l["cerrado_en"])[:10], "Gastos": l["num_gastos"], "Monto": float(l["monto"]),
+        "Estado": NOMBRE_LOTE.get(l["estado"], l["estado"]), "Fecha de pago": l.get("fecha_pago") or "", "Referencia": l.get("referencia_pago") or ""}
+        for l in lotes])
+    ev = st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 300),
+                      on_select="rerun", selection_mode="single-row", key=f"tabla_lpa_{clave}_{st.session_state.get('bit_ver', 0)}_{periodo['id'] if periodo else 'todos'}",
+                      column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
+    sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(lotes)]
+    if not sel:
+        st.caption("Haz clic en un lote para ver los gastos que incluye.")
+        return
+    lote = lotes[sel[0]]
+    gastos = db.gastos_de_lote(sb, lote["id"])
+    with st.container(border=True):
+        st.markdown(f"**Lote {mes.get(lote['periodo_id'], '')}-{lote['numero']}** · {NOMBRE_LOTE.get(lote['estado'], lote['estado'])} · {money_md(lote['monto'])}")
+        if lote["estado"] == "pagado":
+            st.success(f"Pagado el {lote.get('fecha_pago')} · referencia {lote.get('referencia_pago')}")
+        if gastos:
+            st.dataframe(pd.DataFrame([{"Sol. #": g["solicitud"].get("numero"), "Descripción": g["solicitud"].get("description") or "",
+                                        "Empleado": g["solicitud"].get("employee_name") or "", "Categoría": g.get("categoria") or "",
+                                        "Cargo": float(g["monto_estado"])} for g in gastos]),
+                         hide_index=True, use_container_width=True, column_config={"Cargo": st.column_config.NumberColumn("Cargo", format="$%.2f")})
 
 
 def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
@@ -968,6 +1047,7 @@ def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
             "Monto enviado": float(e["monto_enviado"]), "Revisado y aprobado para pago": float(e["monto_aprobado"]),
             "Devuelto": float(e["monto_devuelto"]), "En revisión": float(e["monto_en_revision"]), "Pagado": float(e["monto_pagado"]),
             "Fecha de pago": (e["primer_pago"] if e["primer_pago"] == e["ultimo_pago"] else f"{e['primer_pago']} a {e['ultimo_pago']}") if e.get("ultimo_pago") else "—",
+            "Lote(s) de pago": _lotes_de_envio(env_g, e["envio_id"]), "Estatus": _estatus_envio(env_g, e["envio_id"]),
         } for e in resumen])
         dinero = {c: st.column_config.NumberColumn(c, format="$%.2f") for c in ("Monto enviado", "Revisado y aprobado para pago", "Devuelto", "En revisión", "Pagado")}
         st.dataframe(tabla, hide_index=True, use_container_width=True, column_config=dinero)
@@ -991,6 +1071,10 @@ def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
                 st.dataframe(pd.DataFrame(det), hide_index=True, use_container_width=True,
                              column_config={"Monto enviado": st.column_config.NumberColumn(format="$%.2f"),
                                             "Aprobado para pago": st.column_config.NumberColumn(format="$%.2f")})
+
+    # ---- Lotes de pago: los mismos que ve el revisor ----
+    st.markdown("##### 💸 Lotes de pago (los mismos que ve el revisor)")
+    _lotes_pago_aplicante(sb, cuenta, periodos_todos(), periodo, "enviados")
 
     # ---- Desglose (una fila por solicitud comprobada; los demás movimientos, uno por fila) ----
     st.markdown("##### Desglose del estado de cuenta")
@@ -1046,10 +1130,10 @@ def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
         with st.container(border=True):
             _detalle_movimiento(sb, df, fila.index[0], fila.iloc[0], None, cuenta, periodo, cerrado)
     else:
-        _detalle_solicitud_enviada(df, r, gastos_por_id)
+        _detalle_solicitud_enviada(sb, df, r, gastos_por_id)
 
 
-def _detalle_solicitud_enviada(df: pd.DataFrame, r: dict, gastos_por_id: dict) -> None:
+def _detalle_solicitud_enviada(sb, df: pd.DataFrame, r: dict, gastos_por_id: dict) -> None:
     """Detalle de una comprobación (solicitud) con todos sus cargos y facturas."""
     sub = df[df["solicitud_id"] == r["id"]]
     if sub.empty:
@@ -1074,10 +1158,9 @@ def _detalle_solicitud_enviada(df: pd.DataFrame, r: dict, gastos_por_id: dict) -
         for g in gs:
             for f in g.get("facturas") or []:
                 cols = st.columns([3.2, 1.2, 1])
-                cols[0].caption(f"🧾 {f.get('uuid_cfdi') or 'SIN-UUID'} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
+                cols[0].caption(f"{_etiqueta_factura(f)} · 🧾 {f.get('uuid_cfdi') or 'SIN-UUID'} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
                 cols[1].caption(money_md(f["monto_aplicado"]))
-                if f.get("adjunto") and cols[2].button("📎 Ver", key=f"venv_{g['id']}_{f['id']}"):
-                    st.session_state.adj_ver = f["adjunto"]["ruta"]
+                _boton_pdf(sb, f, f"venv_{g['id']}_{f['id']}", cols[2])
 
 
 def _tag_html(estado: str) -> str:
@@ -1132,10 +1215,115 @@ def _detalle_movimiento(sb, df: pd.DataFrame, idx, r, g: dict | None, cuenta: di
                        + "; ".join(f"{m['fecha']} {m['descripcion']} {money_md(m['monto'])}" for m in g["movimientos"]))
         for f in g["facturas"]:
             cols = st.columns([3.2, 1.2, 1])
-            cols[0].caption(f"🧾 {f.get('uuid_cfdi') or 'SIN-UUID'} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
+            cols[0].caption(f"{_etiqueta_factura(f)} · 🧾 {f.get('uuid_cfdi') or 'SIN-UUID'} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
             cols[1].caption(money_md(f["monto_aplicado"]))
-            if f.get("adjunto") and cols[2].button("📎 Ver", key=f"venv_{g['id']}_{f['id']}"):
-                st.session_state.adj_ver = f["adjunto"]["ruta"]
+            _boton_pdf(sb, f, f"venv_{g['id']}_{f['id']}", cols[2])
+
+
+# ======================================================================
+# Panel de pendientes (arriba) y búsqueda de pagos (aplicante)
+# ======================================================================
+def _cache_corto(clave: tuple, ttl: int, calcular):
+    """Guarda un resultado en la sesión por `ttl` segundos (se renueva solo si cambia la clave)."""
+    import time
+    almacen = st.session_state.setdefault("_cache_corto", {})
+    hit = almacen.get(clave[0])
+    if hit and hit["clave"] == clave and time.time() - hit["t"] < ttl:
+        return hit["valor"]
+    valor = calcular()
+    almacen[clave[0]] = {"clave": clave, "t": time.time(), "valor": valor}
+    return valor
+
+
+def _panel_pendientes(sb, cuenta: dict) -> None:
+    """Todo lo que está pendiente (movimientos de cualquier mes y gastos devueltos por el revisor), con su banco."""
+    ver = st.session_state.get("bit_ver", 0)
+    movs = _cache_corto(("pend_movs", cuenta["id"], ver), 60, lambda: db.listar_movimientos(sb, cuenta["id"], estado="en_espera"))
+    devueltos = _cache_corto(("pend_dev", cuenta["id"], ver), 60, lambda: db.listar_pendientes_abiertos(sb, cuenta["id"]))
+    if movs.empty and not devueltos:
+        return
+    banco = cuenta["nombre"] + (f" · {cuenta['banco']}" if cuenta.get("banco") and cuenta["banco"] not in cuenta["nombre"] else "")
+    ahora = pd.Timestamp.now(tz="UTC")
+    filas = []
+    for m in movs.itertuples():
+        esp = getattr(m, "espera_desde", None)
+        desde = pd.to_datetime(esp, utc=True) if isinstance(esp, str) and esp else None
+        dias = int((ahora - desde).days) if desde is not None else None
+        nota_r = getattr(m, "nota_revisor", None)
+        nota = nota_r if isinstance(nota_r, str) else ""
+        filas.append({"Banco / cuenta": banco, "Fecha": m.fecha, "Descripción": m.descripcion, "Monto": abs(float(m.monto)),
+                      "Por qué está pendiente": m.motivo_espera or "", "Días": dias, "Nota del revisor": nota})
+    total = sum(f["Monto"] for f in filas)
+    with st.container(border=True, key="panel-pendientes"):
+        st.markdown(f"#### ⏳ Pendientes · {len(filas)} movimiento(s) · {money_md(total)}" if filas else "#### 🚩 Gastos devueltos por el revisor")
+        if filas:
+            tabla = pd.DataFrame(filas)
+            st.dataframe(tabla.style.apply(lambda col: ["color:#B91C1C;font-weight:700" if (isinstance(v, (int, float)) and v >= 15) else "" for v in col], subset=["Días"])
+                         .format({"Monto": "${:,.2f}"}, na_rep="—"),
+                         hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 220),
+                         column_config={"Días": st.column_config.NumberColumn("Días", format="%d", help="Días que lleva pendiente (en rojo si pasan de 15)")})
+        if devueltos:
+            st.markdown(f"**🚩 {len(devueltos)} gasto(s) devuelto(s) por el revisor** · atiéndelos en la sección «Pendientes devueltos»")
+            st.dataframe(pd.DataFrame([{"Banco / cuenta": banco, "Solicitud": p.get("solicitud_numero"), "Descripción": p.get("solicitud_descripcion") or "",
+                                        "Monto": float(p.get("monto_estado") or 0), "Motivo": p["motivo"],
+                                        "Último comentario": (p["comentarios"][-1]["texto"] if p.get("comentarios") else "")} for p in devueltos]),
+                         hide_index=True, use_container_width=True, height=min(36 * (len(devueltos) + 1) + 4, 200),
+                         column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
+
+
+def _sin_acentos(t: str) -> str:
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFD", str(t)) if unicodedata.category(c) != "Mn").lower()
+
+
+def _numero(token: str) -> float | None:
+    try:
+        return float(token.replace("$", "").replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _pagina_busqueda(sb, cuenta: dict, periodos: list[dict]) -> None:
+    st.markdown("### 🔎 Buscar pagos e información")
+    st.caption("Busca por monto, concepto, número de request, empleado, categoría, número de solicitud, UUID o referencia de pago. "
+               "Puedes combinar palabras (todas deben coincidir). Un número se busca como monto (±$0.50) y también como texto.")
+    ver = st.session_state.get("bit_ver", 0)
+
+    def cargar():
+        sols = db.listar_solicitudes(sb, cuenta["id"])
+        gastos = db.listar_gastos(sb, [x["id"] for x in sols]) if sols else []
+        movs = db.listar_movimientos(sb, cuenta["id"])
+        env_g = db.listar_envio_gastos(sb, cuenta["id"])
+        return reportes.filas_busqueda(sols, gastos, movs, env_g, {p["id"]: db.etiqueta_periodo(p) for p in periodos})
+
+    filas = _cache_corto(("busqueda", cuenta["id"], ver, st.session_state.get("busq_ref", 0)), 300, cargar)
+    c1, c2, c3, c4 = st.columns([3, 1.2, 1.4, 0.8])
+    texto = c1.text_input("Buscar", key="busq_texto", placeholder="Ej.: 3980, Flight, Facebook, ZHANG, 4500012345…")
+    meses = sorted({f["Mes"] for f in filas}, reverse=True)
+    mes = c2.selectbox("Mes", ["Todos", *meses], key="busq_mes")
+    tipos = ["Todos", "Gasto comprobado", "Movimiento del banco", "Solicitud sin comprobar"]
+    tipo = c3.selectbox("Qué buscar", tipos, key="busq_tipo")
+    if c4.button("🔄", key="busq_ref_btn", help="Actualizar los datos"):
+        st.session_state["busq_ref"] = st.session_state.get("busq_ref", 0) + 1
+        st.rerun()
+    campos = ("Descripción", "Concepto", "Empleado", "Categoría", "Request", "Sol. #", "UUID", "Referencia de pago", "Lote de pago", "Estado", "Fecha", "Fecha de pago")
+    vista = [f for f in filas if (mes == "Todos" or f["Mes"] == mes) and (tipo == "Todos" or f["Tipo"] == tipo)]
+    for tok in _sin_acentos(texto).split():
+        n = _numero(tok)
+        vista = [f for f in vista if tok in _sin_acentos(" ".join(str(f[k]) for k in campos if f[k] not in (None, "")))
+                 or (n is not None and abs(abs(float(f["Monto"])) - n) <= 0.5)]
+    if not vista:
+        st.info("Sin resultados. Prueba con menos palabras o con otro mes.")
+        return
+    tabla = pd.DataFrame(vista, columns=reportes.COLUMNAS_BUSQUEDA)
+    tabla["Sol. #"] = tabla["Sol. #"].astype("Int64")
+    st.markdown(f"**{len(tabla)} resultado(s)** · total {money_md(tabla['Monto'].sum())}")
+    st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 520),
+                 column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f"), "Sol. #": st.column_config.NumberColumn("Sol. #", format="%d", width="small")})
+    d1, d2, _ = st.columns([1.3, 1.3, 3])
+    d1.download_button("⬇️ Excel de los resultados", reportes.excel_tabla(tabla, "Búsqueda"), file_name=f"Busqueda_{cuenta['nombre'].replace(' ', '_')}_{datetime.date.today():%Y%m%d}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="busq_xl")
+    d2.download_button("⬇️ CSV", tabla.to_csv(index=False).encode("utf-8-sig"), file_name=f"Busqueda_{datetime.date.today():%Y%m%d}.csv", mime="text/csv", key="busq_csv")
 
 
 # ======================================================================
@@ -1152,6 +1340,23 @@ FILTROS_COLA = {"Por revisar": "enviado_revision", "Devueltas": "con_pendientes"
 def _nueva_tabla_rev() -> None:
     st.session_state["rev_ver"] = st.session_state.get("rev_ver", 0) + 1
     st.session_state.pop("vb_confirm", None)
+
+
+def _pintar_comprobacion(col) -> list[str]:
+    """Color de la celda «Comprobación»: XML azul, manual naranja."""
+    out = []
+    for v in col:
+        fondo, texto = reportes.COLOR_COMPROBACION.get(v, (None, None))
+        out.append(f"background-color:{fondo};color:{texto};font-weight:700;text-align:center" if fondo else "")
+    return out
+
+
+def _tinte_manual(tabla: pd.DataFrame):
+    """Sombrea toda la fila cuando la comprobación fue manual (o mixta)."""
+    def aplicar(fila):
+        manual = tabla.loc[fila.name, "Comprobación"] in ("Manual", "XML + manual")
+        return [f"background-color:{reportes.FONDO_FILA_MANUAL}" if manual else "" for _ in fila]
+    return aplicar
 
 
 def _vista_revisor(sb) -> None:
@@ -1177,7 +1382,7 @@ def _vista_revisor(sb) -> None:
         if cuenta.get("limite_reembolso"):
             st.caption(f"Límite de reembolso: {money_md(cuenta['limite_reembolso'])}")
 
-    secciones = ["📥 Cola de revisión", "🏦 Estado de cuenta", "💸 Lotes y pagos", "📊 Resumen y cierre de mes"]
+    secciones = ["📥 Cola de revisión", "🏦 Estado de cuenta", "💸 Lotes y pagos", "📊 Resumen y cierre de mes", "⬇️ Descargas"]
     elegida = st.segmented_control("Sección", secciones, default=secciones[0], label_visibility="collapsed", key="rev_seccion")
     vista = elegida or st.session_state.get("_rev_seccion_ult", secciones[0])
     st.session_state["_rev_seccion_ult"] = vista
@@ -1188,8 +1393,10 @@ def _vista_revisor(sb) -> None:
         _estado_cuenta_revisor(sb, cuenta, periodo)
     elif vista == secciones[2]:
         _lotes_revisor(sb, cuenta, cuentas, periodos)
-    else:
+    elif vista == secciones[3]:
         _resumen_revisor(sb, cuentas, periodo)
+    else:
+        _descargas_revisor(sb, cuentas, periodos, cuenta, periodo)
     _visor_adjunto(sb)
 
 
@@ -1244,8 +1451,8 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
         return
     tabla = pd.DataFrame([{
         "Estado": NOMBRE_SOL_REV.get(f["solicitud_estado"], f["solicitud_estado"]), "Sol. #": f["numero"], "Fecha": f["fecha"],
-        "Descripción": f["descripcion"], "Concepto": f["concepto"], "Mov.": f["movs"], "Monto": f["monto"], "Diferencia": f["diferencia"],
-        "Enviada en lote": f"#{f['envio']}" if f["envio"] else "—"} for f in vista])
+        "Descripción": f["descripcion"], "Concepto": f["concepto"], "Comprobación": f["comprobacion"], "Mov.": f["movs"], "Monto": f["monto"],
+        "Diferencia": f["diferencia"], "Enviada en lote": f"#{f['envio']}" if f["envio"] else "—"} for f in vista])
 
     def _pintar(col):
         return [f"background-color:{ESTILO_SOL_REV[f['solicitud_estado']][0]};color:{ESTILO_SOL_REV[f['solicitud_estado']][1]};"
@@ -1254,9 +1461,10 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
     def _pintar_dif(col):
         return [f"background-color:{estilos.C_DIFERENCIA_AMARILLO};font-weight:700" if f["tiene_diferencia"] else "" for f in vista]
 
-    estilo = (tabla.style.apply(_pintar, subset=["Estado"]).apply(_pintar_dif, subset=["Diferencia"])
-              .format({"Monto": "${:,.2f}", "Diferencia": "${:,.2f}"}))
-    st.caption("Selecciona una o varias filas: con una ves el detalle y puedes devolverla; con varias das el visto bueno y se crea el lote de pago.")
+    estilo = (tabla.style.apply(_tinte_manual(tabla), axis=1).apply(_pintar, subset=["Estado"]).apply(_pintar_dif, subset=["Diferencia"])
+              .apply(_pintar_comprobacion, subset=["Comprobación"]).format({"Monto": "${:,.2f}", "Diferencia": "${:,.2f}"}))
+    st.caption("🟧 Las filas sombreadas en naranja se comprobaron capturando datos a mano (sin XML); revísalas con más cuidado. "
+               "Selecciona una o varias filas: con una ves el detalle y puedes devolverla; con varias das el visto bueno y se crea el lote de pago.")
     ev = st.dataframe(estilo, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 420),
                       on_select="rerun", selection_mode="multi-row",
                       key=f"tabla_rev_{st.session_state.get('rev_ver', 0)}_{cuenta['id']}_{periodo['id']}_{filtro}_{texto}",
@@ -1309,7 +1517,7 @@ def _confirmar_visto_bueno(sb, cuenta: dict, periodo: dict, por_id: dict) -> Non
 
 def _detalle_revision(sb, cuenta: dict, r: dict, df: pd.DataFrame, gastos: list[dict], pend: list[dict], tol: float) -> None:
     gastos_por_id = {g["id"]: g for g in gastos}
-    _detalle_solicitud_enviada(df, r, gastos_por_id)
+    _detalle_solicitud_enviada(sb, df, r, gastos_por_id)
     mias = [p for p in pend if p.get("solicitud_numero") == r["numero"]]
     for p in mias:
         with st.container(border=True):
@@ -1366,6 +1574,9 @@ def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
         st.info(f"{cuenta['nombre']} no tiene movimientos en {db.etiqueta_periodo(periodo)}.")
         return
     movs = df.drop_duplicates("id").sort_values(["fecha", "id"]).reset_index(drop=True)
+    sols = db.listar_solicitudes(sb, cuenta["id"], periodo["id"])
+    gastos = db.listar_gastos(sb, [x["id"] for x in sols]) if sols else []
+    comprobacion_de = {f["id"]: f["comprobacion"] for f in reportes.filas_desglose(df, gastos) if f["tipo"] == "solicitud"}
     cu = reportes.cuadre(movs)
     cols = st.columns(4)
     for col, (est, titulo) in zip(cols, (("comprobado", "Comprobados"), ("no_necesario", "No necesarios"),
@@ -1405,12 +1616,14 @@ def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
         "Estado": vista["estado"].map(CLAVE_REGISTRO_MOV).map(reportes.ETIQUETA_REGISTRO), "Fecha": vista["fecha"],
         "Descripción": vista["descripcion"], "Monto": vista["monto"].abs(),
         "Sol. #": pd.to_numeric(vista["solicitud_numero"], errors="coerce").astype("Int64"),
+        "Comprobación": [comprobacion_de.get(r["solicitud_id"], "") if r["estado"] == "comprobado" else "" for _, r in vista.iterrows()],
         "Situación": [_situacion(r) for _, r in vista.iterrows()]})
 
     def _pintar(col):
         return [f"background-color:{ESTILO_ETIQUETA[inverso[v]][0]};color:{ESTILO_ETIQUETA[inverso[v]][1]};font-weight:700;text-align:center" for v in col]
 
-    ev = st.dataframe(tabla.style.apply(_pintar, subset=["Estado"]).format({"Monto": "${:,.2f}"}, na_rep="—"),
+    ev = st.dataframe(tabla.style.apply(_tinte_manual(tabla), axis=1).apply(_pintar, subset=["Estado"])
+                      .apply(_pintar_comprobacion, subset=["Comprobación"]).format({"Monto": "${:,.2f}"}, na_rep="—"),
                       hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 460),
                       on_select="rerun", selection_mode="multi-row",
                       key=f"tabla_ecr_{st.session_state.get('rev_ver', 0)}_{cuenta['id']}_{periodo['id']}_{filtro}_{texto}",
@@ -1429,11 +1642,9 @@ def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
     arrastrados = int(df[df["gasto_id"].isin(gasto_ids)].drop_duplicates("id").shape[0]) if gasto_ids else 0
 
     if len(elegidos) == 1 and not comprobados.empty:
-        sols = db.listar_solicitudes(sb, cuenta["id"], periodo["id"])
-        gastos = db.listar_gastos(sb, [x["id"] for x in sols]) if sols else []
         fila = next((f for f in reportes.filas_desglose(df, gastos) if f["tipo"] == "solicitud" and f["id"] == comprobados.iloc[0]["solicitud_id"]), None)
         if fila:
-            _detalle_solicitud_enviada(df, fila, {g["id"]: g for g in gastos})
+            _detalle_solicitud_enviada(sb, df, fila, {g["id"]: g for g in gastos})
     elif len(elegidos) == 1:
         m = elegidos.iloc[0]
         nota = m.get("nota_revisor")
@@ -1565,6 +1776,69 @@ def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) 
 
 
 # ----------------------------------------------------------------------
+# Descargas: Excel del desglose de comprobación (total o parcial)
+# ----------------------------------------------------------------------
+HOJAS_EXCEL = {"Comprobados": "comprobados", "No necesarios": "no_necesarios", "Sin comprobar": "sin_comprobar",
+               "Pendientes": "pendientes", "Resumen / cuadre": "resumen"}
+
+
+def _descargas_revisor(sb, cuentas: list[dict], periodos: list[dict], cuenta: dict, periodo: dict) -> None:
+    st.markdown("##### 📥 Excel con el desglose de comprobación")
+    st.caption("Incluye lo comprobado (por enviar, en revisión, aprobado, pagado o devuelto), lo no necesario, lo pendiente y lo que aún está por comprobar. "
+               "Elige qué cuentas y meses quieres, o descarga todo.")
+    nombres = [c["nombre"] for c in cuentas]
+    etiquetas = [db.etiqueta_periodo(p) for p in periodos]
+    a1, a2 = st.columns(2)
+    todas_c = a1.checkbox("Todas las cuentas", key="dl_todas_c")
+    todos_m = a2.checkbox("Todos los meses", key="dl_todos_m")
+    c1, c2 = st.columns(2)
+    sel_c = nombres if todas_c else c1.multiselect("Cuentas", nombres, default=[cuenta["nombre"]], key="dl_cuentas")
+    sel_m = etiquetas if todos_m else c2.multiselect("Meses", etiquetas, default=[db.etiqueta_periodo(periodo)], key="dl_meses")
+    b1, b2 = st.columns(2)
+    hojas = b1.multiselect("Qué incluir", list(HOJAS_EXCEL), default=list(HOJAS_EXCEL), key="dl_hojas")
+    estatus = b2.multiselect("De lo comprobado, solo gastos…", list(reportes.ESTATUS_GASTO.values()), default=list(reportes.ESTATUS_GASTO.values()),
+                             key="dl_estatus")
+    combos = len(sel_c) * len(sel_m)
+    if not sel_c or not sel_m or not hojas:
+        st.info("Elige al menos una cuenta, un mes y una hoja.")
+        return
+    clave = (tuple(sel_c), tuple(sel_m), tuple(hojas), tuple(estatus))
+    if combos > 30:
+        st.warning(f"Son {combos} combinaciones de cuenta y mes; la descarga puede tardar. Considera acotarla.")
+    if st.button(f"📊 Preparar Excel ({len(sel_c)} cuenta(s) · {len(sel_m)} mes(es))", type="primary", key="dl_preparar"):
+        por_nombre = {c["nombre"]: c for c in cuentas}
+        por_etiqueta = {db.etiqueta_periodo(p): p for p in periodos}
+        aplicantes = db.aplicantes_por_cuenta(sb)
+        conjuntos = []
+        with st.spinner("Armando el Excel…"):
+            for nc in sel_c:
+                cta = por_nombre[nc]
+                for em in sel_m:
+                    per = por_etiqueta[em]
+                    movs = db.listar_movimientos(sb, cta["id"], periodo_id=per["id"])
+                    sols = db.listar_solicitudes(sb, cta["id"], per["id"])
+                    if movs.empty and not sols:
+                        continue
+                    gastos = db.listar_gastos(sb, [x["id"] for x in sols]) if sols else []
+                    conjuntos.append({"cuenta": nc, "periodo": em, "applicant": aplicantes.get(cta["id"], ""), "movs": movs, "sols": sols,
+                                      "gastos": gastos, "env_g": db.listar_envio_gastos(sb, cta["id"], per["id"])})
+        if not conjuntos:
+            st.warning("No hay datos en las cuentas y meses elegidos.")
+        else:
+            inverso = {v: k for k, v in reportes.ESTATUS_GASTO.items()}
+            st.session_state["dl_xl"] = {
+                "clave": clave, "hora": datetime.datetime.now().strftime("%H:%M"), "n": len(conjuntos),
+                "bytes": reportes.excel_revisor(conjuntos, {HOJAS_EXCEL[h] for h in hojas}, {inverso[e] for e in estatus})}
+    xl = st.session_state.get("dl_xl")
+    if xl and xl["clave"] == clave:
+        st.download_button(f"⬇️ Descargar Excel ({xl['n']} cuenta/mes, generado {xl['hora']})", data=xl["bytes"],
+                           file_name=f"Comprobaciones_revisor_{datetime.date.today():%Y%m%d}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_bajar")
+    elif xl:
+        st.caption("Cambiaste la selección: vuelve a pulsar «Preparar Excel».")
+
+
+# ----------------------------------------------------------------------
 # Resumen de cuentas y cierre de mes
 # ----------------------------------------------------------------------
 def _resumen_revisor(sb, cuentas: list[dict], periodo: dict) -> None:
@@ -1682,9 +1956,16 @@ def main() -> None:
             st.warning("Mes cerrado (solo lectura).")
         if cuenta.get("limite_reembolso"):
             st.caption(f"Límite de reembolso: {money_md(cuenta['limite_reembolso'])}")
+        st.divider()
+        vista_app = st.radio("Ir a", ["🧾 Mi caja chica", "🔎 Buscar pagos"], key="vista_app")
 
     if st.session_state.get("comprobando"):
         _pantalla_comprobar(sb, cuenta, st.session_state.comprobando, st.session_state.tol)
+        return
+    _panel_pendientes(sb, cuenta)
+    if vista_app == "🔎 Buscar pagos":
+        _pagina_busqueda(sb, cuenta, periodos)
+        _visor_adjunto(sb)
         return
 
     # Control de sección (en lugar de st.tabs) para conservar la sección elegida después de cada acción.
