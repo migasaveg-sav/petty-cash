@@ -436,6 +436,64 @@ def listar_lotes(sb, cuenta_id: str | None = None) -> list[dict]:
 
 
 # ----------------------------------------------------------------------
+# Revisor: visto bueno, devolución, pagos y cierre de mes
+# ----------------------------------------------------------------------
+def cerrar_lote(sb, cuenta_id: str, periodo_id: str, solicitud_ids: list[str]) -> str:
+    """Visto bueno: crea y cierra (bloquea) el lote de pago de una cuenta y un mes. Regresa el id del lote."""
+    return _ejecutar(sb.rpc("cerrar_lote", {"p_cuenta": cuenta_id, "p_periodo": periodo_id, "p_solicitudes": solicitud_ids}))
+
+
+def pagar_lote(sb, lote_id: str, fecha, referencia: str) -> None:
+    _ejecutar(sb.rpc("pagar_lote", {"p_lote": lote_id, "p_fecha": str(fecha), "p_referencia": referencia}))
+
+
+def desbloquear_lote(sb, lote_id: str, motivo: str) -> None:
+    _ejecutar(sb.rpc("desbloquear_lote", {"p_lote": lote_id, "p_motivo": motivo}))
+
+
+def marcar_pendiente(sb, gasto_id: str, motivo: str, comentario: str | None = None) -> str:
+    """El revisor devuelve un gasto al aplicante con un pendiente (la solicitud regresa a «con pendientes»)."""
+    return _ejecutar(sb.rpc("marcar_pendiente", {"p_gasto": gasto_id, "p_motivo": motivo, "p_comentario": comentario or None}))
+
+
+def gastos_de_lote(sb, lote_id: str) -> list[dict]:
+    """Gastos incluidos en un lote, con los datos de su solicitud."""
+    gastos = _ejecutar(sb.table("v_gastos").select("*").eq("lote_id", lote_id).eq("eliminado", False)) or []
+    if not gastos:
+        return []
+    sol_ids = list({g["solicitud_id"] for g in gastos})
+    sols = {x["id"]: x for x in (_ejecutar(sb.table("solicitudes").select("id,numero,fecha,description,employee_name,category")
+                                           .in_("id", sol_ids)) or [])}
+    for g in gastos:
+        g["solicitud"] = sols.get(g["solicitud_id"], {})
+    return sorted(gastos, key=lambda g: (g["solicitud"].get("numero") or 0))
+
+
+def listar_cobertura(sb, periodo_id: str) -> list[dict]:
+    return _ejecutar(sb.table("v_cobertura_mes").select("*").eq("periodo_id", periodo_id)) or []
+
+
+def estados_cierre_periodo(sb, periodo_id: str) -> dict[str, str]:
+    """{cuenta_id: 'abierto'|'cerrado'} del mes dado, para todas las cuentas (vista del revisor)."""
+    filas = _ejecutar(sb.table("periodos_cuenta").select("cuenta_id,estado").eq("periodo_id", periodo_id)) or []
+    return {f["cuenta_id"]: f["estado"] for f in filas}
+
+
+def cerrar_mes_cuenta(sb, periodo_id: str, cuenta_id: str) -> None:
+    _ejecutar(sb.rpc("cerrar_mes_cuenta", {"p_periodo": periodo_id, "p_cuenta": cuenta_id}))
+
+
+def reabrir_mes_cuenta(sb, periodo_id: str, cuenta_id: str, motivo: str) -> None:
+    _ejecutar(sb.rpc("reabrir_mes_cuenta", {"p_periodo": periodo_id, "p_cuenta": cuenta_id, "p_motivo": motivo}))
+
+
+def aplicantes_por_cuenta(sb) -> dict[str, str]:
+    """{cuenta_id: nombre del aplicante}."""
+    filas = _ejecutar(sb.table("perfiles").select("nombre,cuenta_id,rol").eq("rol", "aplicante")) or []
+    return {f["cuenta_id"]: f["nombre"] for f in filas if f.get("cuenta_id")}
+
+
+# ----------------------------------------------------------------------
 # Adjuntos (Storage)
 # ----------------------------------------------------------------------
 def subir_adjunto(sb, cuenta_id: str, etiqueta_mes: str, pdf: bytes) -> str:
