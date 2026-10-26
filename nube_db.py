@@ -240,7 +240,7 @@ def listar_movimientos(sb, cuenta_id: str, estado: "str | list[str] | None" = No
             q = q.eq("periodo_id", periodo_id)
         return q.order("fecha", desc=False).order("creado_en", desc=False)
     filas = _paginado(construir)
-    cols = ["id", "fecha", "descripcion", "monto", "saldo", "estado", "periodo_id", "ocurrencia", "motivo_espera", "espera_desde"]
+    cols = ["id", "fecha", "descripcion", "monto", "saldo", "estado", "periodo_id", "ocurrencia", "motivo_espera", "espera_desde", "nota_revisor"]
     df = pd.DataFrame(filas, columns=cols) if filas else pd.DataFrame(columns=cols)
     if not df.empty:
         df["monto"] = df["monto"].astype(float)
@@ -456,6 +456,20 @@ def marcar_pendiente(sb, gasto_id: str, motivo: str, comentario: str | None = No
     return _ejecutar(sb.rpc("marcar_pendiente", {"p_gasto": gasto_id, "p_motivo": motivo, "p_comentario": comentario or None}))
 
 
+def reclasificar_movimientos(sb, ids: list[str], estado: str, nota: str, motivo_espera: str | None = None) -> int:
+    """El revisor cambia la clasificación de movimientos (también los ya comprobados: se revierte su gasto).
+    estado: 'pendiente' (sin comprobar) | 'no_necesario' | 'en_espera' (pendiente, exige motivo_espera).
+    Regresa cuántos gastos comprobados se revirtieron."""
+    if estado not in ("pendiente", "no_necesario", "en_espera"):
+        raise ErrorNube("Clasificación no permitida.")
+    if not (nota or "").strip():
+        raise ErrorNube("Escribe la nota para el aplicante: por qué se reclasifica.")
+    if estado == "en_espera" and not (motivo_espera or "").strip():
+        raise ErrorNube("Explica por qué el movimiento queda pendiente.")
+    return int(_ejecutar(sb.rpc("reclasificar_movimientos", {"p_movimientos": ids, "p_estado": estado, "p_nota": nota,
+                                                             "p_motivo_espera": (motivo_espera or "").strip() or None})) or 0)
+
+
 def gastos_de_lote(sb, lote_id: str) -> list[dict]:
     """Gastos incluidos en un lote, con los datos de su solicitud."""
     gastos = _ejecutar(sb.table("v_gastos").select("*").eq("lote_id", lote_id).eq("eliminado", False)) or []
@@ -542,6 +556,7 @@ COLUMNAS_REVISION = [
     "material", "monto_estado", "suma_facturas", "diferencia", "tiene_diferencia", "propina", "solicitud_id",
     "solicitud_numero", "solicitud_estado", "employee_name", "solicitud_descripcion", "request_number",
     "lote_id", "lote_numero", "lote_estado", "fecha_pago", "referencia_pago", "motivo_espera", "espera_desde",
+    "nota_revisor", "nota_revisor_en",
 ]
 
 
