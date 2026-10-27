@@ -190,23 +190,7 @@ def _nueva_tabla() -> None:
     st.session_state["bit_ver"] = st.session_state.get("bit_ver", 0) + 1
 
 
-def _chips_bitacora(registros: list[dict]) -> str:
-    cuenta = collections.Counter(r["estado"] for r in registros)
-    movs_comp = sum(r.get("movs", 0) for r in registros if r["estado"] == "comprobado")
-    chips = []
-    for est in ("comprobado", "no_necesario", "sin_comprobar", "pendiente"):
-        fondo, texto = ESTILO_ETIQUETA[est]
-        borde = "#CBD5E1" if est == "no_necesario" else texto
-        if est == "comprobado":
-            etiqueta = f'{cuenta.get(est, 0)} gastos comprobados · {movs_comp} movimientos del banco'
-        else:
-            etiqueta = f'{cuenta.get(est, 0)} {reportes.ETIQUETA_REGISTRO[est].lower()}'
-        chips.append(f'<span style="display:inline-block;background:{fondo};color:{texto};border:1px solid {borde};border-radius:999px;'
-                     f'padding:2px 12px;margin:0 6px 4px 0;font-size:.85rem;font-weight:700">{etiqueta}</span>')
-    return "".join(chips)
-
-
-def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
+def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool, cierre: dict | None = None) -> None:
     _tarjetas_gasto(sb, cuenta)
     st.divider()
     if cerrado:
@@ -227,35 +211,34 @@ def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
                 except db.ErrorNube as e:
                     st.error(str(e))
 
-    sols = db.listar_solicitudes(sb, cuenta["id"], periodo["id"])
-    gastos = db.listar_gastos(sb, [x["id"] for x in sols]) if sols else []
-    movs = db.listar_movimientos(sb, cuenta["id"], periodo_id=periodo["id"])
-    registros = reportes.registros_bitacora(sols, gastos, movs)
-    st.markdown(f"##### Bitácora de {db.etiqueta_periodo(periodo)} ({len(registros)} registros)")
-    if not registros:
-        st.caption("Aún no hay registros en este mes. Carga el estado de cuenta o crea una solicitud.")
-        return
-    st.markdown(_chips_bitacora(registros), unsafe_allow_html=True)
+    periodos = st.session_state.get("_periodos") or [periodo]
+    cierre = cierre if cierre is not None else {}
+    _seccion_registros_bitacora(sb, cuenta, periodos, periodo, cierre)
+    _seccion_estado_cuenta_bitacora(sb, cuenta, periodos, periodo, cierre)
 
-    f1, f2 = st.columns([1.3, 3])
-    filtro = f1.selectbox("Mostrar", ["Todos", *reportes.ETIQUETA_REGISTRO.values()], key="bit_filtro")
-    texto = f2.text_input("🔎 Buscar (descripción, concepto, empleado, categoría, #)", key="bit_busca")
-    vista = registros
-    if filtro != "Todos":
-        clave = {v: k for k, v in reportes.ETIQUETA_REGISTRO.items()}[filtro]
-        vista = [r for r in vista if r["estado"] == clave]
-    if texto.strip():
-        t = texto.strip().lower()
-        vista = [r for r in vista if t in " ".join(str(r[k]) for k in ("descripcion", "concepto", "empleado", "categoria", "numero")).lower()]
-    if not vista:
-        st.caption("Ningún registro coincide con el filtro.")
-        return
 
+def _chips(registros: list[dict], estados: tuple[str, ...]) -> str:
+    cuenta = collections.Counter(r["estado"] for r in registros)
+    movs_comp = sum(r.get("movs", 0) for r in registros if r["estado"] == "comprobado")
+    chips = []
+    for est in estados:
+        fondo, texto = ESTILO_ETIQUETA[est]
+        borde = "#CBD5E1" if est == "no_necesario" else texto
+        etiqueta = (f'{cuenta.get(est, 0)} gastos comprobados · {movs_comp} movimientos del banco' if est == "comprobado"
+                    else f'{cuenta.get(est, 0)} {reportes.ETIQUETA_REGISTRO[est].lower()}')
+        chips.append(f'<span style="display:inline-block;background:{fondo};color:{texto};border:1px solid {borde};border-radius:999px;'
+                     f'padding:2px 12px;margin:0 6px 4px 0;font-size:.85rem;font-weight:700">{etiqueta}</span>')
+    return "".join(chips)
+
+
+def _tabla_registros(vista: list[dict], mes_de: dict, columnas: list[str], clave: str) -> list[int]:
+    """Pinta la tabla de registros y devuelve las filas seleccionadas."""
     tabla = pd.DataFrame([{
-        "Estado": reportes.ETIQUETA_REGISTRO[r["estado"]], "Fecha": r["fecha"], "#": r["numero"], "Descripción": r["descripcion"],
-        "Concepto": r["concepto"], "Empleado": r["empleado"], "Categoría": r["categoria"], "Mov.": r["movs"], "Monto": r["monto"],
-        "Situación": r["situacion"]} for r in vista])
-    tabla["#"] = tabla["#"].astype("Int64")
+        "Estado": reportes.ETIQUETA_REGISTRO[r["estado"]], "Mes": mes_de.get(r["id"], ""), "Fecha": r["fecha"], "#": r["numero"],
+        "Descripción": r["descripcion"], "Concepto": r["concepto"], "Empleado": r["empleado"], "Categoría": r["categoria"],
+        "Mov.": r["movs"], "Monto": r["monto"], "Situación": r["situacion"]} for r in vista])[columnas]
+    if "#" in tabla:
+        tabla["#"] = tabla["#"].astype("Int64")
     inverso = {v: k for k, v in reportes.ETIQUETA_REGISTRO.items()}
 
     def _pintar(col):
@@ -263,18 +246,97 @@ def _tab_bitacora(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
 
     estilo = tabla.style.apply(_pintar, subset=["Estado"]).format({"Monto": "${:,.2f}"}, na_rep="—")
     ev = st.dataframe(estilo, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 400),
-                      on_select="rerun", selection_mode="single-row", key=f"tabla_bit_{st.session_state.get('bit_ver', 0)}",
+                      on_select="rerun", selection_mode="single-row", key=f"{clave}_{st.session_state.get('bit_ver', 0)}",
                       column_config={"#": st.column_config.NumberColumn("#", format="%d", width="small"),
                                      "Estado": st.column_config.TextColumn("Estado", width="small"),
                                      "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small", help="Movimientos del estado de cuenta que cubre el gasto")})
-    filas = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
-    if not filas:
-        st.caption("Haz clic en una fila para abrir el registro y ver sus detalles (gasto, facturas y PDF).")
-        return
-    gastos_por_sol: dict[str, list[dict]] = {}
-    for g in gastos:
-        gastos_por_sol.setdefault(g["solicitud_id"], []).append(g)
-    _detalle_registro(sb, cuenta, periodo, cerrado, vista[filas[0]], {x["id"]: x for x in sols}, gastos_por_sol, movs)
+    return [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
+
+
+def _seccion_registros_bitacora(sb, cuenta: dict, periodos: list[dict], periodo: dict, cierre: dict) -> None:
+    """Solicitudes que el aplicante registró en la bitácora (de cualquier mes), con su estado de comprobación."""
+    por_periodo = {p["id"]: p for p in periodos}
+    etiquetas = {p["id"]: db.etiqueta_periodo(p) for p in periodos}
+    with st.expander("📒 Registros de la bitácora", expanded=True):
+        st.caption("Lo que tú registraste como solicitud. Aquí compruebas cada registro con su cargo del estado de cuenta.")
+        m1, m2, m3 = st.columns([1.2, 1.3, 3])
+        opciones = ["Todos los meses", *[etiquetas[p["id"]] for p in periodos]]
+        mes = m1.selectbox("Mes", opciones, key="bit_mes", help="Por omisión se ven todos los meses para que no se te pierda ningún registro.")
+        filtro = m2.selectbox("Mostrar", ["Todos", "Sin comprobar", "Comprobado"], key="bit_filtro")
+        texto = m3.text_input("🔎 Buscar (descripción, concepto, empleado, categoría, #)", key="bit_busca")
+        id_mes = None if mes == "Todos los meses" else next(p["id"] for p in periodos if etiquetas[p["id"]] == mes)
+        sols = db.listar_solicitudes(sb, cuenta["id"], id_mes)
+        gastos = db.listar_gastos(sb, [x["id"] for x in sols]) if sols else []
+        registros = reportes.registros_bitacora(sols, gastos, pd.DataFrame())
+        if not registros:
+            st.caption("Aún no hay registros en esta selección. Crea una solicitud con «➕ Nueva solicitud».")
+            return
+        mes_de = {x["id"]: etiquetas.get(x.get("periodo_id"), "") for x in sols}
+        st.markdown(f"**{len(registros)} registro(s)** · {mes}")
+        st.markdown(_chips(registros, ("sin_comprobar", "comprobado")), unsafe_allow_html=True)
+        vista = registros
+        if filtro != "Todos":
+            vista = [r for r in vista if r["estado"] == {"Sin comprobar": "sin_comprobar", "Comprobado": "comprobado"}[filtro]]
+        if texto.strip():
+            t = texto.strip().lower()
+            vista = [r for r in vista if t in " ".join(str(r[k]) for k in ("descripcion", "concepto", "empleado", "categoria", "numero")).lower()]
+        if not vista:
+            st.caption("Ningún registro coincide con el filtro.")
+            return
+        cols = ["Estado", "Mes", "Fecha", "#", "Descripción", "Concepto", "Empleado", "Categoría", "Mov.", "Monto", "Situación"]
+        filas = _tabla_registros(vista, mes_de, cols, "tabla_bit")
+        if not filas:
+            st.caption("Haz clic en una fila para abrir el registro y ver sus detalles (gasto, facturas y PDF) o comprobarlo.")
+            return
+        gastos_por_sol: dict[str, list[dict]] = {}
+        for g in gastos:
+            gastos_por_sol.setdefault(g["solicitud_id"], []).append(g)
+        sel = vista[filas[0]]
+        sol = next(x for x in sols if x["id"] == sel["id"])
+        per_r = por_periodo.get(sol.get("periodo_id"), periodo)
+        _detalle_registro(sb, cuenta, per_r, cierre.get(per_r["id"]) == "cerrado", sel, {x["id"]: x for x in sols}, gastos_por_sol, pd.DataFrame())
+
+
+def _seccion_estado_cuenta_bitacora(sb, cuenta: dict, periodos: list[dict], periodo: dict, cierre: dict) -> None:
+    """Cargos del banco que todavía no están comprobados (sin comprobar, pendiente, no necesario)."""
+    por_periodo = {p["id"]: p for p in periodos}
+    etiquetas = {p["id"]: db.etiqueta_periodo(p) for p in periodos}
+    with st.expander("🏦 Estado de cuenta del banco", expanded=True):
+        st.caption("Cargos del banco que aún no están comprobados. Los ya comprobados aparecen arriba, dentro de su registro de la bitácora.")
+        m1, m2, m3 = st.columns([1.2, 1.3, 3])
+        opciones = [*[etiquetas[p["id"]] for p in periodos], "Todos los meses"]
+        mes = m1.selectbox("Mes", opciones, index=opciones.index(etiquetas[periodo["id"]]) if periodo["id"] in etiquetas else 0,
+                           key=f"bit_mes_ec_{periodo['id']}")
+        filtro = m2.selectbox("Mostrar", ["Todos", *[reportes.ETIQUETA_REGISTRO[e] for e in ("sin_comprobar", "pendiente", "no_necesario")]], key="bit_filtro_ec")
+        texto = m3.text_input("🔎 Buscar por descripción o monto", key="bit_busca_ec")
+        id_mes = None if mes == "Todos los meses" else next(p["id"] for p in periodos if etiquetas[p["id"]] == mes)
+        movs = db.listar_movimientos(sb, cuenta["id"], periodo_id=id_mes)
+        registros = reportes.registros_bitacora([], [], movs)
+        if not registros:
+            st.caption("No hay cargos sin comprobar en esta selección. Carga el estado de cuenta en la sección «Estado de cuenta».")
+            return
+        mes_de = {r.id: etiquetas.get(r.periodo_id, "") for r in movs.itertuples()}
+        st.markdown(f"**{len(registros)} cargo(s)** · {mes}")
+        st.markdown(_chips(registros, ("sin_comprobar", "pendiente", "no_necesario")), unsafe_allow_html=True)
+        vista = registros
+        if filtro != "Todos":
+            clave = {v: k for k, v in reportes.ETIQUETA_REGISTRO.items()}[filtro]
+            vista = [r for r in vista if r["estado"] == clave]
+        if texto.strip():
+            t = texto.strip().lower()
+            vista = [r for r in vista if t in f"{r['descripcion']} {r['monto']:.2f} {r['monto']:,.2f}".lower()]
+        if not vista:
+            st.caption("Ningún cargo coincide con el filtro.")
+            return
+        cols = ["Estado", "Mes", "Fecha", "Descripción", "Monto", "Situación"]
+        filas = _tabla_registros(vista, mes_de, cols, "tabla_bitec")
+        if not filas:
+            st.caption("Haz clic en un cargo para comprobarlo, marcarlo como no necesario o regresarlo a sin comprobar.")
+            return
+        sel = vista[filas[0]]
+        pid = movs.loc[movs["id"] == sel["id"], "periodo_id"].iloc[0]
+        per_r = por_periodo.get(pid, periodo)
+        _detalle_registro(sb, cuenta, per_r, cierre.get(per_r["id"]) == "cerrado", sel, {}, {}, movs)
 
 
 def _detalle_registro(sb, cuenta: dict, periodo: dict, cerrado: bool, r: dict, sols: dict, gastos_por_sol: dict, movs: pd.DataFrame) -> None:
@@ -1975,7 +2037,7 @@ def main() -> None:
     st.session_state["_seccion_ult"] = vista
     st.divider()
     if vista == secciones[0]:
-        _tab_bitacora(sb, cuenta, periodo, cerrado)
+        _tab_bitacora(sb, cuenta, periodo, cerrado, cierre)
     elif vista == secciones[1]:
         _tab_estado_cuenta(sb, cuenta, periodo, cerrado)
     elif vista == secciones[2]:
