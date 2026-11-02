@@ -241,8 +241,8 @@ def _chips(registros: list[dict], estados: tuple[str, ...]) -> str:
     return "".join(chips)
 
 
-def _tabla_registros(vista: list[dict], mes_de: dict, columnas: list[str], clave: str) -> list[int]:
-    """Pinta la tabla de registros y devuelve las filas seleccionadas."""
+def _tabla_registros(vista: list[dict], mes_de: dict, columnas: list[str], clave: str, multi: bool = True) -> list[int]:
+    """Pinta la tabla de registros y devuelve las filas seleccionadas (una o varias)."""
     tabla = pd.DataFrame([{
         "Estado": reportes.ETIQUETA_REGISTRO[r["estado"]], "Mes": mes_de.get(r["id"], ""), "Fecha": r["fecha"], "#": r["numero"],
         "Descripción": r["descripcion"], "Concepto": r["concepto"], "Empleado": r["empleado"], "Categoría": r["categoria"],
@@ -256,7 +256,8 @@ def _tabla_registros(vista: list[dict], mes_de: dict, columnas: list[str], clave
 
     estilo = tabla.style.apply(_pintar, subset=["Estado"]).format({"Monto": "${:,.2f}"}, na_rep="—")
     ev = st.dataframe(estilo, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 400),
-                      on_select="rerun", selection_mode="single-row", key=f"{clave}_{st.session_state.get('bit_ver', 0)}_{_firma(r['id'] for r in vista)}",
+                      on_select="rerun", selection_mode="multi-row" if multi else "single-row",
+                      key=f"{clave}_{st.session_state.get('bit_ver', 0)}_{_firma(r['id'] for r in vista)}",
                       column_config={"#": st.column_config.NumberColumn("#", format="%d", width="small"),
                                      "Estado": st.column_config.TextColumn("Estado", width="small"),
                                      "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small", help="Movimientos del estado de cuenta que cubre el gasto")})
@@ -296,15 +297,92 @@ def _seccion_registros_bitacora(sb, cuenta: dict, periodos: list[dict], periodo:
         cols = ["Estado", "Mes", "Fecha", "#", "Descripción", "Concepto", "Empleado", "Categoría", "Mov.", "Monto", "Situación"]
         filas = _tabla_registros(vista, mes_de, cols, "tabla_bit")
         if not filas:
-            st.caption("Haz clic en una fila para abrir el registro y ver sus detalles (gasto, facturas y PDF) o comprobarlo.")
+            st.caption("Haz clic en una fila para abrir el registro y ver sus detalles (gasto, facturas y PDF) o comprobarlo. "
+                       "Marca varias casillas para seleccionar más de un registro.")
             return
         gastos_por_sol: dict[str, list[dict]] = {}
         for g in gastos:
             gastos_por_sol.setdefault(g["solicitud_id"], []).append(g)
+        if len(filas) > 1:
+            _acciones_varios_registros(sb, [vista[i] for i in filas], {x["id"]: x for x in sols}, gastos_por_sol, cierre)
+            return
         sel = vista[filas[0]]
         sol = next(x for x in sols if x["id"] == sel["id"])
         per_r = por_periodo.get(sol.get("periodo_id"), periodo)
         _detalle_registro(sb, cuenta, per_r, cierre.get(per_r["id"]) == "cerrado", sel, {x["id"]: x for x in sols}, gastos_por_sol, pd.DataFrame())
+
+
+def _acciones_varios_registros(sb, sel: list[dict], sols: dict, gastos_por_sol: dict, cierre: dict) -> None:
+    """Acciones cuando se seleccionan 2 o más registros (solicitudes) de la bitácora."""
+    ss = [sols[r["id"]] for r in sel if r["id"] in sols]
+    total = round(sum(float(x.get("monto_tentativo") or 0) for x in ss), 2)
+    with st.container(border=True):
+        st.markdown(f"**{len(ss)} registros seleccionados** (#{', #'.join(str(x['numero']) for x in ss)}) · monto tentativo {money_md(total)}")
+        enviables = [x for x in ss if x["estado"] in EDITABLES and gastos_por_sol.get(x["id"]) and cierre.get(x.get("periodo_id")) != "cerrado"]
+        borrables = [x for x in ss if x["estado"] in EDITABLES and not gastos_por_sol.get(x["id"]) and cierre.get(x.get("periodo_id")) != "cerrado"]
+        b1, b2, _ = st.columns([1.6, 1.6, 3])
+        if b1.button(f"📤 Enviar a revisión ({len(enviables)})", type="primary", disabled=not enviables, key="bit_env_varios",
+                     help="Solo se envían los que ya tienen gasto comprobado."):
+            errores = []
+            for x in enviables:
+                try:
+                    db.enviar_a_revision(sb, x["id"])
+                except db.ErrorNube as e:
+                    errores.append(f"#{x['numero']}: {e}")
+            _nueva_tabla()
+            if errores:
+                st.error("No se pudieron enviar:\n- " + "\n- ".join(errores))
+            else:
+                _flash(f"{len(enviables)} solicitud(es) enviada(s) a revisión.")
+                st.rerun()
+        if b2.button(f"🗑️ Eliminar ({len(borrables)})", disabled=not borrables, key="bit_del_varios",
+                     help="Solo se eliminan los que todavía no tienen gasto comprobado."):
+            errores = []
+            for x in borrables:
+                try:
+                    db.eliminar_solicitud(sb, x["id"])
+                except db.ErrorNube as e:
+                    errores.append(f"#{x['numero']}: {e}")
+            _nueva_tabla()
+            if errores:
+                st.error("No se pudieron eliminar:\n- " + "\n- ".join(errores))
+            else:
+                st.rerun()
+        st.caption("Para ver el detalle de un registro, comprobarlo o editarlo, deja seleccionado uno solo.")
+
+
+def _acciones_varios_cargos(sb, cuenta: dict, periodo: dict, ids: list[str], movs: pd.DataFrame, cierre: dict) -> None:
+    """Acciones cuando se seleccionan 2 o más cargos del estado de cuenta en la bitácora."""
+    fila = movs[movs["id"].isin(ids)]
+    if fila.empty:
+        st.warning("Los movimientos ya no están en la lista; vuelve a seleccionar.")
+        return
+    total = round(float(fila["monto"].abs().sum()), 2)
+    cerrados = [p for p in fila["periodo_id"].unique() if cierre.get(p) == "cerrado"]
+    abiertos = fila[fila["estado"].isin(["pendiente", "en_espera"])]
+    with st.container(border=True):
+        st.markdown(f"**{len(fila)} cargos seleccionados** · total {money_md(total)}")
+        if cerrados:
+            st.info("Algún cargo pertenece a un mes cerrado; no se puede modificar.")
+            return
+        b0, b1, b2 = st.columns([1.8, 1.6, 2])
+        mismo_mes = fila["periodo_id"].nunique() == 1
+        if b0.button(f"🔗 Comprobar juntos ({len(fila)})", type="primary", key="bit_cmp_varios",
+                     disabled=len(abiertos) != len(fila) or not mismo_mes,
+                     help="Los cargos comparten las mismas facturas (un solo gasto)."):
+            _nueva_tabla()
+            _comprobar_desde_estado(sb, cuenta, periodo, fila)
+        if b1.button(f"🚫 No necesarios ({len(abiertos)})", key="bit_nn_varios", disabled=abiertos.empty):
+            _nueva_tabla()
+            _cambiar(sb, abiertos["id"].tolist(), "no_necesario")
+        regresables = fila[fila["estado"].isin(["no_necesario", "en_espera"])]
+        if b2.button(f"↩️ Regresar a sin comprobar ({len(regresables)})", key="bit_sc_varios", disabled=regresables.empty):
+            _nueva_tabla()
+            _cambiar(sb, regresables["id"].tolist(), "pendiente")
+        if len(abiertos) != len(fila):
+            st.caption("«Comprobar juntos» requiere que todos los cargos seleccionados estén sin comprobar o pendientes.")
+        elif not mismo_mes:
+            st.caption("«Comprobar juntos» requiere que los cargos sean del mismo mes.")
 
 
 def _seccion_estado_cuenta_bitacora(sb, cuenta: dict, periodos: list[dict], periodo: dict, cierre: dict) -> None:
@@ -341,7 +419,11 @@ def _seccion_estado_cuenta_bitacora(sb, cuenta: dict, periodos: list[dict], peri
         cols = ["Estado", "Mes", "Fecha", "Descripción", "Monto", "Situación"]
         filas = _tabla_registros(vista, mes_de, cols, "tabla_bitec")
         if not filas:
-            st.caption("Haz clic en un cargo para comprobarlo, marcarlo como no necesario o regresarlo a sin comprobar.")
+            st.caption("Haz clic en un cargo para comprobarlo, marcarlo como no necesario o regresarlo a sin comprobar. "
+                       "Marca varias casillas para seleccionar más de un cargo (por ejemplo, varios cargos de una misma factura).")
+            return
+        if len(filas) > 1:
+            _acciones_varios_cargos(sb, cuenta, periodo, [vista[i]["id"] for i in filas], movs, cierre)
             return
         sel = vista[filas[0]]
         pid = movs.loc[movs["id"] == sel["id"], "periodo_id"].iloc[0]
@@ -576,15 +658,27 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
 
     # ---------- Paso 2: facturas ----------
     st.markdown("#### Paso 2 · Agrega la(s) factura(s)")
-    c1, c2 = st.columns(2)
-    categorias = _catalogo(sb, "categoria")
-    cat_ini = sol.get("category")
-    with c1:
-        categoria = st.selectbox("Categoría", ["—", *categorias], index=(categorias.index(cat_ini) + 1) if cat_ini in categorias else 0, key="cmp_categoria")
-    with c2:
-        mats = _catalogo(sb, "material")
-        mat_ini = sol.get("material")
-        material = st.selectbox("Material", ["—", *mats], index=(mats.index(mat_ini) + 1) if mat_ini in mats else 0, key="cmp_material")
+    datos_sol_ui = None
+    if not sol.get("id"):
+        # Viene directo del banco: se piden TODOS los campos de la solicitud, igual que en «➕ Nueva solicitud».
+        st.markdown("##### 🧍 Datos de la solicitud")
+        st.caption("Los mismos campos que «Nueva solicitud»; ya vienen prellenados con lo que dice el banco. "
+                   "La solicitud se crea hasta que guardas el gasto y queda en el mes del cargo del banco.")
+        datos_sol_ui = _campos_solicitud(sb, "cmp_sol", {
+            "fecha": sol["fecha"], "monto_tentativo": sol["monto_tentativo"], "description": sol.get("description"),
+            "category": sol.get("category"), "material": sol.get("material")})
+        categoria = datos_sol_ui["category"] or "—"
+        material = datos_sol_ui["material"] or "—"
+    else:
+        c1, c2 = st.columns(2)
+        categorias = _catalogo(sb, "categoria")
+        cat_ini = sol.get("category")
+        with c1:
+            categoria = st.selectbox("Categoría", ["—", *categorias], index=(categorias.index(cat_ini) + 1) if cat_ini in categorias else 0, key="cmp_categoria")
+        with c2:
+            mats = _catalogo(sb, "material")
+            mat_ini = sol.get("material")
+            material = st.selectbox("Material", ["—", *mats], index=(mats.index(mat_ini) + 1) if mat_ini in mats else 0, key="cmp_material")
     propina = 0.0
     if categoria in CATEGORIAS_CON_PROPINA:
         propina = st.number_input("💵 Propina (no aparece en la factura)", min_value=0.0, step=1.0, format="%.2f", key="cmp_propina")
@@ -680,8 +774,9 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
         sol_nueva_id = None
         try:
             if not sol.get("id"):  # viene del estado de cuenta: la solicitud se crea hasta guardar el gasto
-                datos_sol = {**sol["_datos"], "category": None if categoria == "—" else categoria,
-                             "material": None if material == "—" else material}
+                datos_sol = {**sol["_datos"], **(datos_sol_ui or {})}
+                for tipo, clave in (("categoria", "category"), ("empleado", "employee_name"), ("material", "material")):
+                    _guardar_catalogo_si_nuevo(sb, tipo, datos_sol.get(clave))
                 sol_nueva_id = db.crear_solicitud(sb, cuenta["id"], sol["_periodo_id"], datos_sol)["id"]
             mes = str(sol["fecha"])[:7]
             payload = []
