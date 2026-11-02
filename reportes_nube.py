@@ -154,7 +154,7 @@ def registros_bitacora(solicitudes: list[dict], gastos: list[dict], movs: pd.Dat
                 "tipo": "movimiento", "id": r.id, "estado": estado, "fecha": r.fecha, "numero": None,
                 "descripcion": r.descripcion, "empleado": "", "categoria": "", "concepto": "", "movs": 1, "monto": round(abs(float(r.monto)), 2),
                 "situacion": _situacion_movimiento(estado, motivo, getattr(r, "nota_revisor", None))})
-    filas.sort(key=lambda f: (PRIORIDAD_REGISTRO[f["estado"]], str(f["fecha"]), f["numero"] or 0))
+    filas.sort(key=lambda f: (PRIORIDAD_REGISTRO[f["estado"]], str(f["fecha"]), f["numero"] or 0, str(f["id"])))
     return filas
 
 
