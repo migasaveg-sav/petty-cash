@@ -122,6 +122,14 @@ section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{ color: #FFFF
 
 /* -------- Mensajes -------- */
 [data-testid="stAlert"] {{ border-radius: 8px; }}
+
+/* -------- Ventana «Comprobar gasto» (diálogo): color cálido para distinguirla del resto de la página -------- */
+[data-testid="stDialog"] > div {{ background: rgba(25,35,51,.62); }}
+div[role="dialog"] {{ background: #FFF1D6; border: 4px solid #F59E0B; border-radius: 16px; box-shadow: 0 24px 70px rgba(25,35,51,.55); }}
+div[role="dialog"] h2 {{ color: #7A3E00; font-weight: 800; border-bottom: 3px solid #F59E0B; padding-bottom: 6px; }}
+div[role="dialog"] h3, div[role="dialog"] h4, div[role="dialog"] h5 {{ color: #7A3E00; }}
+div[role="dialog"] [data-testid="stVerticalBlockBorderWrapper"] {{ background: #FFFFFF; border-color: #E0B060; }}
+div[role="dialog"] [data-testid="stCaptionContainer"], div[role="dialog"] small {{ color: #5C4A2E !important; }}
 </style>
 """, unsafe_allow_html=True)
 
