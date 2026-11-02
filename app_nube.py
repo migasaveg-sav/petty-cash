@@ -18,6 +18,7 @@ import estilos
 import importar
 import nube_db as db
 import reportes_nube as reportes
+import pdf_estado
 from bank import BankStatementError, cargar_estado_cuenta
 from catalog import CATEGORIAS_SOLICITUD_DEFAULT, EMPLEADOS_DEFAULT, MATERIALES_DEFAULT
 from cfdi import CFDIParseError, parse_cfdi
@@ -185,6 +186,15 @@ ESTILO_ETIQUETA = {   # (fondo, texto): verde = comprobado, blanco = no necesari
 }
 
 
+def _firma(ids) -> str:
+    """Huella corta de los renglones que muestra una tabla (en su orden).
+    Streamlit conserva la selección de una tabla por POSICIÓN de fila mientras la llave no cambie, aunque cambien los datos
+    (buscador, filtros, orden, movimientos que se comprueban...). Al incluir esta huella en la llave, si la lista cambia la
+    selección se reinicia en lugar de apuntar a otro renglón."""
+    import hashlib
+    return hashlib.md5("|".join(str(i) for i in ids).encode()).hexdigest()[:8]
+
+
 def _nueva_tabla() -> None:
     """Cambia la llave de la tabla de la bitácora para que no quede seleccionada una fila que ya cambió."""
     st.session_state["bit_ver"] = st.session_state.get("bit_ver", 0) + 1
@@ -246,7 +256,7 @@ def _tabla_registros(vista: list[dict], mes_de: dict, columnas: list[str], clave
 
     estilo = tabla.style.apply(_pintar, subset=["Estado"]).format({"Monto": "${:,.2f}"}, na_rep="—")
     ev = st.dataframe(estilo, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 400),
-                      on_select="rerun", selection_mode="single-row", key=f"{clave}_{st.session_state.get('bit_ver', 0)}",
+                      on_select="rerun", selection_mode="single-row", key=f"{clave}_{st.session_state.get('bit_ver', 0)}_{_firma(r['id'] for r in vista)}",
                       column_config={"#": st.column_config.NumberColumn("#", format="%d", width="small"),
                                      "Estado": st.column_config.TextColumn("Estado", width="small"),
                                      "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small", help="Movimientos del estado de cuenta que cubre el gasto")})
@@ -534,11 +544,11 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
         if texto.strip():
             vista = vista[vista["descripcion"].str.contains(texto.strip(), case=False, na=False)]
         if cerca and float(sol["monto_tentativo"] or 0) > 0:
-            vista = vista.assign(_d=(vista["monto"].abs() - float(sol["monto_tentativo"])).abs()).sort_values("_d").drop(columns="_d")
-        vista = vista.reset_index(drop=True)
+            vista = vista.assign(_d=(vista["monto"].abs() - float(sol["monto_tentativo"])).abs()).sort_values(["_d", "fecha", "id"], kind="stable").drop(columns="_d")
+        vista = vista.reset_index(drop=True)   # el orden viene fijo de la base de datos (fecha, creado_en, id)
         ev = st.dataframe(
             vista[["fecha", "descripcion", "monto", "saldo"]], hide_index=True, use_container_width=True,
-            on_select="rerun", selection_mode="multi-row", key=f"cmp_tabla_{mes_sel}",
+            on_select="rerun", selection_mode="multi-row", key=f"cmp_tabla_{mes_sel}_{_firma(vista['id'])}",
             column_config={"fecha": "Fecha", "descripcion": "Descripción",
                            "monto": st.column_config.NumberColumn("Monto", format="$%.2f"), "saldo": st.column_config.NumberColumn("Saldo", format="$%.2f")})
         filas = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
@@ -708,10 +718,29 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
     with st.expander("⬆️ Cargar estado de cuenta", expanded=todos.empty):
         st.caption(f"Cuenta **{cuenta['nombre']}** · formato de lectura: {cuenta['formato']}. "
                    "Puedes subir un archivo acumulado: solo se agregan los movimientos nuevos.")
-        archivo = st.file_uploader("Archivo (CSV o Excel)", type=["csv", "xlsx", "xls"], key="up_estado")
-        if archivo is not None and st.button("Cargar movimientos", type="primary", key="btn_cargar_estado"):
+        archivo = st.file_uploader("Archivo (CSV, Excel o PDF)", type=["csv", "xlsx", "xls", "pdf"], key="up_estado",
+                                   help="PDF: debe traer texto (en BBVAnet: Ctrl+P → Destino «Guardar como PDF»). Se validan los saldos renglón por renglón.")
+        df_pdf, error_pdf = None, None
+        if archivo is not None and archivo.name.lower().endswith(".pdf"):
             try:
-                df = cargar_estado_cuenta(archivo.getvalue(), archivo.name, cuenta["formato"])
+                df_pdf = pdf_estado.leer_pdf_estado(archivo.getvalue())
+                if df_pdf.attrs.get("validado"):
+                    st.success(f"✔ PDF leído: {len(df_pdf)} movimientos del {df_pdf['Fecha'].min()} al {df_pdf['Fecha'].max()} · "
+                               "los saldos cuadran renglón por renglón.")
+                else:
+                    st.warning(" ".join(df_pdf.attrs.get("avisos", [])))
+                st.caption(f"Cargos {money_md(df_pdf['Cargo'].sum())} · abonos {money_md(df_pdf['Abono'].sum())}. "
+                           f"El PDF no trae el año: se tomó de la fecha de impresión ({df_pdf.attrs['fecha_impresion']}). "
+                           "Revisa la vista previa antes de cargar.")
+                st.dataframe(df_pdf[["Fecha", "Descripción", "Cargo", "Abono", "Saldo"]], hide_index=True, use_container_width=True,
+                             height=min(36 * (len(df_pdf) + 1) + 4, 300),
+                             column_config={c: st.column_config.NumberColumn(c, format="$%.2f") for c in ("Cargo", "Abono", "Saldo")})
+            except pdf_estado.ErrorPDF as e:
+                error_pdf = str(e)
+                st.error("No se pudo leer el PDF:\n\n" + error_pdf)
+        if archivo is not None and error_pdf is None and st.button("Cargar movimientos", type="primary", key="btn_cargar_estado"):
+            try:
+                df = df_pdf if df_pdf is not None else cargar_estado_cuenta(archivo.getvalue(), archivo.name, cuenta["formato"])
                 r = db.subir_estado_cuenta(sb, cuenta["id"], df)
                 _flash(f"{r['nuevos']} movimiento(s) nuevo(s); {r['ya_existian']} ya estaban cargados"
                        + (f"; {r['sin_fecha_o_monto']} omitido(s) por no tener fecha o monto válido" if r["sin_fecha_o_monto"] else "") + ".")
@@ -748,7 +777,7 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
     mostrar = vista[["fecha", "descripcion", "monto", "saldo", "estado", "motivo_espera", "nota_revisor"]].assign(estado=vista["estado"].map(NOMBRE_MOV))
     ev = st.dataframe(mostrar, hide_index=True, use_container_width=True,
                       on_select="rerun", selection_mode="multi-row",
-                      key=f"tabla_mov_{st.session_state.get('bit_ver', 0)}_{periodo['id']}_{estado}_{alcance}",
+                      key=f"tabla_mov_{st.session_state.get('bit_ver', 0)}_{periodo['id']}_{estado}_{alcance}_{_firma(vista['id'])}",
                       column_config={"fecha": "Fecha", "descripcion": "Descripción", "estado": "Estado", "motivo_espera": "Por qué está pendiente", "nota_revisor": "Nota del revisor",
                                      "monto": st.column_config.NumberColumn("Monto", format="$%.2f"), "saldo": st.column_config.NumberColumn("Saldo", format="$%.2f")})
     filas = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
@@ -1011,7 +1040,7 @@ def _lotes_pago_aplicante(sb, cuenta: dict, periodos: list[dict], periodo: dict 
         "Estado": NOMBRE_LOTE.get(l["estado"], l["estado"]), "Fecha de pago": l.get("fecha_pago") or "", "Referencia": l.get("referencia_pago") or ""}
         for l in lotes])
     ev = st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 300),
-                      on_select="rerun", selection_mode="single-row", key=f"tabla_lpa_{clave}_{st.session_state.get('bit_ver', 0)}_{periodo['id'] if periodo else 'todos'}",
+                      on_select="rerun", selection_mode="single-row", key=f"tabla_lpa_{clave}_{st.session_state.get('bit_ver', 0)}_{periodo['id'] if periodo else 'todos'}_{_firma(l['id'] for l in lotes)}",
                       column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
     sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(lotes)]
     if not sel:
@@ -1175,7 +1204,7 @@ def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
                 .format({"Monto": "${:,.2f}", "Diferencia": "${:,.2f}"}, na_rep="—"))
     ev = st.dataframe(estilo_d, hide_index=True, use_container_width=True, height=min(36 * (len(tabla_d) + 1) + 4, 420),
                       on_select="rerun", selection_mode="single-row",
-                      key=f"tabla_env_{st.session_state.get('bit_ver', 0)}_{filtro}_{texto}",
+                      key=f"tabla_env_{st.session_state.get('bit_ver', 0)}_{filtro}_{texto}_{_firma(r['tipo'] + str(r['id']) for r in vista_d)}",
                       column_config={"Sol. #": st.column_config.NumberColumn("Sol. #", format="%d", width="small"),
                                      "Estado": st.column_config.TextColumn("Estado", width="small"),
                                      "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small", help="Movimientos del banco que forman la comprobación")})
@@ -1529,7 +1558,7 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
                "Selecciona una o varias filas: con una ves el detalle y puedes devolverla; con varias das el visto bueno y se crea el lote de pago.")
     ev = st.dataframe(estilo, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 420),
                       on_select="rerun", selection_mode="multi-row",
-                      key=f"tabla_rev_{st.session_state.get('rev_ver', 0)}_{cuenta['id']}_{periodo['id']}_{filtro}_{texto}",
+                      key=f"tabla_rev_{st.session_state.get('rev_ver', 0)}_{cuenta['id']}_{periodo['id']}_{filtro}_{texto}_{_firma(f['id'] for f in vista)}",
                       column_config={"Sol. #": st.column_config.NumberColumn("Sol. #", format="%d", width="small"),
                                      "Estado": st.column_config.TextColumn("Estado", width="small"),
                                      "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small")})
@@ -1688,7 +1717,7 @@ def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
                       .apply(_pintar_comprobacion, subset=["Comprobación"]).format({"Monto": "${:,.2f}"}, na_rep="—"),
                       hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 460),
                       on_select="rerun", selection_mode="multi-row",
-                      key=f"tabla_ecr_{st.session_state.get('rev_ver', 0)}_{cuenta['id']}_{periodo['id']}_{filtro}_{texto}",
+                      key=f"tabla_ecr_{st.session_state.get('rev_ver', 0)}_{cuenta['id']}_{periodo['id']}_{filtro}_{texto}_{_firma(vista['id'])}",
                       column_config={"Sol. #": st.column_config.NumberColumn("Sol. #", format="%d", width="small"),
                                      "Estado": st.column_config.TextColumn("Estado", width="small")})
     sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
@@ -1785,7 +1814,7 @@ def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) 
         "Gastos": l["num_gastos"], "Monto": float(l["monto"]), "Estado": NOMBRE_LOTE.get(l["estado"], l["estado"]),
         "Fecha de pago": l.get("fecha_pago") or "", "Referencia": l.get("referencia_pago") or ""} for l in lotes])
     ev = st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 360),
-                      on_select="rerun", selection_mode="single-row", key=f"tabla_lotes_{st.session_state.get('rev_ver', 0)}_{alcance}",
+                      on_select="rerun", selection_mode="single-row", key=f"tabla_lotes_{st.session_state.get('rev_ver', 0)}_{alcance}_{_firma(l['id'] for l in lotes)}",
                       column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
     sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(lotes)]
     if not sel:
