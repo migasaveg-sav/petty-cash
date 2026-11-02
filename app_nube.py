@@ -393,7 +393,7 @@ def _seccion_estado_cuenta_bitacora(sb, cuenta: dict, periodos: list[dict], peri
         st.caption("Cargos del banco que aún no están comprobados. Los ya comprobados aparecen arriba, dentro de su registro de la bitácora.")
         m1, m2, m3 = st.columns([1.2, 1.3, 3])
         opciones = [*[etiquetas[p["id"]] for p in periodos], "Todos los meses"]
-        mes = m1.selectbox("Mes", opciones, index=opciones.index(etiquetas[periodo["id"]]) if periodo["id"] in etiquetas else 0,
+        mes = m1.selectbox("Mes", opciones, index=_idx(f"bit_mes_ec_{periodo['id']}", opciones.index(etiquetas[periodo["id"]]) if periodo["id"] in etiquetas else 0),
                            key=f"bit_mes_ec_{periodo['id']}")
         filtro = m2.selectbox("Mostrar", ["Todos", *[reportes.ETIQUETA_REGISTRO[e] for e in ("sin_comprobar", "pendiente", "no_necesario")]], key="bit_filtro_ec")
         texto = m3.text_input("🔎 Buscar por descripción o monto", key="bit_busca_ec")
@@ -588,6 +588,36 @@ def _visor_adjunto(sb) -> None:
 # ======================================================================
 # Flujo: comprobar una solicitud (pantalla completa)
 # ======================================================================
+# Selectores que deben conservar lo que el usuario eligió aunque cambie de sección: Streamlit borra el estado de un
+# widget que no se dibuja en una ejecución (por ejemplo, el «Mes» de la bitácora al irte a «Estado de cuenta»).
+# Reasignar su valor al inicio de cada ejecución evita esa limpieza (técnica documentada de Streamlit).
+_CLAVES_FIJAS = ("mes_sel", "bit_mes", "bit_filtro", "bit_filtro_ec", "filtro_estado_mov", "alcance_mov",
+                 "rev_cuenta", "rev_mes", "rev_lotes_alc")
+_PREFIJOS_FIJOS = ("bit_mes_ec_", "cmp_mes_")
+
+
+def _idx(clave: str, indice: int) -> int:
+    """Índice inicial de un selectbox con key: si ya hay un valor guardado en la sesión no se pasa índice (evita el aviso de Streamlit)."""
+    return 0 if clave in st.session_state else indice
+
+
+def _conservar_filtros() -> None:
+    for k in list(st.session_state.keys()):
+        if isinstance(k, str) and (k in _CLAVES_FIJAS or k.startswith(_PREFIJOS_FIJOS)):
+            st.session_state[k] = st.session_state[k]
+
+
+def _abrir_ventana_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
+    """Abre la comprobación en una ventana aparte (diálogo ancho). Cerrarla con la X equivale a «Volver»."""
+    def _contenido() -> None:
+        _pantalla_comprobar(sb, cuenta, sol, tol)
+    try:
+        deco = st.dialog("🔗 Comprobar gasto", width="large", on_dismiss=_limpiar_comprobacion)
+    except TypeError:   # versión de Streamlit sin on_dismiss
+        deco = st.dialog("🔗 Comprobar gasto", width="large")
+    deco(_contenido)()
+
+
 def _limpiar_comprobacion() -> None:
     for k in [k for k in st.session_state if k.startswith("cmp_") or k.startswith("adjf_")]:
         del st.session_state[k]
@@ -595,7 +625,9 @@ def _limpiar_comprobacion() -> None:
 
 
 def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
-    st.button("← Volver a la bitácora", on_click=_limpiar_comprobacion, key="volver_cmp")
+    if st.button("← Cerrar y volver a la bitácora", key="volver_cmp"):
+        _limpiar_comprobacion()
+        st.rerun()
     st.markdown(f"### 🔗 Comprobar solicitud #{sol['numero']}" if sol.get("id") else "### 🔗 Comprobar movimiento(s) del estado de cuenta")
     st.caption(f"{sol['fecha']} · {money_md(sol['monto_tentativo'])} (tentativo) · {sol.get('category') or '—'} · {sol.get('description') or ''}")
 
@@ -609,10 +641,12 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
             return
         hoy = hoy_cdmx()
         mes_actual = f"{hoy.year}-{hoy.month:02d}"
-        meses = sorted({str(f)[:7] for f in pend["fecha"]} | {mes_actual}, reverse=True)
+        mes_pref = st.session_state.get("mes_sel")   # el mes que el usuario tiene elegido en la barra lateral
+        mes_def = mes_pref if isinstance(mes_pref, str) and len(mes_pref) == 7 else mes_actual
+        meses = sorted({str(f)[:7] for f in pend["fecha"]} | {mes_actual, mes_def}, reverse=True)
         c0, c1, c2 = st.columns([1.1, 2, 1.3])
-        mes_sel = c0.selectbox("Mes del estado de cuenta", [*meses, "Todos los meses"], index=meses.index(mes_actual),
-                               key=f"cmp_mes_{sol.get('id') or 'nueva'}", help="Por omisión se muestra el mes en curso; cámbialo si aún quedan pendientes de un mes anterior.")
+        mes_sel = c0.selectbox("Mes del estado de cuenta", [*meses, "Todos los meses"], index=_idx(f"cmp_mes_{sol.get('id') or 'nueva'}", meses.index(mes_def)),
+                               key=f"cmp_mes_{sol.get('id') or 'nueva'}", help="Por omisión se muestra el mes elegido en la barra lateral; cámbialo si quedan pendientes de otro mes. Se conserva hasta que lo cambies.")
         texto = c1.text_input("🔎 Buscar por descripción", key="cmp_busca")
         cerca = c2.checkbox("Ordenar por cercanía al monto tentativo", value=float(sol["monto_tentativo"] or 0) > 0, key="cmp_cerca")
         vista = pend.copy()
@@ -1563,7 +1597,7 @@ def _vista_revisor(sb) -> None:
     with st.sidebar:
         st.markdown('<div class="sidebar-header"><div class="sidebar-header-icon">🧮</div><span>Revisor</span></div>', unsafe_allow_html=True)
         cuenta = cuentas[nombres.index(st.selectbox("Cuenta", nombres, key="rev_cuenta"))]
-        sel = st.selectbox("Mes", etiquetas, index=etiquetas.index(actual) if actual in etiquetas else 0, key="rev_mes")
+        sel = st.selectbox("Mes", etiquetas, index=_idx("rev_mes", etiquetas.index(actual) if actual in etiquetas else 0), key="rev_mes")
         periodo = periodos[etiquetas.index(sel)]
         if cuenta.get("limite_reembolso"):
             st.caption(f"Límite de reembolso: {money_md(cuenta['limite_reembolso'])}")
@@ -2107,6 +2141,7 @@ def main() -> None:
         cuenta = st.session_state._cuenta
     else:
         cuenta = None
+    _conservar_filtros()
     cab = st.columns([5, 2, 1])
     cab[0].markdown(estilos.encabezado(), unsafe_allow_html=True)
     if perfil:
@@ -2135,7 +2170,7 @@ def main() -> None:
     etiquetas = [db.etiqueta_periodo(p) for p in periodos]
     with st.sidebar:
         st.markdown(f'<div class="sidebar-header"><div class="sidebar-header-icon">💼</div><span>{cuenta["nombre"]}</span></div>', unsafe_allow_html=True)
-        sel = st.selectbox("Mes", etiquetas, index=etiquetas.index(actual) if actual in etiquetas else 0, key="mes_sel")
+        sel = st.selectbox("Mes", etiquetas, index=_idx("mes_sel", etiquetas.index(actual) if actual in etiquetas else 0), key="mes_sel")
         periodo = periodos[etiquetas.index(sel)]
         cerrado = cierre.get(periodo["id"]) == "cerrado"
         if cerrado:
@@ -2146,8 +2181,7 @@ def main() -> None:
         vista_app = st.radio("Ir a", ["🧾 Mi caja chica", "🔎 Buscar pagos"], key="vista_app")
 
     if st.session_state.get("comprobando"):
-        _pantalla_comprobar(sb, cuenta, st.session_state.comprobando, st.session_state.tol)
-        return
+        _abrir_ventana_comprobar(sb, cuenta, st.session_state.comprobando, st.session_state.tol)
     _panel_pendientes(sb, cuenta)
     if vista_app == "🔎 Buscar pagos":
         _pagina_busqueda(sb, cuenta, periodos)
