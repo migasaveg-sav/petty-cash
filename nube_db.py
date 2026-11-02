@@ -238,7 +238,8 @@ def listar_movimientos(sb, cuenta_id: str, estado: "str | list[str] | None" = No
             q = q.eq("estado", estado)
         if periodo_id:
             q = q.eq("periodo_id", periodo_id)
-        return q.order("fecha", desc=False).order("creado_en", desc=False)
+        # `creado_en` es igual para todos los movimientos cargados en un mismo archivo: `id` desempata para que el orden sea siempre el mismo
+        return q.order("fecha", desc=False).order("creado_en", desc=False).order("id", desc=False)
     filas = _paginado(construir)
     cols = ["id", "fecha", "descripcion", "monto", "saldo", "estado", "periodo_id", "ocurrencia", "motivo_espera", "espera_desde", "nota_revisor"]
     df = pd.DataFrame(filas, columns=cols) if filas else pd.DataFrame(columns=cols)
@@ -404,7 +405,7 @@ def factura_a_json(f: dict, adjunto: dict | None = None) -> dict:
 # ----------------------------------------------------------------------
 def listar_pendientes_abiertos(sb, cuenta_id: str) -> list[dict]:
     pend = _ejecutar(sb.table("gastos_pendientes").select("*").eq("cuenta_id", cuenta_id)
-                     .neq("estado", "resuelto").order("creado_en", desc=True)) or []
+                     .neq("estado", "resuelto").order("creado_en", desc=True).order("id", desc=False)) or []
     if not pend:
         return []
     gastos = {g["id"]: g for g in (_ejecutar(sb.table("gastos").select("id,solicitud_id,monto_estado")
@@ -445,7 +446,7 @@ def listar_lotes(sb, cuenta_id: str | None = None) -> list[dict]:
     q = sb.table("lotes").select("*")
     if cuenta_id:
         q = q.eq("cuenta_id", cuenta_id)
-    return _ejecutar(q.order("cerrado_en", desc=True)) or []
+    return _ejecutar(q.order("cerrado_en", desc=True).order("id", desc=False)) or []
 
 
 # ----------------------------------------------------------------------
@@ -493,7 +494,7 @@ def gastos_de_lote(sb, lote_id: str) -> list[dict]:
                                            .in_("id", sol_ids)) or [])}
     for g in gastos:
         g["solicitud"] = sols.get(g["solicitud_id"], {})
-    return sorted(gastos, key=lambda g: (g["solicitud"].get("numero") or 0))
+    return sorted(gastos, key=lambda g: (g["solicitud"].get("numero") or 0, str(g["id"])))
 
 
 def listar_cobertura(sb, periodo_id: str) -> list[dict]:
@@ -617,7 +618,7 @@ def listar_envio_gastos(sb, cuenta_id: str, periodo_id: str | None = None) -> li
         q = sb.table("v_envio_gastos").select("*").eq("cuenta_id", cuenta_id)
         if periodo_id:
             q = q.eq("periodo_id", periodo_id)
-        return q.order("envio_numero", desc=False)
+        return q.order("envio_numero", desc=False).order("gasto_id", desc=False)
     return _paginado(construir)
 
 
