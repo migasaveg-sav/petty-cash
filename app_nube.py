@@ -761,7 +761,7 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
         st.markdown("##### 🧾 Facturas de este gasto")
     for f in list(facturas):
         d = f["datos"]
-        with st.container(border=True):
+        with st.container(border=True, key=f"cmp_tarjeta_{f['k']}"):
             cols = st.columns([3, 1.4, 1.1, 1.1, 0.5])
             cols[0].markdown(f"**{d.get('Archivo', '')}** · `{d['UUID']}`  \n{d.get('RFC Emisor', '')} · {d.get('Concepto', '')}")
             cols[1].write(d.get("Fecha Factura", ""))
