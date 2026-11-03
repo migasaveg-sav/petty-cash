@@ -564,9 +564,18 @@ def descargar_adjunto(sb, ruta: str) -> bytes:
 # ----------------------------------------------------------------------
 # Envío del estado de cuenta a revisión (005_envios_estado_cuenta.sql)
 # ----------------------------------------------------------------------
-def enviar_estado_cuenta(sb, periodo_id: str, nota: str | None = None) -> str:
-    """Envía a revisión las solicitudes del mes con gastos comprobados y guarda la foto del avance."""
-    return _ejecutar(sb.rpc("enviar_estado_cuenta", {"p_periodo": periodo_id, "p_nota": nota}))
+def enviar_estado_cuenta(sb, periodo_id: str, nota: str | None = None, solicitud_ids: list[str] | None = None) -> str:
+    """Envía a revisión las solicitudes del mes con gastos comprobados y guarda la foto del avance.
+    Con `solicitud_ids` solo se envían esas (requiere el script 011); sin él, todas las elegibles."""
+    params = {"p_periodo": periodo_id, "p_nota": nota}
+    if solicitud_ids is not None:
+        params["p_solicitudes"] = solicitud_ids
+    try:
+        return _ejecutar(sb.rpc("enviar_estado_cuenta", params))
+    except ErrorNube as e:
+        if solicitud_ids is not None and "p_solicitudes" in str(e):
+            raise ErrorNube("Falta correr el script 011_enviar_seleccion.sql en Supabase para enviar solo las solicitudes marcadas.") from e
+        raise
 
 
 def listar_envios(sb, cuenta_id: str | None = None, periodo_id: str | None = None) -> list[dict]:
