@@ -1188,6 +1188,65 @@ def _lotes_pago_aplicante(sb, cuenta: dict, periodos: list[dict], periodo: dict 
                          hide_index=True, use_container_width=True, column_config={"Cargo": st.column_config.NumberColumn("Cargo", format="$%.2f")})
 
 
+def _lote_por_enviar(sb, periodo: dict, cerrado: bool, por_enviar: pd.DataFrame, sols: list[dict], n_lote: int) -> None:
+    """Tabla del lote por enviar con casilla «Enviar» por solicitud: se mandan solo las marcadas."""
+    num_a_id = {int(x["numero"]): x["id"] for x in sols}
+    ps = por_enviar.groupby("Solicitud", as_index=False).agg(
+        Fecha=("Fecha", "min"), Empleado=("Empleado", "first"), Categoría=("Categoría", "first"), Descripción=("Descripción", "first"),
+        Gastos=("Monto", "size"), Movimientos=("Movimientos", "sum"), Facturas=("Facturas", "sum"), Monto=("Monto", "sum"),
+        Diferencia=("Diferencia", "sum"), Devuelto=("Devuelto", "max")).sort_values("Solicitud").reset_index(drop=True)
+    total = float(ps["Monto"].sum())
+    k = st.columns(3)
+    k[0].markdown(estilos.tarjeta(f"Lote #{n_lote} disponible", str(int(ps["Gastos"].sum())), "gasto(s) comprobado(s)", "acento"), unsafe_allow_html=True)
+    k[1].markdown(estilos.tarjeta("Solicitudes", str(len(ps)), "disponibles para enviar", "acento"), unsafe_allow_html=True)
+    k[2].markdown(estilos.tarjeta("Total disponible", estilos.money_html(total), "monto de los cargos", "rojo"), unsafe_allow_html=True)
+
+    ver = st.session_state.setdefault("env_ver", 0)
+    marca_ini = st.session_state.get("env_marca_ini", True)
+    b1, b2, b3 = st.columns([1.2, 1.2, 4])
+    if b1.button("☑️ Marcar todas", key="env_todas", disabled=cerrado):
+        st.session_state.env_ver = ver + 1
+        st.session_state.env_marca_ini = True
+        st.rerun()
+    if b2.button("⬜ Quitar marcas", key="env_ninguna", disabled=cerrado):
+        st.session_state.env_ver = ver + 1
+        st.session_state.env_marca_ini = False
+        st.rerun()
+    b3.caption("Marca las solicitudes que sí quieres mandar a revisión; las demás se quedan aquí para el siguiente lote.")
+
+    editor = ps.copy()
+    editor.insert(0, "Enviar", marca_ini)
+    editado = st.data_editor(
+        editor, hide_index=True, use_container_width=True, disabled=[c for c in editor.columns if c != "Enviar"],
+        key=f"env_editor_{ver}_{_firma(ps['Solicitud'])}",
+        column_config={"Enviar": st.column_config.CheckboxColumn("Enviar", help="Marca para incluirla en este lote", width="small"),
+                       "Monto": st.column_config.NumberColumn("Monto", format="$%.2f"),
+                       "Diferencia": st.column_config.NumberColumn("Diferencia", format="$%.2f"),
+                       "Solicitud": st.column_config.NumberColumn("Solicitud", format="%d")})
+    marcadas = editado[editado["Enviar"]]
+    ids = [num_a_id[int(n)] for n in marcadas["Solicitud"] if int(n) in num_a_id]
+    n_gastos = int(marcadas["Gastos"].sum()) if len(marcadas) else 0
+    monto_sel = float(marcadas["Monto"].sum()) if len(marcadas) else 0.0
+    st.markdown(f"**Seleccionadas: {len(marcadas)} de {len(ps)} solicitudes** · {n_gastos} gasto(s) · {money_md(monto_sel)}")
+    if len(marcadas) < len(ps):
+        st.caption(f"{len(ps) - len(marcadas)} solicitud(es) sin marcar no se enviarán y seguirán disponibles para el siguiente lote.")
+    st.caption("Al mandar a revisión el lote queda registrado con su fecha y su total; no se puede editar, solo el revisor puede devolver un gasto.")
+    nota = st.text_input("Nota para el revisor (opcional)", key="env_nota", disabled=cerrado)
+    if st.button(f"📤 Mandar a revisión · Lote #{n_lote} · {len(marcadas)} solicitud(es) · {money_md(monto_sel)}", type="primary",
+                 key="btn_enviar_ec", disabled=cerrado or not ids):
+        try:
+            db.enviar_estado_cuenta(sb, periodo["id"], nota, None if len(ids) == len(ps) else ids)
+            st.session_state.pop("env_nota", None)
+            st.session_state.pop("xl_mes", None)
+            st.session_state.pop("env_marca_ini", None)
+            _flash(f"Lote #{n_lote} enviado a revisión ({len(ids)} solicitud(es)).")
+            st.rerun()
+        except db.ErrorNube as e:
+            st.error(str(e))
+    if not ids:
+        st.caption("Marca al menos una solicitud para poder enviar.")
+
+
 def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
     df = db.listar_movimientos_revision(sb, cuenta["id"], periodo["id"])
     if df.empty:
@@ -1220,26 +1279,7 @@ def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
             st.caption("Comprueba gastos en la Bitácora o en el Estado de cuenta; aquí aparecerán para que los revises antes de mandarlos. "
                        "Los gastos que el revisor te devuelva vuelven a entrar en el siguiente lote cuando atiendas el pendiente.")
         else:
-            total = float(por_enviar["Monto"].sum())
-            k = st.columns(3)
-            k[0].markdown(estilos.tarjeta(f"Lote #{n_lote} por enviar", str(len(por_enviar)), "gasto(s) comprobado(s)", "acento"), unsafe_allow_html=True)
-            k[1].markdown(estilos.tarjeta("Solicitudes", str(por_enviar["Solicitud"].nunique()), "incluidas en el lote", "acento"), unsafe_allow_html=True)
-            k[2].markdown(estilos.tarjeta("Total del lote", estilos.money_html(total), "monto de los cargos", "rojo"), unsafe_allow_html=True)
-            st.dataframe(por_enviar, hide_index=True, use_container_width=True,
-                         column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f"),
-                                        "Diferencia": st.column_config.NumberColumn("Diferencia", format="$%.2f")})
-            st.caption("Revisa la tabla. Al mandar a revisión el lote queda registrado con su fecha y su total; no se puede editar, solo el revisor puede devolver un gasto.")
-            nota = st.text_input("Nota para el revisor (opcional)", key="env_nota", disabled=cerrado)
-            if st.button(f"📤 Mandar a revisión · Lote #{n_lote} · {money_md(total)}", type="primary", key="btn_enviar_ec", disabled=cerrado):
-                try:
-                    db.enviar_estado_cuenta(sb, periodo["id"], nota)
-                    if "env_nota" in st.session_state:
-                        del st.session_state["env_nota"]
-                    st.session_state.pop("xl_mes", None)
-                    _flash(f"Lote #{n_lote} enviado a revisión.")
-                    st.rerun()
-                except db.ErrorNube as e:
-                    st.error(str(e))
+            _lote_por_enviar(sb, periodo, cerrado, por_enviar, sols, n_lote)
         # Excel del mes (siempre disponible)
         xl = st.session_state.get("xl_mes")
         if xl and xl["clave"] != (cuenta["id"], periodo["id"]):
