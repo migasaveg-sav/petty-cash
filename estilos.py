@@ -123,13 +123,31 @@ section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{ color: #FFFF
 /* -------- Mensajes -------- */
 [data-testid="stAlert"] {{ border-radius: 8px; }}
 
-/* -------- Ventana «Comprobar gasto» (diálogo): color cálido para distinguirla del resto de la página -------- */
-[data-testid="stDialog"] > div {{ background: rgba(25,35,51,.62); }}
-div[role="dialog"] {{ background: #FFF1D6; border: 4px solid #F59E0B; border-radius: 16px; box-shadow: 0 24px 70px rgba(25,35,51,.55); }}
-div[role="dialog"] h2 {{ color: #7A3E00; font-weight: 800; border-bottom: 3px solid #F59E0B; padding-bottom: 6px; }}
-div[role="dialog"] h3, div[role="dialog"] h4, div[role="dialog"] h5 {{ color: #7A3E00; }}
-div[role="dialog"] [data-testid="stVerticalBlockBorderWrapper"] {{ background: #FFFFFF; border-color: #E0B060; }}
-div[role="dialog"] [data-testid="stCaptionContainer"], div[role="dialog"] small {{ color: #5C4A2E !important; }}
+/* -------- Ventana «Comprobar gasto» (diálogo): fondo sólido y cálido, distinto del resto de la página -------- */
+[data-testid="stDialog"] {{ background: rgba(25,35,51,.68) !important; }}
+[data-testid="stDialog"] > div {{ background: transparent !important; }}
+section[role="dialog"], div[role="dialog"] {{ background: #F6BE4F !important; border: 4px solid #8A4B00; border-radius: 16px;
+    box-shadow: 0 24px 70px rgba(0,0,0,.6); opacity: 1 !important; }}
+section[role="dialog"] *, div[role="dialog"] * {{ opacity: 1; }}
+section[role="dialog"] h1, section[role="dialog"] h2, section[role="dialog"] h3, section[role="dialog"] h4, section[role="dialog"] h5,
+div[role="dialog"] h1, div[role="dialog"] h2, div[role="dialog"] h3, div[role="dialog"] h4, div[role="dialog"] h5 {{ color: #2B1700 !important; }}
+section[role="dialog"] h2 {{ font-weight: 800; border-bottom: 3px solid #8A4B00; padding-bottom: 6px; }}
+section[role="dialog"] label, section[role="dialog"] label p, section[role="dialog"] [data-testid="stWidgetLabel"] p,
+section[role="dialog"] [data-testid="stMarkdownContainer"] p, section[role="dialog"] [data-testid="stCaptionContainer"],
+section[role="dialog"] [data-testid="stMetricLabel"], section[role="dialog"] [data-testid="stMetricValue"], section[role="dialog"] small {{ color: #2B1700 !important; }}
+/* campos: blancos y con borde oscuro para que resalten sobre el fondo ámbar */
+section[role="dialog"] [data-testid="stTextInputRootElement"], section[role="dialog"] [data-testid="stNumberInputContainer"],
+section[role="dialog"] [data-testid="stDateInputField"], section[role="dialog"] [data-testid="stSelectbox"] [role="group"], section[role="dialog"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+section[role="dialog"] [data-testid="stTextArea"] textarea, section[role="dialog"] [data-testid="stFileUploaderDropzone"] {{
+    background: #FFFFFF !important; border: 1.5px solid #8A4B00 !important; }}
+section[role="dialog"] input, section[role="dialog"] textarea {{ color: #111827 !important; }}
+/* tarjetas y avisos opacos (sin transparencia) */
+section[role="dialog"] [class*="st-key-cmp_tarjeta_"] {{ background: #FFFFFF !important; border: 1.5px solid #8A4B00 !important; border-radius: 10px; padding: 8px; }}
+section[role="dialog"] [class*="st-key-cmp_tarjeta_"] * {{ color: #111827; }}
+section[role="dialog"] [data-testid="stForm"] {{ background: #FFFFFF !important; border: 1.5px solid #8A4B00 !important; }}
+section[role="dialog"] [data-testid="stAlert"] {{ background: #FFFFFF !important; border: 1.5px solid #8A4B00; }}
+section[role="dialog"] [data-testid="stExpander"] details {{ border: 2px solid #8A4B00 !important; background: #FFFFFF !important; }}
+section[role="dialog"] [data-testid="stExpander"] summary, section[role="dialog"] [data-testid="stExpander"] summary * {{ color: #FFFFFF !important; }}
 </style>
 """, unsafe_allow_html=True)
 
