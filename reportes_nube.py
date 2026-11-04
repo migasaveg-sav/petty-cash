@@ -188,6 +188,9 @@ def filas_desglose(df: pd.DataFrame, gastos: list[dict]) -> list[dict]:
             "movs": int(len(movs)), "monto": round(float(movs["monto"].abs().sum()), 2),
             "diferencia": round(float(pd.to_numeric(por_gasto["diferencia"], errors="coerce").fillna(0).sum()), 2),
             "tiene_diferencia": bool(por_gasto["tiene_diferencia"].fillna(False).astype(bool).any()),
+            "dif_tc": any(gastos_por_id[g].get("dif_tc") for g in gasto_ids if g in gastos_por_id),
+            "detalle_tc": " | ".join(str(gastos_por_id[g]["detalle_tc"]) for g in gasto_ids
+                                     if g in gastos_por_id and gastos_por_id[g].get("dif_tc") and gastos_por_id[g].get("detalle_tc")),
             "situacion": " · ".join(x for x in (SITUACION_SOLICITUD.get(r0["solicitud_estado"], str(r0["solicitud_estado"])), lote) if x)})
     resto = df[(df["estado"] != "comprobado") | (df["solicitud_id"].isna())].drop_duplicates("id")
     for r in resto.itertuples():
