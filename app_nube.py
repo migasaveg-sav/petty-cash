@@ -607,6 +607,15 @@ def _conservar_filtros() -> None:
             st.session_state[k] = st.session_state[k]
 
 
+def _rerun_ventana() -> None:
+    """Vuelve a dibujar solo el contenido de la ventana «Comprobar gasto» (no la página de atrás), para que no se
+    mueva el scroll ni se reinicien las secciones. Fuera de la ventana (o en versiones viejas de Streamlit) hace el rerun completo."""
+    try:
+        st.rerun(scope="fragment")
+    except Exception:
+        st.rerun()
+
+
 def _abrir_ventana_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
     """Abre la comprobación en una ventana aparte (diálogo ancho). Cerrarla con la X equivale a «Volver»."""
     def _contenido() -> None:
@@ -674,7 +683,7 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
                     + (" · varios cargos comparten las mismas facturas" if len(sel) > 1 else ""))
             if st.button(f"Continuar con {len(sel)} movimiento(s)", type="primary", key="cmp_continuar"):
                 st.session_state.cmp_movs = sel["id"].tolist()
-                st.rerun()
+                _rerun_ventana()
         return
 
     movs = pend[pend["id"].isin(elegidos)]
@@ -688,7 +697,7 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
                  column_config={"fecha": "Fecha", "descripcion": "Descripción", "monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
     if st.button("Cambiar selección", key="cmp_cambiar"):
         st.session_state.pop("cmp_movs", None)
-        st.rerun()
+        _rerun_ventana()
 
     # ---------- Paso 2: facturas ----------
     st.markdown("#### Paso 2 · Agrega la(s) factura(s)")
@@ -735,7 +744,7 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
             if datos.get("Incompleta"):
                 st.warning(f"'{xf.name}' está incompleta: {'; '.join(datos.get('Advertencias', []))}")
         st.session_state.cmp_xml_ver = ver + 1
-        st.rerun()
+        _rerun_ventana()
 
     with st.expander("✏️ Agregar factura manual (sin XML)"):
         with st.form("cmp_manual", clear_on_submit=True):
@@ -755,7 +764,7 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
                         "Fuente": "Manual", "Archivo": "Manual", "Fecha Factura": str(mf_fecha), "UUID": u, "Concepto": mf_concepto,
                         "RFC Emisor": mf_rfc, "Razón Social": mf_razon, "IVA": mf_iva, "IVA Retenido": 0.0, "ISR Retenido": 0.0,
                         "ISH": 0.0, "Monto Total": mf_monto, "Incompleta": False, "Advertencias": []}})
-                    st.rerun()
+                    _rerun_ventana()
 
     if facturas:
         st.markdown("##### 🧾 Facturas de este gasto")
@@ -769,7 +778,7 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
             cols[3].write(f"**{money_md(d['Monto Total'])}**")
             if cols[4].button("✕", key=f"cmp_quitar_{f['k']}", help="Quitar factura"):
                 facturas.remove(f)
-                st.rerun()
+                _rerun_ventana()
             if f["adjunto"]:
                 info = f["adjunto"][1]
                 a1, a2 = st.columns([4, 1])
@@ -777,14 +786,14 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
                 if a2.button("Quitar PDF", key=f"cmp_qadj_{f['k']}"):
                     f["adjunto"] = None
                     f["adj_ver"] += 1
-                    st.rerun()
+                    _rerun_ventana()
             else:
                 archivo = st.file_uploader("📎 Adjuntar PDF o foto de la factura", type=["pdf", "jpg", "jpeg", "png"], key=f"adjf_{f['k']}_{f['adj_ver']}")
                 if archivo is not None:
                     try:
                         pdf, info = adj.comprimir_a_pdf(archivo.getvalue(), archivo.name)
                         f["adjunto"] = (pdf, info)
-                        st.rerun()
+                        _rerun_ventana()
                     except adj.AdjuntoError as e:
                         st.error(str(e))
 
