@@ -461,6 +461,30 @@ def pagar_lote(sb, lote_id: str, fecha, referencia: str) -> None:
     _ejecutar(sb.rpc("pagar_lote", {"p_lote": lote_id, "p_fecha": str(fecha), "p_referencia": referencia}))
 
 
+def registrar_pago_lote(sb, lote_id: str, fecha, monto: float, referencia: str) -> None:
+    """Registra un pago (total o parcial) de un lote. El lote queda «pagado» cuando lo pagado alcanza su monto."""
+    if not (referencia or "").strip():
+        raise ErrorNube("Escribe la referencia / folio del pago.")
+    if not monto or float(monto) <= 0:
+        raise ErrorNube("El monto del pago debe ser mayor a cero.")
+    _ejecutar(sb.rpc("registrar_pago_lote", {"p_lote": lote_id, "p_fecha": str(fecha), "p_monto": round(float(monto), 2),
+                                            "p_referencia": referencia.strip()}))
+
+
+def listar_pagos_lote(sb, lote_id: str) -> list[dict]:
+    return _ejecutar(sb.table("pagos_lote").select("*").eq("lote_id", lote_id).order("fecha_pago", desc=False)
+                     .order("creado_en", desc=False)) or []
+
+
+def reclasificar_fuente_facturas(sb, factura_ids: list[str], fuente: str, motivo: str) -> int:
+    """El revisor corrige si una factura se comprobó con XML o a mano. Regresa cuántas cambió."""
+    if fuente not in ("xml", "manual"):
+        raise ErrorNube("Tipo de comprobación no válido.")
+    if not (motivo or "").strip():
+        raise ErrorNube("Escribe el motivo del cambio.")
+    return int(_ejecutar(sb.rpc("reclasificar_fuente_facturas", {"p_facturas": factura_ids, "p_fuente": fuente, "p_motivo": motivo.strip()})) or 0)
+
+
 def desbloquear_lote(sb, lote_id: str, motivo: str) -> None:
     _ejecutar(sb.rpc("desbloquear_lote", {"p_lote": lote_id, "p_motivo": motivo}))
 
