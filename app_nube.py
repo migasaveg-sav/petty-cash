@@ -806,10 +806,24 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
     if not facturas:
         st.info("Agrega al menos una factura (XML o manual).")
         return
-    if abs(diferencia) > tol:
-        st.warning(f"La diferencia debe ser de máximo {money_md(tol)} para guardar el gasto.")
+    # Función especial: cotización en dólares y factura en pesos → la diferencia por tipo de cambio puede ser mayor a la tolerancia.
+    dif_tc = st.toggle("💱 Facturas con diferencias de tipo de cambio", key="cmp_dif_tc",
+                       help="Úsalo solo cuando la cotización fue en dólares y la factura en pesos. Permite una diferencia mayor a "
+                            f"{money_md(tol)} y exige explicar el motivo en «Detalles».")
+    detalle_tc = ""
+    if dif_tc:
+        detalle_tc = st.text_area("Detalles (obligatorio): razón de la diferencia", key="cmp_dif_tc_det", height=90,
+                                  placeholder="Ej.: cotización en USD 500 a T.C. 17.20; la factura se emitió en pesos a T.C. 18.05 (DOF del día de emisión).")
+        st.info("Este gasto se guardará marcado como **diferencia por tipo de cambio**: el revisor verá tu explicación y podrá darle visto bueno aunque la diferencia sea mayor a "
+                f"{money_md(tol)}.")
+        if not detalle_tc.strip():
+            st.warning("Escribe en «Detalles» por qué hay diferencia para poder guardar.")
+            return
+    elif abs(diferencia) > tol:
+        st.warning(f"La diferencia debe ser de máximo {money_md(tol)} para guardar el gasto. "
+                   "Si se debe al tipo de cambio (cotización en dólares, factura en pesos), activa «Facturas con diferencias de tipo de cambio».")
         return
-    if abs(diferencia) >= 0.005:
+    elif abs(diferencia) >= 0.005:
         st.info(f"Se guardará con una diferencia de {money_md(diferencia)} (dentro de la tolerancia); el revisor la verá resaltada.")
 
     if st.button("💾 Guardar gasto", type="primary", key="cmp_guardar"):
@@ -832,7 +846,8 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
                     adjunto = {"ruta": ruta, **{k: info[k] for k in ("nombre_original", "bytes_original", "bytes_final", "sha256")}}
                 payload.append(db.factura_a_json(f["datos"], adjunto))
             db.guardar_gasto(sb, sol.get("id") or sol_nueva_id, elegidos, None if categoria == "—" else categoria,
-                             None if material == "—" else material, propina, payload)
+                             None if material == "—" else material, propina, payload,
+                             dif_tc=bool(dif_tc), detalle_tc=detalle_tc.strip() if dif_tc else None)
         except db.ErrorNube as e:
             db.borrar_adjuntos_huerfanos(sb, subidos)
             if sol_nueva_id:
@@ -1463,6 +1478,10 @@ def _detalle_solicitud_enviada(sb, df: pd.DataFrame, r: dict, gastos_por_id: dic
                      hide_index=True, use_container_width=True,
                      column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
         for g in gs:
+            if g.get("dif_tc"):
+                st.warning(f"💱 **Factura con diferencia de tipo de cambio** (cotización en dólares, factura en pesos). "
+                           f"Detalles del aplicante: {g.get('detalle_tc') or '—'}")
+        for g in gs:
             for f in g.get("facturas") or []:
                 cols = st.columns([3.2, 1.2, 1, 1.1] if revisor else [3.2, 1.2, 1])
                 cols[0].caption(f"{_etiqueta_factura(f)} · 🧾 {f.get('uuid_cfdi') or 'SIN-UUID'} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
@@ -1760,7 +1779,7 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
             st.caption("Revisa y aprueba cada envío por separado, o usa el botón de abajo para aprobar todos juntos.")
             for n in sorted(grupos, key=lambda x: (x is None, x or 0)):
                 g = grupos[n]
-                ok = [f for f in g if abs(f["diferencia"]) <= tol and f["numero"] not in pend_nums]
+                ok = [f for f in g if (abs(f["diferencia"]) <= tol or f.get("dif_tc")) and f["numero"] not in pend_nums]
                 c = st.columns([3, 1.4, 1.2, 1.6])
                 c[0].markdown(f"**{_etq_envio(n)}**  \n{len(g)} solicitud(es) · {money_md(sum(f['monto'] for f in g))}")
                 c[1].caption(f"{len(ok)} sin diferencia" + (f" · {len(g) - len(ok)} con observaciones" if len(g) > len(ok) else ""))
@@ -1785,7 +1804,7 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
         t = texto.strip().lower()
         vista = [f for f in vista if t in " ".join(str(f[k]) for k in ("descripcion", "concepto", "numero")).lower()]
 
-    limpias = [f for f in filas if f["solicitud_estado"] == "enviado_revision" and abs(f["diferencia"]) <= tol
+    limpias = [f for f in filas if f["solicitud_estado"] == "enviado_revision" and (abs(f["diferencia"]) <= tol or f.get("dif_tc"))
                and f["numero"] not in {p["solicitud_numero"] for p in pend}]
     if limpias:
         if st.button(f"⚡ Aprobar TODOS los envíos juntos: por revisar sin diferencia ({len(limpias)} · {money_md(sum(f['monto'] for f in limpias))})",
@@ -1799,7 +1818,8 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
     tabla = pd.DataFrame([{
         "Estado": NOMBRE_SOL_REV.get(f["solicitud_estado"], f["solicitud_estado"]), "Sol. #": f["numero"], "Fecha": f["fecha"],
         "Descripción": f["descripcion"], "Concepto": f["concepto"], "Comprobación": f["comprobacion"], "Mov.": f["movs"], "Monto": f["monto"],
-        "Diferencia": f["diferencia"], "Enviada en lote": f"#{f['envio']}" if f["envio"] else "—"} for f in vista])
+        "Diferencia": f["diferencia"], "Tipo de cambio": "💱 Sí" if f.get("dif_tc") else "",
+        "Enviada en lote": f"#{f['envio']}" if f["envio"] else "—"} for f in vista])
 
     def _pintar(col):
         return [f"background-color:{ESTILO_SOL_REV[f['solicitud_estado']][0]};color:{ESTILO_SOL_REV[f['solicitud_estado']][1]};"
@@ -1826,7 +1846,7 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
         total = sum(f["monto"] for f in elegidas)
         st.markdown(f"**{len(elegidas)} solicitud(es) seleccionada(s)** · {money_md(total)}")
         if len(revisables) == len(elegidas):
-            malas = [f for f in elegidas if abs(f["diferencia"]) > tol]
+            malas = [f for f in elegidas if abs(f["diferencia"]) > tol and not f.get("dif_tc")]
             if malas:
                 st.warning("Con diferencia mayor a la tolerancia: " + ", ".join(f"#{f['numero']}" for f in malas)
                            + ". El sistema no deja darles visto bueno; devuélvelas al aplicante.")
