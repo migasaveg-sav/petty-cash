@@ -223,6 +223,23 @@ def cuadre(movs: pd.DataFrame) -> dict[str, Any]:
             "dif_n": n_tot - suma_n, "dif_monto": round(m_tot - suma_m, 2)}
 
 
+def overview_categorias(movs: pd.DataFrame) -> list[dict]:
+    """Estado de cuenta resumido: comprobados por categoría + no necesarios + sin comprobar + pendientes.
+    Las filas suman exactamente el total del estado de cuenta. Cada fila: rubro, grupo, n, monto."""
+    filas: list[dict] = []
+    if movs is None or len(movs) == 0:
+        return filas
+    comp = movs[movs["estado"] == "comprobado"]
+    cat = comp["categoria"].fillna("").astype(str).str.strip().replace("", "Sin categoría")
+    for nombre, sub in comp.groupby(cat, sort=True):
+        filas.append({"rubro": nombre, "grupo": "Comprobado", "n": int(len(sub)), "monto": round(float(sub["monto"].abs().sum()), 2)})
+    for est, nombre in ESTADOS_CUADRE[1:]:
+        sub = movs[movs["estado"] == est]
+        if len(sub):
+            filas.append({"rubro": nombre, "grupo": nombre, "n": int(len(sub)), "monto": round(float(sub["monto"].abs().sum()), 2)})
+    return filas
+
+
 # ----------------------------------------------------------------------
 # Excel del mes
 # ----------------------------------------------------------------------
