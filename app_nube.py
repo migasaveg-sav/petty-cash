@@ -1127,6 +1127,23 @@ NOMBRE_LOTE = {"por_pagar": "⏳ Por pagar", "pagado": "✅ Pagado", "anulado": 
 POR_PAGINA = 25
 
 
+def _pagado_de(l: dict) -> float:
+    """Cuánto lleva pagado un lote (un lote pagado cuenta completo aunque no exista la columna monto_pagado)."""
+    if l.get("estado") == "pagado":
+        return float(l["monto"])
+    return float(l.get("monto_pagado") or 0)
+
+
+def _saldo_de(l: dict) -> float:
+    return round(float(l["monto"]) - _pagado_de(l), 2) if l.get("estado") != "anulado" else 0.0
+
+
+def _estado_lote(l: dict) -> str:
+    if l.get("estado") == "por_pagar" and _pagado_de(l) > 0:
+        return "🟡 Pago parcial"
+    return NOMBRE_LOTE.get(l.get("estado"), str(l.get("estado")))
+
+
 def _fecha_cdmx(ts: str) -> str:
     t = pd.to_datetime(ts, utc=True).tz_convert("America/Mexico_City")
     return t.strftime("%Y-%m-%d %H:%M")
@@ -1168,18 +1185,19 @@ def _lotes_pago_aplicante(sb, cuenta: dict, periodos: list[dict], periodo: dict 
         st.caption("Todavía no hay lotes de pago." if periodo is None else "Todavía no hay lotes de pago este mes: se crean cuando el revisor da el visto bueno.")
         return
     mes = {p["id"]: db.etiqueta_periodo(p) for p in periodos}
-    pagado = sum(float(l["monto"]) for l in lotes if l["estado"] == "pagado")
-    por_pagar = sum(float(l["monto"]) for l in lotes if l["estado"] == "por_pagar")
+    pagado = sum(_pagado_de(l) for l in lotes)
+    por_pagar = sum(_saldo_de(l) for l in lotes if l["estado"] == "por_pagar")
     k = st.columns(2)
-    k[0].markdown(estilos.tarjeta("Por pagar", str(sum(1 for l in lotes if l["estado"] == "por_pagar")), estilos.money_html(por_pagar), "alerta"), unsafe_allow_html=True)
-    k[1].markdown(estilos.tarjeta("Pagado", str(sum(1 for l in lotes if l["estado"] == "pagado")), estilos.money_html(pagado), "comprobado"), unsafe_allow_html=True)
+    k[0].markdown(estilos.tarjeta("Por pagar (saldo)", str(sum(1 for l in lotes if l["estado"] == "por_pagar")), estilos.money_html(por_pagar), "alerta"), unsafe_allow_html=True)
+    k[1].markdown(estilos.tarjeta("Pagado", str(sum(1 for l in lotes if _pagado_de(l) > 0)), estilos.money_html(pagado), "comprobado"), unsafe_allow_html=True)
     tabla = pd.DataFrame([{
         "Lote": f"{mes.get(l['periodo_id'], '')}-{l['numero']}", "Cerrado": str(l["cerrado_en"])[:10], "Gastos": l["num_gastos"], "Monto": float(l["monto"]),
-        "Estado": NOMBRE_LOTE.get(l["estado"], l["estado"]), "Fecha de pago": l.get("fecha_pago") or "", "Referencia": l.get("referencia_pago") or ""}
+        "Pagado": _pagado_de(l), "Saldo": _saldo_de(l),
+        "Estado": _estado_lote(l), "Fecha de pago": l.get("fecha_pago") or "", "Referencia": l.get("referencia_pago") or ""}
         for l in lotes])
     ev = st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 300),
                       on_select="rerun", selection_mode="single-row", key=f"tabla_lpa_{clave}_{st.session_state.get('bit_ver', 0)}_{periodo['id'] if periodo else 'todos'}_{_firma(l['id'] for l in lotes)}",
-                      column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
+                      column_config={c: st.column_config.NumberColumn(c, format="$%.2f") for c in ("Monto", "Pagado", "Saldo")})
     sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(lotes)]
     if not sel:
         st.caption("Haz clic en un lote para ver los gastos que incluye.")
@@ -1187,9 +1205,12 @@ def _lotes_pago_aplicante(sb, cuenta: dict, periodos: list[dict], periodo: dict 
     lote = lotes[sel[0]]
     gastos = db.gastos_de_lote(sb, lote["id"])
     with st.container(border=True):
-        st.markdown(f"**Lote {mes.get(lote['periodo_id'], '')}-{lote['numero']}** · {NOMBRE_LOTE.get(lote['estado'], lote['estado'])} · {money_md(lote['monto'])}")
+        st.markdown(f"**Lote {mes.get(lote['periodo_id'], '')}-{lote['numero']}** · {_estado_lote(lote)} · {money_md(lote['monto'])}")
         if lote["estado"] == "pagado":
             st.success(f"Pagado el {lote.get('fecha_pago')} · referencia {lote.get('referencia_pago')}")
+        elif _pagado_de(lote) > 0:
+            st.info(f"Pago parcial: se han pagado {money_md(_pagado_de(lote))} de {money_md(lote['monto'])}. Saldo pendiente: {money_md(_saldo_de(lote))}.")
+        _historial_pagos(sb, lote)
         if gastos:
             st.dataframe(pd.DataFrame([{"Sol. #": g["solicitud"].get("numero"), "Descripción": g["solicitud"].get("description") or "",
                                         "Empleado": g["solicitud"].get("employee_name") or "", "Categoría": g.get("categoria") or "",
@@ -1402,7 +1423,24 @@ def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
         _detalle_solicitud_enviada(sb, df, r, gastos_por_id)
 
 
-def _detalle_solicitud_enviada(sb, df: pd.DataFrame, r: dict, gastos_por_id: dict) -> None:
+def _corregir_fuente(sb, f: dict, gasto_id: str, columna) -> None:
+    """El revisor corrige si la factura es XML o manual (queda en bitácora)."""
+    actual = reportes.tipo_factura(f)
+    nuevo = "manual" if actual == "xml" else "xml"
+    with columna.popover(f"🔁 a {'Manual' if nuevo == 'manual' else 'XML'}"):
+        st.caption(f"Hoy figura como **{'XML' if actual == 'xml' else 'Manual'}**. Corrígela si no es correcto; queda registrado.")
+        mot = st.text_input("Motivo", key=f"fte_m_{gasto_id}_{f['id']}")
+        if st.button(f"Marcar como {'manual' if nuevo == 'manual' else 'XML'}", key=f"fte_b_{gasto_id}_{f['id']}"):
+            try:
+                db.reclasificar_fuente_facturas(sb, [f["id"]], nuevo, mot)
+                _nueva_tabla_rev()
+                _flash("Tipo de comprobación corregido.")
+                st.rerun()
+            except db.ErrorNube as e:
+                st.error(str(e))
+
+
+def _detalle_solicitud_enviada(sb, df: pd.DataFrame, r: dict, gastos_por_id: dict, revisor: bool = False) -> None:
     """Detalle de una comprobación (solicitud) con todos sus cargos y facturas."""
     sub = df[df["solicitud_id"] == r["id"]]
     if sub.empty:
@@ -1426,10 +1464,12 @@ def _detalle_solicitud_enviada(sb, df: pd.DataFrame, r: dict, gastos_por_id: dic
                      column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
         for g in gs:
             for f in g.get("facturas") or []:
-                cols = st.columns([3.2, 1.2, 1])
+                cols = st.columns([3.2, 1.2, 1, 1.1] if revisor else [3.2, 1.2, 1])
                 cols[0].caption(f"{_etiqueta_factura(f)} · 🧾 {f.get('uuid_cfdi') or 'SIN-UUID'} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
                 cols[1].caption(money_md(f["monto_aplicado"]))
                 _boton_pdf(sb, f, f"venv_{g['id']}_{f['id']}", cols[2])
+                if revisor:
+                    _corregir_fuente(sb, f, g["id"], cols[3])
 
 
 def _tag_html(estado: str) -> str:
@@ -1697,12 +1737,50 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
     cu = reportes.cuadre(df.drop_duplicates("id"))
     st.markdown(estilos.cuadre_html(cu), unsafe_allow_html=True)
 
-    f1, f2 = st.columns([1.4, 3])
+    # ---- Envíos por fecha: revisar y aprobar cada envío por separado (o todos juntos) ----
+    try:
+        res_envios = {int(e["numero"]): e for e in db.listar_envios_resumen(sb, cuenta["id"], periodo["id"])}
+    except Exception:
+        res_envios = {}
+
+    def _etq_envio(n) -> str:
+        if n is None:
+            return "Sin envío registrado"
+        fecha = _fecha_cdmx(res_envios[n]["enviado_en"])[:16] if n in res_envios and res_envios[n].get("enviado_en") else ""
+        return f"Envío #{n}" + (f" · {fecha}" if fecha else "")
+
+    pend_nums = {p["solicitud_numero"] for p in pend}
+    por_rev = [f for f in filas if f["solicitud_estado"] == "enviado_revision"]
+    grupos: dict = {}
+    for f in por_rev:
+        grupos.setdefault(f["envio"], []).append(f)
+    if grupos:
+        with st.container(border=True):
+            st.markdown("**📦 Por revisar, separado por fecha de envío**")
+            st.caption("Revisa y aprueba cada envío por separado, o usa el botón de abajo para aprobar todos juntos.")
+            for n in sorted(grupos, key=lambda x: (x is None, x or 0)):
+                g = grupos[n]
+                ok = [f for f in g if abs(f["diferencia"]) <= tol and f["numero"] not in pend_nums]
+                c = st.columns([3, 1.4, 1.2, 1.6])
+                c[0].markdown(f"**{_etq_envio(n)}**  \n{len(g)} solicitud(es) · {money_md(sum(f['monto'] for f in g))}")
+                c[1].caption(f"{len(ok)} sin diferencia" + (f" · {len(g) - len(ok)} con observaciones" if len(g) > len(ok) else ""))
+                c[2].button("Ver sólo este", key=f"ver_env_{n}", on_click=lambda n=n: st.session_state.__setitem__("rev_envio", _etq_envio(n)))
+                if c[3].button(f"✅ Aprobar este envío ({len(ok)})", key=f"vb_env_{n}", disabled=not ok, type="primary"):
+                    st.session_state["vb_confirm"] = tuple(f["id"] for f in ok)
+
+    f1, f1b, f2 = st.columns([1.2, 1.6, 2.6])
     filtro = f1.selectbox("Mostrar", [*FILTROS_COLA, "Todas"], key="rev_filtro")
+    nums_env = sorted({f["envio"] for f in filas if f["envio"] is not None})
+    opciones_env = ["Todos los envíos", *[_etq_envio(n) for n in nums_env], *(["Sin envío registrado"] if any(f["envio"] is None for f in filas) else [])]
+    if st.session_state.get("rev_envio") not in opciones_env:
+        st.session_state["rev_envio"] = "Todos los envíos"
+    envio_sel = f1b.selectbox("Envío", opciones_env, key="rev_envio")
     texto = f2.text_input("🔎 Buscar (descripción, concepto, empleado, #)", key="rev_busca")
     vista = filas
     if filtro != "Todas":
         vista = [f for f in vista if f["solicitud_estado"] == FILTROS_COLA[filtro]]
+    if envio_sel != "Todos los envíos":
+        vista = [f for f in vista if _etq_envio(f["envio"]) == envio_sel]
     if texto.strip():
         t = texto.strip().lower()
         vista = [f for f in vista if t in " ".join(str(f[k]) for k in ("descripcion", "concepto", "numero")).lower()]
@@ -1710,7 +1788,7 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
     limpias = [f for f in filas if f["solicitud_estado"] == "enviado_revision" and abs(f["diferencia"]) <= tol
                and f["numero"] not in {p["solicitud_numero"] for p in pend}]
     if limpias:
-        if st.button(f"⚡ Dar visto bueno a todas las por revisar sin diferencia ({len(limpias)} · {money_md(sum(f['monto'] for f in limpias))})",
+        if st.button(f"⚡ Aprobar TODOS los envíos juntos: por revisar sin diferencia ({len(limpias)} · {money_md(sum(f['monto'] for f in limpias))})",
                      key="vb_todas"):
             st.session_state["vb_confirm"] = tuple(f["id"] for f in limpias)
 
@@ -1736,7 +1814,7 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
                "Selecciona una o varias filas: con una ves el detalle y puedes devolverla; con varias das el visto bueno y se crea el lote de pago.")
     ev = st.dataframe(estilo, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 420),
                       on_select="rerun", selection_mode="multi-row",
-                      key=f"tabla_rev_{st.session_state.get('rev_ver', 0)}_{cuenta['id']}_{periodo['id']}_{filtro}_{texto}_{_firma(f['id'] for f in vista)}",
+                      key=f"tabla_rev_{st.session_state.get('rev_ver', 0)}_{cuenta['id']}_{periodo['id']}_{filtro}_{envio_sel}_{texto}_{_firma(f['id'] for f in vista)}",
                       column_config={"Sol. #": st.column_config.NumberColumn("Sol. #", format="%d", width="small"),
                                      "Estado": st.column_config.TextColumn("Estado", width="small"),
                                      "Mov.": st.column_config.NumberColumn("Mov.", format="%d", width="small")})
@@ -1786,7 +1864,7 @@ def _confirmar_visto_bueno(sb, cuenta: dict, periodo: dict, por_id: dict) -> Non
 
 def _detalle_revision(sb, cuenta: dict, r: dict, df: pd.DataFrame, gastos: list[dict], pend: list[dict], tol: float) -> None:
     gastos_por_id = {g["id"]: g for g in gastos}
-    _detalle_solicitud_enviada(sb, df, r, gastos_por_id)
+    _detalle_solicitud_enviada(sb, df, r, gastos_por_id, revisor=True)
     mias = [p for p in pend if p.get("solicitud_numero") == r["numero"]]
     for p in mias:
         with st.container(border=True):
@@ -1837,6 +1915,37 @@ CLAVE_REGISTRO_MOV = {"comprobado": "comprobado", "no_necesario": "no_necesario"
 RUBROS_RECLASIF = {"Sin comprobar": "pendiente", "No necesario": "no_necesario", "Pendiente (devolución u otro caso largo)": "en_espera"}
 
 
+def _overview_categorias(movs: pd.DataFrame, cu: dict) -> None:
+    """Resumen del estado de cuenta por tipo de gasto; las filas suman el total del estado de cuenta."""
+    filas = reportes.overview_categorias(movs)
+    if not filas:
+        return
+    total_n = sum(f["n"] for f in filas)
+    total_m = round(sum(f["monto"] for f in filas), 2)
+    with st.expander("📊 Overview por tipo de gasto", expanded=True):
+        tabla = pd.DataFrame([{"Tipo de gasto": f["rubro"], "Movimientos": f["n"], "Monto": f["monto"],
+                               "% del total": (f["monto"] / total_m if total_m else 0.0)} for f in filas]
+                             + [{"Tipo de gasto": "TOTAL DEL ESTADO DE CUENTA", "Movimientos": total_n, "Monto": total_m, "% del total": 1.0 if total_m else 0.0}])
+        grupo = [f["grupo"] for f in filas] + ["Total"]
+
+        def _pintar(fila):
+            g = grupo[fila.name]
+            if g == "Total":
+                return ["font-weight:800;background-color:#E2E8F0"] * len(fila)
+            if g == "Comprobado":
+                return [""] * len(fila)
+            fondo = {"No necesarios": "#F1F5F9", "Sin comprobar": "#FEE2E2", "Pendientes": "#FEF3C7"}.get(g, "")
+            return [f"background-color:{fondo}"] * len(fila)
+
+        st.dataframe(tabla.style.apply(_pintar, axis=1).format({"Monto": "${:,.2f}", "% del total": "{:.1%}"}),
+                     hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 460),
+                     column_config={"Movimientos": st.column_config.NumberColumn("Movimientos", format="%d", width="small")})
+        if abs(total_m - cu["monto_total"]) < 0.005 and total_n == cu["n_total"]:
+            st.caption(f"✅ Cuadra: las categorías suman {money_md(total_m)}, igual al total del estado de cuenta.")
+        else:
+            st.error(f"El overview suma {money_md(total_m)} pero el estado de cuenta es {money_md(cu['monto_total'])}.")
+
+
 def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
     df = db.listar_movimientos_revision(sb, cuenta["id"], periodo["id"])
     if df.empty:
@@ -1854,6 +1963,7 @@ def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
     p = cu["por_estado"]
     st.markdown(estilos.barra_progreso(p["comprobado"]["n"], p["no_necesario"]["n"], p["pendiente"]["n"], p["en_espera"]["n"]), unsafe_allow_html=True)
     st.markdown(estilos.cuadre_html(cu), unsafe_allow_html=True)
+    _overview_categorias(movs, cu)
     st.caption("Aquí ves **todos** los cargos del estado de cuenta tal como los clasificó el aplicante. "
                "Selecciona uno o varios para pasarlos al rubro correcto.")
 
@@ -1913,7 +2023,7 @@ def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
     if len(elegidos) == 1 and not comprobados.empty:
         fila = next((f for f in reportes.filas_desglose(df, gastos) if f["tipo"] == "solicitud" and f["id"] == comprobados.iloc[0]["solicitud_id"]), None)
         if fila:
-            _detalle_solicitud_enviada(sb, df, fila, {g["id"]: g for g in gastos})
+            _detalle_solicitud_enviada(sb, df, fila, {g["id"]: g for g in gastos}, revisor=True)
     elif len(elegidos) == 1:
         m = elegidos.iloc[0]
         nota = m.get("nota_revisor")
@@ -1961,16 +2071,31 @@ def _excel_lote(lote: dict, cuenta_nombre: str, etiqueta_mes: str, gastos: list[
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
         resumen = pd.DataFrame([{"Cuenta": cuenta_nombre, "Mes": etiqueta_mes, "Lote": lote["numero"], "Gastos": lote["num_gastos"],
-                                 "Monto": float(lote["monto"]), "Estado": lote["estado"], "Fecha de pago": lote.get("fecha_pago") or "",
+                                 "Monto": float(lote["monto"]), "Pagado": _pagado_de(lote), "Saldo": _saldo_de(lote),
+                                 "Estado": lote["estado"], "Fecha de pago": lote.get("fecha_pago") or "",
                                  "Referencia": lote.get("referencia_pago") or ""}])
         resumen.to_excel(w, sheet_name="Lote", index=False)
         tabla.to_excel(w, sheet_name="Gastos", index=False)
         fmt = w.book.add_format({"num_format": "$#,##0.00"})
         w.sheets["Gastos"].set_column("A:E", 18)
         w.sheets["Gastos"].set_column("F:H", 16, fmt)
-        w.sheets["Lote"].set_column("A:H", 16)
-        w.sheets["Lote"].set_column("E:E", 16, fmt)
+        w.sheets["Lote"].set_column("A:J", 16)
+        w.sheets["Lote"].set_column("E:G", 16, fmt)
     return buf.getvalue()
+
+
+def _historial_pagos(sb, lote: dict) -> None:
+    """Pagos registrados del lote (si ya hubo alguno)."""
+    if _pagado_de(lote) <= 0:
+        return
+    try:
+        pagos = db.listar_pagos_lote(sb, lote["id"])
+    except Exception:
+        pagos = []
+    if pagos:
+        st.markdown("**🧾 Pagos registrados**")
+        st.dataframe(pd.DataFrame([{"Fecha": p["fecha_pago"], "Monto": float(p["monto"]), "Referencia": p["referencia"]} for p in pagos]),
+                     hide_index=True, use_container_width=True, column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
 
 
 def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) -> None:
@@ -1984,25 +2109,31 @@ def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) 
     por_pagar = [l for l in lotes if l["estado"] == "por_pagar"]
     pagados = [l for l in lotes if l["estado"] == "pagado"]
     k = st.columns(3)
-    k[0].markdown(estilos.tarjeta("Por pagar", str(len(por_pagar)), estilos.money_html(sum(float(l["monto"]) for l in por_pagar)), "alerta"), unsafe_allow_html=True)
-    k[1].markdown(estilos.tarjeta("Pagados", str(len(pagados)), estilos.money_html(sum(float(l["monto"]) for l in pagados)), "comprobado"), unsafe_allow_html=True)
+    k[0].markdown(estilos.tarjeta("Por pagar (saldo)", str(len(por_pagar)), estilos.money_html(sum(_saldo_de(l) for l in por_pagar)), "alerta"), unsafe_allow_html=True)
+    k[1].markdown(estilos.tarjeta("Pagado", f"{sum(1 for l in lotes if _pagado_de(l) > 0)} lote(s)", estilos.money_html(sum(_pagado_de(l) for l in lotes)), "comprobado"), unsafe_allow_html=True)
     k[2].markdown(estilos.tarjeta("Anulados", str(sum(1 for l in lotes if l["estado"] == "anulado")), "desbloqueados", "pendiente"), unsafe_allow_html=True)
     tabla = pd.DataFrame([{
         "Cuenta": nombre_cta.get(l["cuenta_id"], ""), "Lote": f"{mes.get(l['periodo_id'], '')}-{l['numero']}", "Cerrado": str(l["cerrado_en"])[:10],
-        "Gastos": l["num_gastos"], "Monto": float(l["monto"]), "Estado": NOMBRE_LOTE.get(l["estado"], l["estado"]),
+        "Gastos": l["num_gastos"], "Monto": float(l["monto"]), "Pagado": _pagado_de(l), "Saldo": _saldo_de(l), "Estado": _estado_lote(l),
         "Fecha de pago": l.get("fecha_pago") or "", "Referencia": l.get("referencia_pago") or ""} for l in lotes])
     ev = st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 360),
                       on_select="rerun", selection_mode="single-row", key=f"tabla_lotes_{st.session_state.get('rev_ver', 0)}_{alcance}_{_firma(l['id'] for l in lotes)}",
-                      column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
+                      column_config={c: st.column_config.NumberColumn(c, format="$%.2f") for c in ("Monto", "Pagado", "Saldo")})
     sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(lotes)]
     if not sel:
-        st.caption("Haz clic en un lote para ver sus gastos, registrar el pago o desbloquearlo.")
+        st.caption("Haz clic en un lote para ver sus gastos, registrar un pago (total o parcial) o desbloquearlo.")
         return
     lote = lotes[sel[0]]
     gastos = db.gastos_de_lote(sb, lote["id"])
     etiqueta = f"{nombre_cta.get(lote['cuenta_id'], '')} · {mes.get(lote['periodo_id'], '')} · lote {lote['numero']}"
     with st.container(border=True):
-        st.markdown(f"**{etiqueta}** · {NOMBRE_LOTE.get(lote['estado'], lote['estado'])} · {money_md(lote['monto'])} · {lote['num_gastos']} gasto(s)")
+        st.markdown(f"**{etiqueta}** · {_estado_lote(lote)} · {money_md(lote['monto'])} · {lote['num_gastos']} gasto(s)")
+        if lote["estado"] == "por_pagar":
+            q = st.columns(3)
+            q[0].metric("Monto del lote", money_md(lote["monto"]))
+            q[1].metric("Pagado", money_md(_pagado_de(lote)))
+            q[2].metric("Saldo pendiente", money_md(_saldo_de(lote)))
+        _historial_pagos(sb, lote)
         if gastos:
             det = pd.DataFrame([{"Sol. #": g["solicitud"].get("numero"), "Descripción": g["solicitud"].get("description") or "",
                                  "Empleado": g["solicitud"].get("employee_name") or "", "Categoría": g.get("categoria") or "",
@@ -2019,22 +2150,30 @@ def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) 
         else:
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("**💸 Registrar pago**")
+                saldo = _saldo_de(lote)
+                st.markdown("**💸 Registrar pago** (total o parcial)")
+                st.caption("Puedes pagar el lote en varios pagos. Queda «Pagado» (y el aplicante lo ve así) cuando lo pagado alcanza el monto del lote.")
+                monto = st.number_input("Monto a pagar ahora", min_value=0.0, max_value=float(saldo), value=float(saldo), step=100.0, format="%.2f", key=f"pg_m_{lote['id']}_{saldo}")
                 fecha = st.date_input("Fecha de pago", value=hoy_cdmx(), key=f"pg_f_{lote['id']}")
                 ref = st.text_input("Referencia / folio de pago (por ejemplo AP-MX o PY-MX)", key=f"pg_r_{lote['id']}")
-                if st.button("✅ Marcar como pagado", type="primary", key=f"pg_b_{lote['id']}"):
+                quedara = round(saldo - monto, 2)
+                st.caption("Con este pago el lote queda **pagado por completo**." if quedara <= 0.005 else f"Con este pago quedará un saldo de **{money_md(quedara)}**.")
+                if st.button("✅ Registrar pago", type="primary", key=f"pg_b_{lote['id']}", disabled=monto <= 0):
                     try:
-                        db.pagar_lote(sb, lote["id"], fecha, ref)
+                        db.registrar_pago_lote(sb, lote["id"], fecha, monto, ref)
                         _nueva_tabla_rev()
-                        _flash("Pago registrado: el aplicante ya lo ve como pagado.")
+                        _flash("Pago completo registrado: el aplicante ya lo ve como pagado." if quedara <= 0.005
+                               else f"Pago parcial registrado. Saldo pendiente: {money_md(quedara)}.")
                         st.rerun()
                     except db.ErrorNube as e:
                         st.error(str(e))
             with c2:
                 st.markdown("**↩️ Desbloquear lote**")
-                st.caption("Anula el lote y regresa sus solicitudes a «Por revisar». Solo si aún no está pagado.")
+                st.caption("Anula el lote y regresa sus solicitudes a «Por revisar». Solo si aún no tiene ningún pago.")
+                if _pagado_de(lote) > 0:
+                    st.info("Este lote ya tiene pagos registrados; no se puede desbloquear.")
                 mot = st.text_input("Motivo (obligatorio)", key=f"ds_m_{lote['id']}")
-                if st.button("Desbloquear lote", key=f"ds_b_{lote['id']}"):
+                if st.button("Desbloquear lote", key=f"ds_b_{lote['id']}", disabled=_pagado_de(lote) > 0):
                     try:
                         db.desbloquear_lote(sb, lote["id"], mot)
                         _nueva_tabla_rev()
