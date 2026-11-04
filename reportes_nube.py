@@ -243,6 +243,27 @@ def overview_categorias(movs: pd.DataFrame) -> list[dict]:
     return filas
 
 
+def overview_estados(movs: pd.DataFrame, comprobacion_de: dict | None = None) -> list[dict]:
+    """Estado de cuenta por tipo de comprobación: comprobados (con su desglose XML / manual), no necesarios,
+    sin comprobar y pendientes. Las filas de nivel 0 suman el total. Cada fila: rubro, nivel (0 total / 1 detalle), n, monto."""
+    filas: list[dict] = []
+    if movs is None or len(movs) == 0:
+        return filas
+    comprobacion_de = comprobacion_de or {}
+    for est, nombre in ESTADOS_CUADRE:
+        sub = movs[movs["estado"] == est]
+        if not len(sub):
+            continue
+        filas.append({"rubro": nombre, "nivel": 0, "n": int(len(sub)), "monto": round(float(sub["monto"].abs().sum()), 2)})
+        if est == "comprobado":
+            tipo = sub["solicitud_id"].map(lambda x: comprobacion_de.get(x) if comprobacion_de.get(x) in ("XML", "Manual", "XML + manual") else "Sin dato")
+            for t in ("XML", "Manual", "XML + manual", "Sin dato"):
+                ss = sub[tipo == t]
+                if len(ss):
+                    filas.append({"rubro": f"↳ {t}", "nivel": 1, "n": int(len(ss)), "monto": round(float(ss["monto"].abs().sum()), 2)})
+    return filas
+
+
 # ----------------------------------------------------------------------
 # Excel del mes
 # ----------------------------------------------------------------------
