@@ -1935,35 +1935,41 @@ CLAVE_REGISTRO_MOV = {"comprobado": "comprobado", "no_necesario": "no_necesario"
 RUBROS_RECLASIF = {"Sin comprobar": "pendiente", "No necesario": "no_necesario", "Pendiente (devolución u otro caso largo)": "en_espera"}
 
 
-def _overview_categorias(movs: pd.DataFrame, cu: dict) -> None:
-    """Resumen del estado de cuenta por tipo de gasto; las filas suman el total del estado de cuenta."""
-    filas = reportes.overview_categorias(movs)
-    if not filas:
-        return
-    total_n = sum(f["n"] for f in filas)
-    total_m = round(sum(f["monto"] for f in filas), 2)
-    with st.expander("📊 Overview por tipo de gasto", expanded=True):
-        tabla = pd.DataFrame([{"Tipo de gasto": f["rubro"], "Movimientos": f["n"], "Monto": f["monto"],
+def _overview_categorias(movs: pd.DataFrame, cu: dict, comprobacion_de: dict | None = None) -> None:
+    """Resumen del estado de cuenta por tipo de gasto y por tipo de comprobación; cada uno suma el total del estado de cuenta."""
+    def _mostrar(filas: list[dict], etiquetas: list[str], pintar_fila) -> None:
+        total_n = sum(f["n"] for f in filas if f.get("nivel", 0) == 0)
+        total_m = round(sum(f["monto"] for f in filas if f.get("nivel", 0) == 0), 2)
+        tabla = pd.DataFrame([{"Concepto": f["rubro"], "Movimientos": f["n"], "Monto": f["monto"],
                                "% del total": (f["monto"] / total_m if total_m else 0.0)} for f in filas]
-                             + [{"Tipo de gasto": "TOTAL DEL ESTADO DE CUENTA", "Movimientos": total_n, "Monto": total_m, "% del total": 1.0 if total_m else 0.0}])
-        grupo = [f["grupo"] for f in filas] + ["Total"]
+                             + [{"Concepto": "TOTAL DEL ESTADO DE CUENTA", "Movimientos": total_n, "Monto": total_m, "% del total": 1.0 if total_m else 0.0}])
+        grupo = etiquetas + ["Total"]
 
         def _pintar(fila):
-            g = grupo[fila.name]
-            if g == "Total":
-                return ["font-weight:800;background-color:#E2E8F0"] * len(fila)
-            if g == "Comprobado":
-                return [""] * len(fila)
-            fondo = {"No necesarios": "#F1F5F9", "Sin comprobar": "#FEE2E2", "Pendientes": "#FEF3C7"}.get(g, "")
-            return [f"background-color:{fondo}"] * len(fila)
+            return [pintar_fila(grupo[fila.name])] * len(fila)
 
         st.dataframe(tabla.style.apply(_pintar, axis=1).format({"Monto": "${:,.2f}", "% del total": "{:.1%}"}),
                      hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 460),
                      column_config={"Movimientos": st.column_config.NumberColumn("Movimientos", format="%d", width="small")})
         if abs(total_m - cu["monto_total"]) < 0.005 and total_n == cu["n_total"]:
-            st.caption(f"✅ Cuadra: las categorías suman {money_md(total_m)}, igual al total del estado de cuenta.")
+            st.caption(f"✅ Cuadra: suma {money_md(total_m)}, igual al total del estado de cuenta.")
         else:
-            st.error(f"El overview suma {money_md(total_m)} pero el estado de cuenta es {money_md(cu['monto_total'])}.")
+            st.error(f"Esta tabla suma {money_md(total_m)} pero el estado de cuenta es {money_md(cu['monto_total'])}.")
+
+    por_cat = reportes.overview_categorias(movs)
+    por_est = reportes.overview_estados(movs, comprobacion_de)
+    if not por_cat:
+        return
+    fondos = {"Total": "font-weight:800;background-color:#E2E8F0", "No necesarios": "background-color:#F1F5F9",
+              "Sin comprobar": "background-color:#FEE2E2;font-weight:700", "Pendientes": "background-color:#FEF3C7;font-weight:700",
+              "Comprobados": "background-color:#DCFCE7;font-weight:700", "Comprobado": ""}
+    with st.expander("📊 Overview del estado de cuenta", expanded=True):
+        t1, t2 = st.tabs(["Por tipo de gasto (categoría)", "Por tipo de comprobación"])
+        with t1:
+            _mostrar(por_cat, [f["grupo"] for f in por_cat], lambda g: fondos.get(g, ""))
+        with t2:
+            _mostrar(por_est, [f["rubro"] if f["nivel"] == 0 else "Comprobado" for f in por_est], lambda g: fondos.get(g, ""))
+            st.caption("«Comprobados» se desglosa en cómo se comprobó: con XML, capturado a mano, o mezclado.")
 
 
 def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
@@ -1983,7 +1989,7 @@ def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
     p = cu["por_estado"]
     st.markdown(estilos.barra_progreso(p["comprobado"]["n"], p["no_necesario"]["n"], p["pendiente"]["n"], p["en_espera"]["n"]), unsafe_allow_html=True)
     st.markdown(estilos.cuadre_html(cu), unsafe_allow_html=True)
-    _overview_categorias(movs, cu)
+    _overview_categorias(movs, cu, comprobacion_de)
     st.caption("Aquí ves **todos** los cargos del estado de cuenta tal como los clasificó el aplicante. "
                "Selecciona uno o varios para pasarlos al rubro correcto.")
 
