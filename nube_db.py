@@ -354,22 +354,36 @@ def listar_gastos(sb, solicitud_ids: list[str]) -> list[dict]:
             fact_por_gasto.setdefault(x["gasto_id"], []).append(
                 {**detalle_fact[x["factura_id"]], "monto_aplicado": x["monto_total"], "iva_aplicado": x.get("iva", 0),
                  "isr_aplicado": x.get("isr_retenido", 0), "iva_ret_aplicado": x.get("iva_retenido", 0), "ish_aplicado": x.get("ish", 0)})
+    try:
+        tc = {x["gasto_id"]: x.get("detalle") for x in _en_trozos(sb, "gasto_tc", "gasto_id,detalle", "gasto_id", ids)}
+    except Exception:
+        tc = {}   # todavía no se corrió el script 013
     for g in gastos:
         g["movimientos"] = movs_por_gasto.get(g["id"], [])
         g["facturas"] = fact_por_gasto.get(g["id"], [])
+        g["dif_tc"] = g["id"] in tc
+        g["detalle_tc"] = tc.get(g["id"])
     return gastos
 
 
 def guardar_gasto(sb, solicitud_id: str, movimiento_ids: list[str], categoria: str | None,
-                  material: str | None, propina: float, facturas: list[dict]) -> str:
-    return _ejecutar(sb.rpc("guardar_gasto", {
+                  material: str | None, propina: float, facturas: list[dict],
+                  dif_tc: bool = False, detalle_tc: str | None = None) -> str:
+    """Guarda un gasto. dif_tc=True marca «factura con diferencia de tipo de cambio» (exige detalle; ignora la tolerancia)."""
+    if dif_tc and not (detalle_tc or "").strip():
+        raise ErrorNube("Explica en «Detalles» por qué hay diferencia por tipo de cambio.")
+    params = {
         "p_solicitud": solicitud_id,
         "p_movimientos": movimiento_ids,
         "p_categoria": categoria,
         "p_material": material,
         "p_propina": round(float(propina or 0), 2),
         "p_facturas": facturas,
-    }))
+    }
+    if dif_tc:   # sin la marca se llama igual que antes (compatible aunque aún no se corra el script 013)
+        params["p_dif_tc"] = True
+        params["p_detalle_tc"] = detalle_tc.strip()
+    return _ejecutar(sb.rpc("guardar_gasto", params))
 
 
 def revertir_gasto(sb, gasto_id: str) -> None:
