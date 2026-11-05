@@ -14,6 +14,7 @@ import pandas as pd
 import streamlit as st
 
 import adjuntos as adj
+import bbva_detalle
 import estilos
 import importar
 import nube_db as db
@@ -152,6 +153,19 @@ def _campos_solicitud(sb, pref: str, v: dict | None = None) -> dict:
             "request_number": request_number, "description": description, "number_of_days": dias, "number_of_people": personas}
 
 
+def _leer_estado(contenido: bytes, nombre: str, formato: str) -> pd.DataFrame:
+    """Lee el estado de cuenta. En cuentas BBVA primero se prueba el formato «Detalle de movimientos» con columnas separadas
+    (fechas sin encabezado, cargo y abono en columnas separadas; sirve para todas las cuentas BBVA); si el archivo no es de ese tipo, se usa el lector general."""
+    if str(formato).strip().upper().startswith("BBVA"):
+        try:
+            return bbva_detalle.leer_bbva_prj(contenido, nombre)
+        except bbva_detalle.FormatoNoReconocido:
+            pass
+        except bbva_detalle.ErrorEstadoBBVA as e:
+            raise BankStatementError(str(e))
+    return cargar_estado_cuenta(contenido, nombre, formato)
+
+
 def _periodo_de(sb, fecha: datetime.date) -> str:
     pid = db.obtener_o_crear_periodo(sb, fecha.year, fecha.month)
     st.session_state.pop("_periodos", None)   # puede haberse creado un mes nuevo
@@ -165,7 +179,16 @@ def _tarjetas_gasto(sb, cuenta: dict) -> None:
     sols = db.solicitudes_acumulables(sb, cuenta["id"])
     fecha = st.date_input("Consultar gasto hasta", value=hoy_cdmx(), key="fecha_consulta")
     res = resumen_gasto_bitacora([{"Fecha": s["fecha"], "Monto": s["monto_tentativo"]} for s in sols], fecha)
-    c1, c2, c3 = st.columns(3)
+    # Movimientos del estado de cuenta cargado que todavía no se comprueban (sin comprobar o pendientes).
+    sin_cmp = db.listar_movimientos(sb, cuenta["id"], estado=["pendiente", "en_espera"])
+    if sin_cmp is not None and not sin_cmp.empty:
+        f0, f1 = str(min(sin_cmp["fecha"]))[:10], str(max(sin_cmp["fecha"]))[:10]
+        rango = f"del {f0} al {f1}" if f0 != f1 else f"del {f0}"
+        c1, c2, c3, c4 = st.columns(4)
+        c4.markdown(estilos.tarjeta("Movimientos pendientes por comprobar", estilos.money_html(float(sin_cmp["monto"].abs().sum())),
+                                    f"{len(sin_cmp)} movimiento(s) · {rango}", "pendiente"), unsafe_allow_html=True)
+    else:
+        c1, c2, c3 = st.columns(3)
     c1.markdown(estilos.tarjeta("Gasto del día", estilos.money_html(res["dia"]), f"{res['n_dia']} registro(s)", "acento"), unsafe_allow_html=True)
     c2.markdown(estilos.tarjeta("Gasto de la semana", estilos.money_html(res["semana"]), f"{res['n_semana']} registro(s)", "acento"), unsafe_allow_html=True)
     c3.markdown(estilos.tarjeta("Acumulado sin reembolso", estilos.money_html(res["acumulado"]), f"{res['n_acumulado']} registro(s)", "rojo"), unsafe_allow_html=True)
@@ -893,7 +916,7 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
                 st.error("No se pudo leer el PDF:\n\n" + error_pdf)
         if archivo is not None and error_pdf is None and st.button("Cargar movimientos", type="primary", key="btn_cargar_estado"):
             try:
-                df = df_pdf if df_pdf is not None else cargar_estado_cuenta(archivo.getvalue(), archivo.name, cuenta["formato"])
+                df = df_pdf if df_pdf is not None else _leer_estado(archivo.getvalue(), archivo.name, cuenta["formato"])
                 r = db.subir_estado_cuenta(sb, cuenta["id"], df)
                 _flash(f"{r['nuevos']} movimiento(s) nuevo(s); {r['ya_existian']} ya estaban cargados"
                        + (f"; {r['sin_fecha_o_monto']} omitido(s) por no tener fecha o monto válido" if r["sin_fecha_o_monto"] else "") + ".")
