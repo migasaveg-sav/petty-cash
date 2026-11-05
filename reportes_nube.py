@@ -271,11 +271,11 @@ def overview_estados(movs: pd.DataFrame, comprobacion_de: dict | None = None) ->
 COLUMNAS_COMPROBADOS = [
     "No.", "Applicant", "Category", "Description", "Linked Request No.", "Number of Days", "Total Number of People",
     "Employee Name", "Material", "Payment Date", "Expense Outflow Amt", "Propina", "No. (gasto)", "Invoice date", "CFDI Folio",
-    "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap (With IVA)", "Status",
+    "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap (With IVA)", "Diferencia", "Status",
     "Lote enviado a revisión", "Resultado de la revisión", "Monto revisado y aprobado para pago", "Fecha de pago", "Lote de pago",
-    "Cómo se comprobó",
+    "Cómo se comprobó", "Detalle de la diferencia (tipo de cambio)",
 ]
-_DINERO = {"Expense Outflow Amt", "Propina", "IVA", "ISR Retenido", "IVA Retenido", "ISH",
+_DINERO = {"Diferencia", "Expense Outflow Amt", "Propina", "IVA", "ISR Retenido", "IVA Retenido", "ISH",
            "Reimbursement Cap (With IVA)", "Monto revisado y aprobado para pago"}
 
 
@@ -360,6 +360,8 @@ def filas_comprobados(solicitudes: list[dict], gastos: list[dict], envio_gastos:
                 fila.update({
                     "Payment Date": fecha_pago_mov, "Expense Outflow Amt": round(float(g["monto_estado"]), 2),
                     "Propina": round(float(g.get("propina") or 0), 2), "No. (gasto)": int(s["numero"]),
+                    "Diferencia": _diferencia_gasto(g),
+                    "Detalle de la diferencia (tipo de cambio)": ("Dif. por tipo de cambio: " + str(g.get("detalle_tc") or "")) if g.get("dif_tc") else "",
                     "Lote enviado a revisión": lote_env, "Resultado de la revisión": resultado,
                     "Monto revisado y aprobado para pago": round(float(aprobado), 2) if aprobado is not None else None,
                     "Fecha de pago": _fecha_corta(e.get("fecha_pago")) if pagado else "", "Lote de pago": lote_pago})
@@ -375,6 +377,14 @@ def filas_comprobados(solicitudes: list[dict], gastos: list[dict], envio_gastos:
             filas.append(fila)
             resaltar.append(bool(g.get("tiene_diferencia")))
     return filas, resaltar
+
+
+def _diferencia_gasto(g: dict) -> float:
+    """Cargo del estado de cuenta − facturas − propina (positivo: el cargo es mayor que lo facturado)."""
+    if g.get("diferencia") is not None:
+        return round(float(g["diferencia"]), 2)
+    suma = sum(float(f.get("monto_aplicado") or 0) for f in g.get("facturas") or [])
+    return round(float(g["monto_estado"]) - suma - float(g.get("propina") or 0), 2)
 
 
 def _tabla_movs(movs: pd.DataFrame, estado: str, con_motivo: bool = False) -> pd.DataFrame:
@@ -431,7 +441,7 @@ def excel_mes(cuenta_nombre: str, periodo: str, applicant: str, movs: pd.DataFra
         anchos = {"No.": 6, "No. (gasto)": 6, "Applicant": 12, "Category": 20, "Description": 26, "Linked Request No.": 18, "Number of Days": 10,
                   "Total Number of People": 12, "Employee Name": 28, "Material": 12, "Payment Date": 13, "Invoice date": 13,
                   "CFDI Folio": 38, "Status": 13, "Lote enviado a revisión": 24, "Resultado de la revisión": 20,
-                  "Fecha de pago": 13, "Lote de pago": 30, "Cómo se comprobó": 16}
+                  "Fecha de pago": 13, "Lote de pago": 30, "Cómo se comprobó": 16, "Detalle de la diferencia (tipo de cambio)": 44}
         for i, c in enumerate(COLUMNAS_COMPROBADOS):
             ws.set_column(i, i, anchos.get(c, 16), dinero if c in _DINERO else None)
         ws.set_row(0, 42)
@@ -453,7 +463,7 @@ def excel_mes(cuenta_nombre: str, periodo: str, applicant: str, movs: pd.DataFra
         # Totales al pie
         fin = len(df) + 2
         ws.write(fin, COLUMNAS_COMPROBADOS.index("Expense Outflow Amt") - 1, "Total", total_t)
-        for c in ("Expense Outflow Amt", "Propina", "Reimbursement Cap (With IVA)", "Monto revisado y aprobado para pago"):
+        for c in ("Expense Outflow Amt", "Propina", "Reimbursement Cap (With IVA)", "Diferencia", "Monto revisado y aprobado para pago"):
             i = COLUMNAS_COMPROBADOS.index(c)
             col = xl_col_to_name(i)
             ws.write_formula(fin, i, f"=SUBTOTAL(109,{col}2:{col}{len(df) + 1})", total_f)
@@ -604,7 +614,7 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
             for i, c in enumerate(cols_c):
                 ws.set_column(i, i, {"Cuenta": 16, "Mes": 9, "Estatus del gasto": 22}.get(c, 14 if c in _DINERO else {
                     "No.": 6, "No. (gasto)": 6, "Description": 26, "Employee Name": 28, "CFDI Folio": 38, "Lote enviado a revisión": 24,
-                    "Resultado de la revisión": 20, "Lote de pago": 30, "Category": 20}.get(c, 14)), dinero if c in _DINERO else None)
+                    "Resultado de la revisión": 20, "Lote de pago": 30, "Category": 20, "Detalle de la diferencia (tipo de cambio)": 44}.get(c, 14)), dinero if c in _DINERO else None)
             ws.set_row(0, 42)
             ws.freeze_panes(1, 2)
             ws.autofilter(0, 0, max(len(df), 1), len(cols_c) - 1)
