@@ -407,7 +407,7 @@ def filas_comprobados(solicitudes: list[dict], gastos: list[dict], envio_gastos:
             if primera_gasto:
                 fila.update({
                     "Payment Date": fecha_pago_mov, "Expense Outflow Amt": round(float(g["monto_estado"]), 2),
-                    "Propina": round(float(g.get("propina") or 0), 2), "No. (gasto)": int(s["numero"]),
+                    "Propina": _propina_comprobada(g), "No. (gasto)": int(s["numero"]),
                     "Diferencia": _diferencia_gasto(g),
                     "Tip sin comprobación": _devuelto_por_tipo(g, "tip_sin_comprobacion"),
                     "Devolución sin comprobación": _devuelto_por_tipo(g, "sin_comprobacion_devolucion"),
@@ -435,6 +435,17 @@ def _diferencia_gasto(g: dict) -> float:
         return round(float(g["diferencia"]), 2)
     suma = sum(float(f.get("monto_aplicado") or 0) for f in g.get("facturas") or [])
     return round(float(g["monto_estado"]) - suma - float(g.get("propina") or 0), 2)
+
+
+def _propina_comprobada(g: dict) -> float:
+    """Propina con comprobante; la que quedó como «tip sin comprobación» no cuenta como propina."""
+    p = float(g.get("propina") or 0) - _devuelto_por_tipo_bruto(g, "tip_sin_comprobacion")
+    return round(max(p, 0.0), 2)
+
+
+def _devuelto_por_tipo_bruto(g: dict, tipo: str) -> float:
+    """Igual que _devuelto_por_tipo pero incluye devoluciones anuladas (la propina sigue sin comprobarse)."""
+    return sum(float(d["monto"]) for d in g.get("devoluciones") or [] if d.get("tipo") == tipo)
 
 
 def _devuelto_por_tipo(g: dict, tipo: str) -> float:
