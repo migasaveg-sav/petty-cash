@@ -27,7 +27,8 @@ from matching import DIFERENCIA_ACEPTABLE, resumen_gasto_bitacora
 from persistence import hoy_cdmx
 
 CATEGORIAS_CON_PROPINA = {"Client Entertainment", "Travel Meal"}
-MOTIVOS_ESPERA_DEFAULT = ["Devolución en trámite", "Aclaración con el banco", "Falta la factura del proveedor", "Reembolso por recibir", "Otro"]
+MOTIVO_DEV_COLABORADOR = "Devolución del colaborador"   # motivo de «Pendiente» que alimenta la sección Devoluciones del revisor
+MOTIVOS_ESPERA_DEFAULT = [MOTIVO_DEV_COLABORADOR, "Devolución en trámite", "Aclaración con el banco", "Falta la factura del proveedor", "Reembolso por recibir", "Otro"]
 MOTIVOS_DEFAULT = ["Falta factura", "Falta PDF", "Monto no cuadra", "Falta aprobación", "Duplicado sospechoso", "Otro"]
 ESTADOS_SOLICITUD = {
     "borrador": "✏️ Borrador", "enviado_revision": "🕓 En revisión", "con_pendientes": "🚩 Con pendientes",
@@ -2230,6 +2231,34 @@ def _historial_pagos(sb, lote: dict) -> None:
                      hide_index=True, use_container_width=True, column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
 
 
+def _movs_devolucion_colaborador(sb, cuentas_vistas: list[dict], nombre_cta: dict, periodos: list[dict]) -> None:
+    """Movimientos del estado de cuenta clasificados «Pendiente» con el motivo «Devolución del colaborador»."""
+    mes = {p["id"]: db.etiqueta_periodo(p) for p in periodos}
+    filas = []
+    for c in cuentas_vistas:
+        m = db.listar_movimientos(sb, c["id"], estado="en_espera")
+        if m is None or m.empty:
+            continue
+        m = m[m["motivo_espera"].astype(str).str.strip().str.lower() == MOTIVO_DEV_COLABORADOR.lower()]
+        hoy = hoy_cdmx()
+        for r in m.itertuples():
+            desde = pd.to_datetime(r.espera_desde, errors="coerce")
+            filas.append({"Cuenta": nombre_cta.get(c["id"], c["nombre"]), "Mes": mes.get(r.periodo_id, ""), "Fecha": r.fecha, "Descripción": r.descripcion,
+                          "Monto": abs(float(r.monto)), "Días pendiente": (hoy - desde.date()).days if pd.notna(desde) else None,
+                          "Nota": getattr(r, "nota_revisor", None) or ""})
+    st.markdown("#### 🏦 Movimientos pendientes por «Devolución del colaborador»")
+    if not filas:
+        st.caption("Ningún movimiento del estado de cuenta está en «Pendiente» con el motivo «Devolución del colaborador». "
+                   "Para agregarlo: Estado de cuenta → selecciona el movimiento → «Pasar al rubro correcto» → Pendiente → motivo «Devolución del colaborador».")
+        return
+    total = sum(f["Monto"] for f in filas)
+    st.markdown(estilos.tarjeta("Por devolver (movimientos del banco)", str(len(filas)), estilos.money_html(total), "rojo"), unsafe_allow_html=True)
+    st.dataframe(pd.DataFrame(filas), hide_index=True, use_container_width=True, height=min(36 * (len(filas) + 1) + 4, 300),
+                 column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f"), "Días pendiente": st.column_config.NumberColumn("Días pendiente", format="%d")})
+    st.divider()
+    st.markdown("#### 💸 Devoluciones de gastos (tip sin comprobación y sin comprobación, devolución)")
+
+
 def _devoluciones_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) -> None:
     """Lo que los colaboradores deben regresar a la cuenta de la empresa (tip sin comprobación y gastos sin comprobación)."""
     c1, c2 = st.columns([1.4, 1.4])
@@ -2240,8 +2269,10 @@ def _devoluciones_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[
     except db.ErrorNube as e:
         st.error(f"{e} (¿ya corriste el script 015?)")
         return
+    nombre_cta = {c["id"]: c["nombre"] for c in cuentas}
+    _movs_devolucion_colaborador(sb, [cuenta] if alcance.startswith("Esta") else cuentas, nombre_cta, periodos)
     if not devs:
-        st.info("No hay devoluciones. Aparecen cuando una propina se guarda sin comprobante o cuando marcas un gasto como «sin comprobación, devolución».")
+        st.info("No hay devoluciones de gastos. Aparecen cuando una propina se guarda sin comprobante o cuando marcas un gasto como «sin comprobación, devolución».")
         return
     nombre_cta = {c["id"]: c["nombre"] for c in cuentas}
     mes = {p["id"]: db.etiqueta_periodo(p) for p in periodos}
@@ -2514,6 +2545,10 @@ def main() -> None:
                     "empleado": list(EMPLEADOS_DEFAULT), "motivo_pendiente": MOTIVOS_DEFAULT})
                 try:
                     db.asegurar_catalogos(sb, {"motivo_espera": MOTIVOS_ESPERA_DEFAULT})
+                    try:
+                        db.agregar_catalogo(sb, "motivo_espera", MOTIVO_DEV_COLABORADOR)   # catálogos que ya existían no lo traen
+                    except Exception:
+                        pass
                 except db.ErrorNube:
                     pass   # todavía no se corrió el script 007
         perfil = st.session_state.perfil
