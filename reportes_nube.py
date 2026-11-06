@@ -189,6 +189,7 @@ def filas_desglose(df: pd.DataFrame, gastos: list[dict]) -> list[dict]:
             "diferencia": round(float(pd.to_numeric(por_gasto["diferencia"], errors="coerce").fillna(0).sum()), 2),
             "tiene_diferencia": bool(por_gasto["tiene_diferencia"].fillna(False).astype(bool).any()),
             "dif_tc": any(gastos_por_id[g].get("dif_tc") for g in gasto_ids if g in gastos_por_id),
+            "devolucion": round(sum(float(gastos_por_id[g].get("devolucion_total") or 0) for g in gasto_ids if g in gastos_por_id), 2),
             "detalle_tc": " | ".join(str(gastos_por_id[g]["detalle_tc"]) for g in gasto_ids
                                      if g in gastos_por_id and gastos_por_id[g].get("dif_tc") and gastos_por_id[g].get("detalle_tc")),
             "situacion": " · ".join(x for x in (SITUACION_SOLICITUD.get(r0["solicitud_estado"], str(r0["solicitud_estado"])), lote) if x)})
@@ -271,11 +272,11 @@ def overview_estados(movs: pd.DataFrame, comprobacion_de: dict | None = None) ->
 COLUMNAS_COMPROBADOS = [
     "No.", "Applicant", "Category", "Description", "Linked Request No.", "Number of Days", "Total Number of People",
     "Employee Name", "Material", "Payment Date", "Expense Outflow Amt", "Propina", "No. (gasto)", "Invoice date", "CFDI Folio",
-    "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap (With IVA)", "Diferencia", "Status",
+    "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap (With IVA)", "Diferencia", "Tip sin comprobación", "Devolución sin comprobación", "Status",
     "Lote enviado a revisión", "Resultado de la revisión", "Monto revisado y aprobado para pago", "Fecha de pago", "Lote de pago",
     "Cómo se comprobó", "Detalle de la diferencia (tipo de cambio)",
 ]
-_DINERO = {"Diferencia", "Expense Outflow Amt", "Propina", "IVA", "ISR Retenido", "IVA Retenido", "ISH",
+_DINERO = {"Diferencia", "Tip sin comprobación", "Devolución sin comprobación", "Expense Outflow Amt", "Propina", "IVA", "ISR Retenido", "IVA Retenido", "ISH",
            "Reimbursement Cap (With IVA)", "Monto revisado y aprobado para pago"}
 
 
@@ -361,6 +362,8 @@ def filas_comprobados(solicitudes: list[dict], gastos: list[dict], envio_gastos:
                     "Payment Date": fecha_pago_mov, "Expense Outflow Amt": round(float(g["monto_estado"]), 2),
                     "Propina": round(float(g.get("propina") or 0), 2), "No. (gasto)": int(s["numero"]),
                     "Diferencia": _diferencia_gasto(g),
+                    "Tip sin comprobación": _devuelto_por_tipo(g, "tip_sin_comprobacion"),
+                    "Devolución sin comprobación": _devuelto_por_tipo(g, "sin_comprobacion_devolucion"),
                     "Detalle de la diferencia (tipo de cambio)": ("Dif. por tipo de cambio: " + str(g.get("detalle_tc") or "")) if g.get("dif_tc") else "",
                     "Lote enviado a revisión": lote_env, "Resultado de la revisión": resultado,
                     "Monto revisado y aprobado para pago": round(float(aprobado), 2) if aprobado is not None else None,
@@ -385,6 +388,11 @@ def _diferencia_gasto(g: dict) -> float:
         return round(float(g["diferencia"]), 2)
     suma = sum(float(f.get("monto_aplicado") or 0) for f in g.get("facturas") or [])
     return round(float(g["monto_estado"]) - suma - float(g.get("propina") or 0), 2)
+
+
+def _devuelto_por_tipo(g: dict, tipo: str) -> float:
+    """Monto que el colaborador debe devolver de un gasto, por tipo (tip sin comprobación / sin comprobación, devolución)."""
+    return round(sum(float(d["monto"]) for d in g.get("devoluciones") or [] if d.get("tipo") == tipo), 2)
 
 
 def _tabla_movs(movs: pd.DataFrame, estado: str, con_motivo: bool = False) -> pd.DataFrame:
@@ -463,7 +471,8 @@ def excel_mes(cuenta_nombre: str, periodo: str, applicant: str, movs: pd.DataFra
         # Totales al pie
         fin = len(df) + 2
         ws.write(fin, COLUMNAS_COMPROBADOS.index("Expense Outflow Amt") - 1, "Total", total_t)
-        for c in ("Expense Outflow Amt", "Propina", "Reimbursement Cap (With IVA)", "Diferencia", "Monto revisado y aprobado para pago"):
+        for c in ("Expense Outflow Amt", "Propina", "Reimbursement Cap (With IVA)", "Diferencia", "Tip sin comprobación",
+                  "Devolución sin comprobación", "Monto revisado y aprobado para pago"):
             i = COLUMNAS_COMPROBADOS.index(c)
             col = xl_col_to_name(i)
             ws.write_formula(fin, i, f"=SUBTOTAL(109,{col}2:{col}{len(df) + 1})", total_f)
