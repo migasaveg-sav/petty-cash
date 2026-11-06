@@ -2239,16 +2239,17 @@ def _movs_devolucion_colaborador(sb, cuentas_vistas: list[dict], nombre_cta: dic
         m = db.listar_movimientos(sb, c["id"], estado="en_espera")
         if m is None or m.empty:
             continue
-        m = m[m["motivo_espera"].astype(str).str.strip().str.lower() == MOTIVO_DEV_COLABORADOR.lower()]
+        # Cualquier «Pendiente» cuyo motivo hable de una devolución (Devolución del colaborador, Devolución en trámite, etc.)
+        m = m[m["motivo_espera"].astype(str).str.lower().str.replace("ó", "o", regex=False).str.contains("devoluc", regex=False)]
         hoy = hoy_cdmx()
         for r in m.itertuples():
             desde = pd.to_datetime(r.espera_desde, errors="coerce")
             filas.append({"Cuenta": nombre_cta.get(c["id"], c["nombre"]), "Mes": mes.get(r.periodo_id, ""), "Fecha": r.fecha, "Descripción": r.descripcion,
-                          "Monto": abs(float(r.monto)), "Días pendiente": (hoy - desde.date()).days if pd.notna(desde) else None,
+                          "Monto": abs(float(r.monto)), "Motivo": r.motivo_espera, "Días pendiente": (hoy - desde.date()).days if pd.notna(desde) else None,
                           "Nota": getattr(r, "nota_revisor", None) or ""})
-    st.markdown("#### 🏦 Movimientos pendientes por «Devolución del colaborador»")
+    st.markdown("#### 🏦 Movimientos pendientes por devolución del colaborador")
     if not filas:
-        st.caption("Ningún movimiento del estado de cuenta está en «Pendiente» con el motivo «Devolución del colaborador». "
+        st.caption("Ningún movimiento de esta vista está en «Pendiente» con un motivo de devolución. "
                    "Para agregarlo: Estado de cuenta → selecciona el movimiento → «Pasar al rubro correcto» → Pendiente → motivo «Devolución del colaborador».")
         return
     total = sum(f["Monto"] for f in filas)
