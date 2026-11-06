@@ -212,19 +212,53 @@ ESTADOS_CUADRE = (("comprobado", "Comprobados"), ("no_necesario", "No necesarios
                   ("pendiente", "Sin comprobar"), ("en_espera", "Pendientes"))
 
 
+def con_devolucion(movs: pd.DataFrame, gastos: list[dict]) -> pd.DataFrame:
+    """Copia del estado de cuenta con la columna `dev_monto`: lo que el colaborador debe devolver de un gasto comprobado
+    (tip sin comprobación / sin comprobación, devolución). Se asigna al primer movimiento comprobado del gasto.
+    En el cuadre y los overviews ese monto sale de «Comprobados» y entra a «Pendientes»; el total no cambia."""
+    m = movs.copy()
+    m["dev_monto"] = 0.0
+    if m.empty or "id" not in m.columns:
+        return m
+    for g in gastos or []:
+        total = float(g.get("devolucion_total") or 0)
+        if total <= 0 or g.get("eliminado"):
+            continue
+        ids = [x["id"] for x in sorted(g.get("movimientos") or [], key=lambda x: str(x.get("fecha"))) if x.get("id") is not None]
+        for mid in ids:
+            fila = (m["id"] == mid) & (m["estado"] == "comprobado")
+            if fila.any():
+                m.loc[fila.idxmax(), "dev_monto"] += total
+                break
+    return m
+
+
+def _dev_total(movs: pd.DataFrame) -> tuple[float, int]:
+    if movs is None or len(movs) == 0 or "dev_monto" not in movs.columns:
+        return 0.0, 0
+    d = movs["dev_monto"].fillna(0.0)
+    return round(float(d.sum()), 2), int((d > 0).sum())
+
+
 def cuadre(movs: pd.DataFrame) -> dict[str, Any]:
-    """comprobados + no necesarios + sin comprobar + pendientes debe ser igual al total del estado de cuenta."""
+    """comprobados + no necesarios + sin comprobar + pendientes debe ser igual al total del estado de cuenta.
+    Si `movs` trae `dev_monto` (ver con_devolucion), ese monto pasa de comprobados a pendientes."""
     n_tot = int(len(movs))
     m_tot = round(float(movs["monto"].abs().sum()), 2) if n_tot else 0.0
     por: dict[str, dict[str, float]] = {}
     for est, _ in ESTADOS_CUADRE:
         sub = movs[movs["estado"] == est] if n_tot else movs
         por[est] = {"n": int(len(sub)), "monto": round(float(sub["monto"].abs().sum()), 2) if len(sub) else 0.0}
+    dev_m, dev_n = _dev_total(movs)
+    if dev_m:
+        por["comprobado"]["monto"] = round(por["comprobado"]["monto"] - dev_m, 2)
+        por["en_espera"]["monto"] = round(por["en_espera"]["monto"] + dev_m, 2)
     suma_n = sum(v["n"] for v in por.values())
     suma_m = round(sum(v["monto"] for v in por.values()), 2)
     return {"por_estado": por, "n_total": n_tot, "monto_total": m_tot, "n_suma": suma_n, "monto_suma": suma_m,
             "cuadra": suma_n == n_tot and abs(suma_m - m_tot) < 0.005,
-            "dif_n": n_tot - suma_n, "dif_monto": round(m_tot - suma_m, 2)}
+            "dif_n": n_tot - suma_n, "dif_monto": round(m_tot - suma_m, 2),
+            "devolucion": {"n": dev_n, "monto": dev_m}}
 
 
 def overview_categorias(movs: pd.DataFrame) -> list[dict]:
@@ -235,12 +269,18 @@ def overview_categorias(movs: pd.DataFrame) -> list[dict]:
         return filas
     comp = movs[movs["estado"] == "comprobado"]
     cat = comp["categoria"].fillna("").astype(str).str.strip().replace("", "Sin categoría")
+    dev = comp["dev_monto"].fillna(0.0) if "dev_monto" in comp.columns else pd.Series(0.0, index=comp.index)
     for nombre, sub in comp.groupby(cat, sort=True):
-        filas.append({"rubro": nombre, "grupo": "Comprobado", "n": int(len(sub)), "monto": round(float(sub["monto"].abs().sum()), 2)})
+        filas.append({"rubro": nombre, "grupo": "Comprobado", "n": int(len(sub)),
+                      "monto": round(float(sub["monto"].abs().sum()) - float(dev.loc[sub.index].sum()), 2)})
     for est, nombre in ESTADOS_CUADRE[1:]:
         sub = movs[movs["estado"] == est]
         if len(sub):
             filas.append({"rubro": nombre, "grupo": nombre, "n": int(len(sub)), "monto": round(float(sub["monto"].abs().sum()), 2)})
+        if est == "en_espera":
+            dev_m, dev_n = _dev_total(movs)
+            if dev_m:
+                filas.append({"rubro": f"Pendientes · devolución del colaborador ({dev_n} gasto(s))", "grupo": "Pendientes", "n": 0, "monto": dev_m})
     return filas
 
 
@@ -251,17 +291,24 @@ def overview_estados(movs: pd.DataFrame, comprobacion_de: dict | None = None) ->
     if movs is None or len(movs) == 0:
         return filas
     comprobacion_de = comprobacion_de or {}
+    dev_m, dev_n = _dev_total(movs)
     for est, nombre in ESTADOS_CUADRE:
         sub = movs[movs["estado"] == est]
-        if not len(sub):
-            continue
-        filas.append({"rubro": nombre, "nivel": 0, "n": int(len(sub)), "monto": round(float(sub["monto"].abs().sum()), 2)})
-        if est == "comprobado":
+        if len(sub):
+            monto = round(float(sub["monto"].abs().sum()), 2)
+            if est == "comprobado":
+                monto = round(monto - dev_m, 2)
+            filas.append({"rubro": nombre, "nivel": 0, "n": int(len(sub)), "monto": monto})
+        if est == "comprobado" and len(sub):
             tipo = sub["solicitud_id"].map(lambda x: comprobacion_de.get(x) if comprobacion_de.get(x) in ("XML", "Manual", "XML + manual") else "Sin dato")
+            dev = sub["dev_monto"].fillna(0.0) if "dev_monto" in sub.columns else pd.Series(0.0, index=sub.index)
             for t in ("XML", "Manual", "XML + manual", "Sin dato"):
                 ss = sub[tipo == t]
                 if len(ss):
-                    filas.append({"rubro": f"↳ {t}", "nivel": 1, "n": int(len(ss)), "monto": round(float(ss["monto"].abs().sum()), 2)})
+                    filas.append({"rubro": f"↳ {t}", "nivel": 1, "n": int(len(ss)),
+                                  "monto": round(float(ss["monto"].abs().sum()) - float(dev.loc[ss.index].sum()), 2)})
+        if est == "en_espera" and dev_m:
+            filas.append({"rubro": f"Pendientes · devolución del colaborador ({dev_n} gasto(s))", "nivel": 0, "n": 0, "monto": dev_m})
     return filas
 
 
@@ -554,7 +601,7 @@ def excel_mes(cuenta_nombre: str, periodo: str, applicant: str, movs: pd.DataFra
         rs.set_column(0, 0, 30); rs.set_column(1, 8, 17)
         rs.write(0, 0, f"Comprobación de caja chica · {cuenta_nombre} · {periodo}", titulo)
         rs.write(1, 0, f"Generado el {datetime.date.today().strftime('%d/%m/%Y')}")
-        c = cuadre(movs)
+        c = cuadre(con_devolucion(movs, gastos))
         rs.write(3, 0, "Cuadre del estado de cuenta", negrita)
         for i, t in enumerate(("Clasificación", "Movimientos", "Monto")):
             rs.write(4, i, t, head)
@@ -566,6 +613,9 @@ def excel_mes(cuenta_nombre: str, periodo: str, applicant: str, movs: pd.DataFra
         rs.write(fila + 1, 0, "Total del estado de cuenta", negrita); rs.write_number(fila + 1, 1, c["n_total"]); rs.write_number(fila + 1, 2, c["monto_total"], dinero)
         rs.write(fila + 2, 0, "Resultado", negrita)
         rs.write(fila + 2, 1, "✔ Cuadra" if c["cuadra"] else f"✘ No cuadra (dif. {c['dif_n']} mov. / {c['dif_monto']:,.2f})", ok_f if c["cuadra"] else mal_f)
+        if c["devolucion"]["monto"]:
+            rs.write(fila + 3, 0, f"Nota: «Pendientes» incluye {c['devolucion']['monto']:,.2f} de devolución del colaborador "
+                                  f"({c['devolucion']['n']} gasto(s): tip sin comprobación / sin comprobación). Ese monto salió de «Comprobados».", negrita)
 
         fila += 5
         rs.write(fila, 0, "Lotes enviados a revisión", negrita)
@@ -626,11 +676,12 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
             marcar.append(r)
             if f.get("Expense Outflow Amt") is not None:
                 por_gasto[f["_gasto"]] = (f["_estatus"], float(f["Expense Outflow Amt"]))
-        cu = cuadre(c["movs"])
+        cu = cuadre(con_devolucion(c["movs"], c["gastos"]))
         fila = {"Cuenta": c["cuenta"], "Mes": c["periodo"]}
         for est, nombre in ESTADOS_CUADRE:
             fila[f"{nombre} (mov.)"] = cu["por_estado"][est]["n"]
             fila[f"{nombre} ($)"] = cu["por_estado"][est]["monto"]
+        fila["Pendientes: devolución del colaborador ($)"] = cu["devolucion"]["monto"]
         fila["Total (mov.)"] = cu["n_total"]
         fila["Total ($)"] = cu["monto_total"]
         fila["Cuadra"] = "Sí" if cu["cuadra"] else "No"
