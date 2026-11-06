@@ -556,7 +556,7 @@ def _detalle_gasto(sb, g: dict, editable: bool) -> None:
     st.markdown("---")
     marca = "🟡 " if g.get("tiene_diferencia") else ""
     st.markdown(f"**Gasto {money_md(g['monto_estado'])}** · {g.get('categoria') or '—'} · {marca}diferencia {money_md(g['diferencia'])}"
-                + (f" · propina {money(g['propina'])}" if float(g.get("propina") or 0) else ""))
+                + (f" · propina {money(reportes._propina_comprobada(g))}" if reportes._propina_comprobada(g) else ""))
     for m in g["movimientos"]:
         st.caption(f"🏦 {m['fecha']} · {m['descripcion']} · {money_md(m['monto'])}")
     _bloque_devolucion(sb, g, False)
@@ -1635,9 +1635,10 @@ def _detalle_movimiento(sb, df: pd.DataFrame, idx, r, g: dict | None, cuenta: di
     if r.get("solicitud_descripcion"):
         b.caption(str(r["solicitud_descripcion"]))
     c.markdown("**💵 Gasto**")
+    _prop = reportes._propina_comprobada(g) if g else float(r["propina"] or 0)
     c.write(f"{r.get('categoria') or '—'}" + (f" · {r['material']}" if r.get("material") else ""))
     c.write(f"Cargo: {money_md(r['monto_estado'])}  \nFacturas: {money_md(r['suma_facturas'])}"
-            + (f"  \nPropina: {money_md(r['propina'])}" if float(r["propina"] or 0) else ""))
+            + (f"  \nPropina: {money_md(_prop)}" if _prop else ""))
     dif = float(r["diferencia"] or 0)
     c.markdown(("🟡 " if r["tiene_diferencia"] else "") + f"Diferencia: **{money_md(dif)}**")
     if pd.notna(r["lote_numero"]):
