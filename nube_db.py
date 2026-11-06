@@ -358,17 +358,30 @@ def listar_gastos(sb, solicitud_ids: list[str]) -> list[dict]:
         tc = {x["gasto_id"]: x.get("detalle") for x in _en_trozos(sb, "gasto_tc", "gasto_id,detalle", "gasto_id", ids)}
     except Exception:
         tc = {}   # todavía no se corrió el script 013
+    try:
+        devs = [d for d in _en_trozos(sb, "gasto_devoluciones", "*", "gasto_id", ids) if not d.get("anulada")]
+        tips = _en_trozos(sb, "gasto_tip", "gasto_id,adjunto_id", "gasto_id", ids)
+        adj_tip = {a["id"]: a for a in _en_trozos(sb, "adjuntos", "id,ruta", "id", list({t["adjunto_id"] for t in tips}))} if tips else {}
+        tip_por_gasto = {t["gasto_id"]: adj_tip.get(t["adjunto_id"]) for t in tips}
+    except Exception:
+        devs, tip_por_gasto = [], {}   # todavía no se corrió el script 015
+    devs_por_gasto: dict[str, list[dict]] = {}
+    for d in devs:
+        devs_por_gasto.setdefault(d["gasto_id"], []).append(d)
     for g in gastos:
         g["movimientos"] = movs_por_gasto.get(g["id"], [])
         g["facturas"] = fact_por_gasto.get(g["id"], [])
         g["dif_tc"] = g["id"] in tc
         g["detalle_tc"] = tc.get(g["id"])
+        g["devoluciones"] = devs_por_gasto.get(g["id"], [])
+        g["devolucion_total"] = round(sum(float(d["monto"]) for d in g["devoluciones"]), 2)
+        g["tip_adjunto"] = tip_por_gasto.get(g["id"])
     return gastos
 
 
 def guardar_gasto(sb, solicitud_id: str, movimiento_ids: list[str], categoria: str | None,
                   material: str | None, propina: float, facturas: list[dict],
-                  dif_tc: bool = False, detalle_tc: str | None = None) -> str:
+                  dif_tc: bool = False, detalle_tc: str | None = None, propina_adjunto: dict | None = None) -> str:
     """Guarda un gasto. dif_tc=True marca «factura con diferencia de tipo de cambio» (exige detalle; ignora la tolerancia)."""
     if dif_tc and not (detalle_tc or "").strip():
         raise ErrorNube("Explica en «Detalles» por qué hay diferencia por tipo de cambio.")
@@ -383,6 +396,8 @@ def guardar_gasto(sb, solicitud_id: str, movimiento_ids: list[str], categoria: s
     if dif_tc:   # sin la marca se llama igual que antes (compatible aunque aún no se corra el script 013)
         params["p_dif_tc"] = True
         params["p_detalle_tc"] = detalle_tc.strip()
+    if propina_adjunto:   # comprobante de la propina; sin él, la propina queda como «tip sin comprobación»
+        params["p_propina_adjunto"] = propina_adjunto
     return _ejecutar(sb.rpc("guardar_gasto", params))
 
 
@@ -497,6 +512,49 @@ def reclasificar_fuente_facturas(sb, factura_ids: list[str], fuente: str, motivo
     if not (motivo or "").strip():
         raise ErrorNube("Escribe el motivo del cambio.")
     return int(_ejecutar(sb.rpc("reclasificar_fuente_facturas", {"p_facturas": factura_ids, "p_fuente": fuente, "p_motivo": motivo.strip()})) or 0)
+
+
+def marcar_devolucion(sb, gasto_id: str, monto: float, nota: str) -> None:
+    """El revisor cataloga un gasto (completo o parcial) como «sin comprobación, devolución»."""
+    if not monto or float(monto) <= 0:
+        raise ErrorNube("Captura el monto a devolver.")
+    if not (nota or "").strip():
+        raise ErrorNube("Explica el motivo de la devolución.")
+    _ejecutar(sb.rpc("marcar_devolucion", {"p_gasto": gasto_id, "p_monto": round(float(monto), 2), "p_nota": nota.strip()}))
+
+
+def anular_devolucion(sb, dev_id: str, motivo: str) -> None:
+    if not (motivo or "").strip():
+        raise ErrorNube("Escribe el motivo.")
+    _ejecutar(sb.rpc("anular_devolucion", {"p_dev": dev_id, "p_motivo": motivo.strip()}))
+
+
+def registrar_devolucion_recibida(sb, dev_id: str, fecha, referencia: str) -> None:
+    if not (referencia or "").strip():
+        raise ErrorNube("Escribe la referencia de la devolución.")
+    _ejecutar(sb.rpc("registrar_devolucion_recibida", {"p_dev": dev_id, "p_fecha": str(fecha), "p_referencia": referencia.strip()}))
+
+
+def listar_devoluciones(sb, cuenta_id: str | None = None) -> list[dict]:
+    """Devoluciones vigentes (no anuladas) con los datos de su gasto y solicitud. Una fila por devolución."""
+    def construir():
+        q = sb.table("gasto_devoluciones").select("*").eq("anulada", False)
+        if cuenta_id:
+            q = q.eq("cuenta_id", cuenta_id)
+        return q.order("creado_en", desc=True).order("id", desc=False)
+    devs = _paginado(construir)
+    if not devs:
+        return []
+    gastos = {g["id"]: g for g in _en_trozos(sb, "gastos", "id,solicitud_id,monto_estado,categoria,eliminado", "id", list({d["gasto_id"] for d in devs}))}
+    sols = {x["id"]: x for x in _en_trozos(sb, "solicitudes", "id,numero,description,employee_name,periodo_id", "id",
+                                           list({g["solicitud_id"] for g in gastos.values()}))}
+    out = []
+    for d in devs:
+        g = gastos.get(d["gasto_id"])
+        if not g or g.get("eliminado"):
+            continue
+        out.append({**d, "gasto": g, "solicitud": sols.get(g["solicitud_id"], {})})
+    return out
 
 
 def desbloquear_lote(sb, lote_id: str, motivo: str) -> None:
