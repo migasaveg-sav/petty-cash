@@ -406,7 +406,46 @@ def _tabla_movs(movs: pd.DataFrame, estado: str, con_motivo: bool = False) -> pd
         cols["Días pendiente"] = [
             (hoy - pd.to_datetime(d).date()).days if pd.notna(d) and d else None
             for d in sub["espera_desde"]]
+        # Movimiento pendiente cuyo motivo es una devolución: su monto es lo que el colaborador debe regresar.
+        cols["Devolución del colaborador"] = [
+            abs(float(m)) if "devoluc" in str(mot or "").lower().replace("ó", "o") else None
+            for m, mot in zip(sub["monto"], sub["motivo_espera"])]
     return pd.DataFrame(cols)
+
+
+TIPO_DEVOLUCION_TXT = {"tip_sin_comprobacion": "Tip sin comprobación", "sin_comprobacion_devolucion": "Sin comprobación, devolución"}
+
+
+def _filas_devolucion_gastos(solicitudes: list[dict], gastos: list[dict]) -> list[dict]:
+    """Devoluciones del colaborador (tip sin comprobación y gastos «sin comprobación, devolución») como renglones de «Pendientes».
+    No son movimientos del banco: no entran al cuadre del estado de cuenta; van en su propia columna de monto."""
+    sols = {x["id"]: x for x in solicitudes if not x.get("eliminado")}
+    hoy = datetime.date.today()
+    filas: list[dict] = []
+    for g in gastos:
+        if g.get("eliminado") or g["solicitud_id"] not in sols:
+            continue
+        sol = sols[g["solicitud_id"]]
+        movs = sorted(m["fecha"] for m in g.get("movimientos") or [])
+        for d in g.get("devoluciones") or []:
+            devuelto = d.get("estado") == "devuelto"
+            motivo = f"{TIPO_DEVOLUCION_TXT.get(d['tipo'], d['tipo'])}: el colaborador debe devolverlo a la cuenta de la empresa"
+            if devuelto:
+                motivo = f"{TIPO_DEVOLUCION_TXT.get(d['tipo'], d['tipo'])}: YA DEVUELTO el {_fecha_corta(d.get('devuelto_en'))} (ref. {d.get('devuelto_ref') or '—'})"
+            creado = pd.to_datetime(d.get("creado_en"), errors="coerce", utc=True)
+            filas.append({"Fecha": movs[0] if movs else sol["fecha"],
+                          "Descripción": f"[Devolución del colaborador] Sol. #{int(sol['numero'])} · {sol.get('employee_name') or '—'} · {sol.get('description') or ''}",
+                          "Monto": None, "Saldo": None, "Motivo (por qué está pendiente)": motivo,
+                          "Días pendiente": None if devuelto or pd.isna(creado) else (hoy - creado.date()).days,
+                          "Devolución del colaborador": round(float(d["monto"]), 2)})
+    return filas
+
+
+def _pendientes_con_devoluciones(pe: pd.DataFrame, solicitudes: list[dict], gastos: list[dict]) -> pd.DataFrame:
+    extra = _filas_devolucion_gastos(solicitudes, gastos)
+    if not extra:
+        return pe
+    return pd.concat([pe, pd.DataFrame(extra, columns=list(pe.columns))], ignore_index=True)
 
 
 def _formato_comprobacion(wb, ws, col: int, n: int) -> None:
@@ -482,16 +521,20 @@ def excel_mes(cuenta_nombre: str, periodo: str, applicant: str, movs: pd.DataFra
         nn.to_excel(w, index=False, sheet_name="No necesarios", header=False, startrow=1)
         sc = _tabla_movs(movs, "pendiente")
         sc.to_excel(w, index=False, sheet_name="Sin comprobar", header=False, startrow=1)
-        pe = _tabla_movs(movs, "en_espera", con_motivo=True)
+        pe = _pendientes_con_devoluciones(_tabla_movs(movs, "en_espera", con_motivo=True), solicitudes, gastos)
         pe.to_excel(w, index=False, sheet_name="Pendientes", header=False, startrow=1)
         for nombre, tabla, anchos_h in (("No necesarios", nn, [14, 46, 16]), ("Sin comprobar", sc, [14, 46, 16, 16]),
-                                         ("Pendientes", pe, [14, 46, 16, 16, 48, 14])):
+                                         ("Pendientes", pe, [14, 56, 16, 16, 60, 14, 20])):
             h = w.sheets[nombre]
             for i, c in enumerate(tabla.columns):
                 h.write(0, i, c, head)
-                h.set_column(i, i, anchos_h[i], dinero if c in ("Monto", "Monto Estado", "Saldo") else None)
+                h.set_column(i, i, anchos_h[i], dinero if c in ("Monto", "Monto Estado", "Saldo", "Devolución del colaborador") else None)
             h.freeze_panes(1, 0)
             h.autofilter(0, 0, max(len(tabla), 1), len(tabla.columns) - 1)
+            if nombre == "Pendientes" and "Devolución del colaborador" in tabla.columns and len(tabla):
+                j = list(tabla.columns).index("Devolución del colaborador")
+                h.write(len(tabla) + 2, j - 1, "Total a devolver por el colaborador", total_t)
+                h.write_formula(len(tabla) + 2, j, f"=SUBTOTAL(109,{xl_col_to_name(j)}2:{xl_col_to_name(j)}{len(tabla) + 1})", total_f)
 
         # ---- Solicitudes abiertas (bitácora sin gasto) ----
         con_gasto = {g["solicitud_id"] for g in gastos if not g.get("eliminado")}
@@ -602,6 +645,13 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
                     sub = c["movs"][c["movs"]["estado"] == est].sort_values(["fecha", "descripcion"])
                     t["Nota del revisor"] = sub["nota_revisor"].values
                 lista.append(t)
+        # Devoluciones del colaborador por gastos (tip sin comprobación, sin comprobación) → también en «Pendientes»
+        extra = _filas_devolucion_gastos(c["sols"], c["gastos"])
+        if extra:
+            tx = pd.DataFrame(extra)
+            tx.insert(0, "Mes", c["periodo"]); tx.insert(0, "Cuenta", c["cuenta"])
+            tx["Nota del revisor"] = ""
+            pe.append(tx)
 
     out = BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as w:
@@ -645,7 +695,7 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
                 ("no_necesarios", "No necesarios", nn, {"Cuenta": 16, "Mes": 9, "Fecha Estado": 14, "Descripción Estado": 46, "Monto Estado": 16, "Nota del revisor": 40}),
                 ("sin_comprobar", "Sin comprobar", sc, {"Cuenta": 16, "Mes": 9, "Fecha": 14, "Descripción": 46, "Monto": 16, "Saldo": 16, "Nota del revisor": 40}),
                 ("pendientes", "Pendientes", pe, {"Cuenta": 16, "Mes": 9, "Fecha": 14, "Descripción": 46, "Monto": 16, "Saldo": 16,
-                                                  "Motivo (por qué está pendiente)": 48, "Días pendiente": 14, "Nota del revisor": 40})):
+                                                  "Motivo (por qué está pendiente)": 60, "Días pendiente": 14, "Devolución del colaborador": 20, "Nota del revisor": 40})):
             if clave not in hojas:
                 continue
             t = pd.concat(listas, ignore_index=True) if listas else pd.DataFrame(columns=["Cuenta", "Mes", "Fecha", "Descripción", "Monto"])
@@ -653,9 +703,14 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
             h = w.sheets[nombre]
             for i, c in enumerate(t.columns):
                 h.write(0, i, c, head)
-                h.set_column(i, i, anchos.get(c, 14), dinero if c in ("Monto", "Monto Estado", "Saldo") else None)
+                h.set_column(i, i, anchos.get(c, 14), dinero if c in ("Monto", "Monto Estado", "Saldo", "Devolución del colaborador") else None)
             h.freeze_panes(1, 0)
             h.autofilter(0, 0, max(len(t), 1), len(t.columns) - 1)
+            if nombre == "Pendientes" and "Devolución del colaborador" in t.columns and len(t):
+                j = list(t.columns).index("Devolución del colaborador")
+                tot_pe = wb.add_format({"bold": True, "top": 1, "num_format": FORMATO_DINERO})
+                h.write(len(t) + 2, j - 1, "Total a devolver por el colaborador", wb.add_format({"bold": True, "top": 1}))
+                h.write_formula(len(t) + 2, j, f"=SUBTOTAL(109,{xl_col_to_name(j)}2:{xl_col_to_name(j)}{len(t) + 1})", tot_pe)
             escritas += 1
         if "resumen" in hojas or escritas == 0:
             rs = pd.DataFrame(resumen_filas)
