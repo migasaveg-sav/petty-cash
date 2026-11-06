@@ -558,6 +558,7 @@ def _detalle_gasto(sb, g: dict, editable: bool) -> None:
                 + (f" · propina {money(g['propina'])}" if float(g.get("propina") or 0) else ""))
     for m in g["movimientos"]:
         st.caption(f"🏦 {m['fecha']} · {m['descripcion']} · {money_md(m['monto'])}")
+    _bloque_devolucion(sb, g, False)
     for f in g["facturas"]:
         cols = st.columns([3, 1, 1])
         cols[0].caption(f"{_etiqueta_factura(f)} · 🧾 {(f.get('uuid_cfdi') or 'SIN-UUID')} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
@@ -746,8 +747,29 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
             mat_ini = sol.get("material")
             material = st.selectbox("Material", ["—", *mats], index=(mats.index(mat_ini) + 1) if mat_ini in mats else 0, key="cmp_material")
     propina = 0.0
+    tip_adj = None
     if categoria in CATEGORIAS_CON_PROPINA:
         propina = st.number_input("💵 Propina (no aparece en la factura)", min_value=0.0, step=1.0, format="%.2f", key="cmp_propina")
+        if propina > 0:
+            tip_adj = st.session_state.get("cmp_tip_adj")
+            if tip_adj:
+                t1, t2 = st.columns([4, 1])
+                t1.caption(f"📎 Comprobante de la propina: {tip_adj[1]['nombre_original']} · {tip_adj[1]['bytes_final'] / 1024:,.0f} KB")
+                if t2.button("Quitar", key="cmp_tip_quitar"):
+                    st.session_state.pop("cmp_tip_adj", None)
+                    st.session_state["cmp_tip_ver"] = st.session_state.get("cmp_tip_ver", 0) + 1
+                    _rerun_ventana()
+            else:
+                archivo_tip = st.file_uploader("📎 Comprobante de la propina (PDF o foto del recibo / voucher)", type=["pdf", "jpg", "jpeg", "png"],
+                                               key=f"cmp_tip_up_{st.session_state.get('cmp_tip_ver', 0)}")
+                if archivo_tip is not None:
+                    try:
+                        st.session_state["cmp_tip_adj"] = adj.comprimir_a_pdf(archivo_tip.getvalue(), archivo_tip.name)
+                        _rerun_ventana()
+                    except adj.AdjuntoError as e:
+                        st.error(str(e))
+                st.warning(f"Sin comprobante de la propina, esos {money_md(propina)} se marcarán como **«tip sin comprobación»**: "
+                           "se separan del gasto y el colaborador deberá devolverlos a la cuenta de la empresa.")
 
     facturas: list[dict] = st.session_state.setdefault("cmp_facturas", [])
     ver = st.session_state.setdefault("cmp_xml_ver", 0)
@@ -859,6 +881,12 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
                     _guardar_catalogo_si_nuevo(sb, tipo, datos_sol.get(clave))
                 sol_nueva_id = db.crear_solicitud(sb, cuenta["id"], sol["_periodo_id"], datos_sol)["id"]
             mes = str(sol["fecha"])[:7]
+            propina_adjunto = None
+            if tip_adj and propina > 0:
+                pdf_t, info_t = tip_adj
+                ruta_t = db.subir_adjunto(sb, cuenta["id"], mes, pdf_t)
+                subidos.append(ruta_t)
+                propina_adjunto = {"ruta": ruta_t, **{k: info_t[k] for k in ("nombre_original", "bytes_original", "bytes_final", "sha256")}}
             payload = []
             for f in facturas:
                 adjunto = None
@@ -870,7 +898,8 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
                 payload.append(db.factura_a_json(f["datos"], adjunto))
             db.guardar_gasto(sb, sol.get("id") or sol_nueva_id, elegidos, None if categoria == "—" else categoria,
                              None if material == "—" else material, propina, payload,
-                             dif_tc=bool(dif_tc), detalle_tc=detalle_tc.strip() if dif_tc else None)
+                             dif_tc=bool(dif_tc), detalle_tc=detalle_tc.strip() if dif_tc else None,
+                             propina_adjunto=propina_adjunto)
         except db.ErrorNube as e:
             db.borrar_adjuntos_huerfanos(sb, subidos)
             if sol_nueva_id:
@@ -1505,6 +1534,8 @@ def _detalle_solicitud_enviada(sb, df: pd.DataFrame, r: dict, gastos_por_id: dic
                 st.warning(f"💱 **Factura con diferencia de tipo de cambio** (cotización en dólares, factura en pesos). "
                            f"Detalles del aplicante: {g.get('detalle_tc') or '—'}")
         for g in gs:
+            _bloque_devolucion(sb, g, revisor)
+        for g in gs:
             for f in g.get("facturas") or []:
                 cols = st.columns([3.2, 1.2, 1, 1.1] if revisor else [3.2, 1.2, 1])
                 cols[0].caption(f"{_etiqueta_factura(f)} · 🧾 {f.get('uuid_cfdi') or 'SIN-UUID'} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
@@ -1512,6 +1543,56 @@ def _detalle_solicitud_enviada(sb, df: pd.DataFrame, r: dict, gastos_por_id: dic
                 _boton_pdf(sb, f, f"venv_{g['id']}_{f['id']}", cols[2])
                 if revisor:
                     _corregir_fuente(sb, f, g["id"], cols[3])
+
+
+TIPO_DEVOLUCION = {"tip_sin_comprobacion": "Tip sin comprobación", "sin_comprobacion_devolucion": "Sin comprobación, devolución"}
+
+
+def _bloque_devolucion(sb, g: dict, revisor: bool) -> None:
+    """Propina (con o sin comprobante) y devoluciones del colaborador de un gasto; el revisor puede marcar una devolución."""
+    propina = float(g.get("propina") or 0)
+    if propina > 0 and g.get("tip_adjunto"):
+        c1, c2 = st.columns([4, 1])
+        c1.caption(f"✅ Propina de {money_md(propina)} con comprobante.")
+        url = db.url_firmada(sb, g["tip_adjunto"]["ruta"])
+        if url:
+            c2.link_button("📎 Abrir", url)
+    for d in g.get("devoluciones") or []:
+        etiqueta = TIPO_DEVOLUCION.get(d["tipo"], d["tipo"])
+        estado = "✅ ya devuelto" if d.get("estado") == "devuelto" else "pendiente de devolver"
+        c1, c2 = st.columns([4.2, 1.3])
+        c1.warning(f"💸 **{etiqueta}: {money_md(d['monto'])}** · {estado}. {d.get('nota') or ''}  \n"
+                   "Este monto se separa del gasto (no se reembolsa) y el colaborador debe regresarlo a la cuenta de la empresa.")
+        if revisor and d.get("estado") != "devuelto" and not g.get("lote_id"):
+            with c2.popover("Quitar"):
+                mot = st.text_input("Motivo (obligatorio)", key=f"dev_q_m_{d['id']}")
+                if st.button("Quitar devolución", key=f"dev_q_b_{d['id']}"):
+                    try:
+                        db.anular_devolucion(sb, d["id"], mot)
+                        _nueva_tabla_rev()
+                        _flash("Devolución quitada.")
+                        st.rerun()
+                    except db.ErrorNube as e:
+                        st.error(str(e))
+    if revisor:
+        libre = round(float(g["monto_estado"]) - float(g.get("devolucion_total") or 0), 2)
+        if g.get("lote_id"):
+            return
+        if libre <= 0:
+            return
+        with st.popover("↩️ Marcar «sin comprobación, devolución»"):
+            st.caption("Separa del gasto el monto que el colaborador debe regresar a la cuenta de la empresa. Puede ser todo el gasto o una parte; "
+                       "ese monto ya no entra al lote de pago.")
+            monto = st.number_input("Monto a devolver", min_value=0.0, max_value=libre, value=libre, step=10.0, format="%.2f", key=f"dev_m_{g['id']}")
+            nota = st.text_area("Motivo (obligatorio)", key=f"dev_n_{g['id']}", height=80)
+            if st.button("Marcar devolución", type="primary", key=f"dev_b_{g['id']}", disabled=monto <= 0):
+                try:
+                    db.marcar_devolucion(sb, g["id"], monto, nota)
+                    _nueva_tabla_rev()
+                    _flash(f"Devolución de {money_md(monto)} registrada: se separó del gasto.")
+                    st.rerun()
+                except db.ErrorNube as e:
+                    st.error(str(e))
 
 
 def _tag_html(estado: str) -> str:
@@ -1733,7 +1814,7 @@ def _vista_revisor(sb) -> None:
         if cuenta.get("limite_reembolso"):
             st.caption(f"Límite de reembolso: {money_md(cuenta['limite_reembolso'])}")
 
-    secciones = ["📥 Cola de revisión", "🏦 Estado de cuenta", "💸 Lotes y pagos", "📊 Resumen y cierre de mes", "⬇️ Descargas"]
+    secciones = ["📥 Cola de revisión", "🏦 Estado de cuenta", "💸 Lotes y pagos", "↩️ Devoluciones", "📊 Resumen y cierre de mes", "⬇️ Descargas"]
     elegida = st.segmented_control("Sección", secciones, default=secciones[0], label_visibility="collapsed", key="rev_seccion")
     vista = elegida or st.session_state.get("_rev_seccion_ult", secciones[0])
     st.session_state["_rev_seccion_ult"] = vista
@@ -1745,6 +1826,8 @@ def _vista_revisor(sb) -> None:
     elif vista == secciones[2]:
         _lotes_revisor(sb, cuenta, cuentas, periodos)
     elif vista == secciones[3]:
+        _devoluciones_revisor(sb, cuenta, cuentas, periodos)
+    elif vista == secciones[4]:
         _resumen_revisor(sb, cuentas, periodo)
     else:
         _descargas_revisor(sb, cuentas, periodos, cuenta, periodo)
@@ -1841,7 +1924,7 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
     tabla = pd.DataFrame([{
         "Estado": NOMBRE_SOL_REV.get(f["solicitud_estado"], f["solicitud_estado"]), "Sol. #": f["numero"], "Fecha": f["fecha"],
         "Descripción": f["descripcion"], "Concepto": f["concepto"], "Comprobación": f["comprobacion"], "Mov.": f["movs"], "Monto": f["monto"],
-        "Diferencia": f["diferencia"], "Tipo de cambio": "💱 Sí" if f.get("dif_tc") else "",
+        "Diferencia": f["diferencia"], "A devolver": f.get("devolucion") or 0.0, "Tipo de cambio": "💱 Sí" if f.get("dif_tc") else "",
         "Enviada en lote": f"#{f['envio']}" if f["envio"] else "—"} for f in vista])
 
     def _pintar(col):
@@ -1852,7 +1935,7 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
         return [f"background-color:{estilos.C_DIFERENCIA_AMARILLO};font-weight:700" if f["tiene_diferencia"] else "" for f in vista]
 
     estilo = (tabla.style.apply(_tinte_manual(tabla), axis=1).apply(_pintar, subset=["Estado"]).apply(_pintar_dif, subset=["Diferencia"])
-              .apply(_pintar_comprobacion, subset=["Comprobación"]).format({"Monto": "${:,.2f}", "Diferencia": "${:,.2f}"}))
+              .apply(_pintar_comprobacion, subset=["Comprobación"]).format({"Monto": "${:,.2f}", "Diferencia": "${:,.2f}", "A devolver": "${:,.2f}"}))
     st.caption("🟧 Las filas sombreadas en naranja se comprobaron capturando datos a mano (sin XML); revísalas con más cuidado. "
                "Selecciona una o varias filas: con una ves el detalle y puedes devolverla; con varias das el visto bueno y se crea el lote de pago.")
     ev = st.dataframe(estilo, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 420),
@@ -2145,6 +2228,74 @@ def _historial_pagos(sb, lote: dict) -> None:
         st.markdown("**🧾 Pagos registrados**")
         st.dataframe(pd.DataFrame([{"Fecha": p["fecha_pago"], "Monto": float(p["monto"]), "Referencia": p["referencia"]} for p in pagos]),
                      hide_index=True, use_container_width=True, column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
+
+
+def _devoluciones_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) -> None:
+    """Lo que los colaboradores deben regresar a la cuenta de la empresa (tip sin comprobación y gastos sin comprobación)."""
+    c1, c2 = st.columns([1.4, 1.4])
+    alcance = c1.radio("Mostrar", ["Esta cuenta", "Todas las cuentas"], horizontal=True, key="rev_dev_alc")
+    filtro = c2.radio("Estado", ["Por devolver", "Ya devueltas", "Todas"], horizontal=True, key="rev_dev_est")
+    try:
+        devs = db.listar_devoluciones(sb, cuenta["id"] if alcance.startswith("Esta") else None)
+    except db.ErrorNube as e:
+        st.error(f"{e} (¿ya corriste el script 015?)")
+        return
+    if not devs:
+        st.info("No hay devoluciones. Aparecen cuando una propina se guarda sin comprobante o cuando marcas un gasto como «sin comprobación, devolución».")
+        return
+    nombre_cta = {c["id"]: c["nombre"] for c in cuentas}
+    mes = {p["id"]: db.etiqueta_periodo(p) for p in periodos}
+    pend = [d for d in devs if d["estado"] == "por_devolver"]
+    hechas = [d for d in devs if d["estado"] == "devuelto"]
+    k = st.columns(3)
+    k[0].markdown(estilos.tarjeta("Por devolver", str(len(pend)), estilos.money_html(sum(float(d["monto"]) for d in pend)), "rojo"), unsafe_allow_html=True)
+    k[1].markdown(estilos.tarjeta("Ya devueltas", str(len(hechas)), estilos.money_html(sum(float(d["monto"]) for d in hechas)), "comprobado"), unsafe_allow_html=True)
+    k[2].markdown(estilos.tarjeta("Total", str(len(devs)), estilos.money_html(sum(float(d["monto"]) for d in devs)), "acento"), unsafe_allow_html=True)
+    if pend:
+        por_col: dict[tuple, float] = {}
+        for d in pend:
+            clave = (nombre_cta.get(d["cuenta_id"], ""), d["solicitud"].get("employee_name") or "—")
+            por_col[clave] = por_col.get(clave, 0.0) + float(d["monto"])
+        with st.expander("👤 Pendiente de devolver por colaborador", expanded=False):
+            st.dataframe(pd.DataFrame([{"Cuenta": c, "Colaborador": e, "Por devolver": m} for (c, e), m in sorted(por_col.items())]),
+                         hide_index=True, use_container_width=True, column_config={"Por devolver": st.column_config.NumberColumn("Por devolver", format="$%.2f")})
+    vista = [d for d in devs if filtro == "Todas" or (filtro == "Por devolver" and d["estado"] == "por_devolver") or (filtro == "Ya devueltas" and d["estado"] == "devuelto")]
+    if not vista:
+        st.caption("No hay devoluciones con este filtro.")
+        return
+    tabla = pd.DataFrame([{
+        "Cuenta": nombre_cta.get(d["cuenta_id"], ""), "Mes": mes.get(d["solicitud"].get("periodo_id"), ""), "Sol. #": d["solicitud"].get("numero"),
+        "Colaborador": d["solicitud"].get("employee_name") or "", "Descripción": d["solicitud"].get("description") or "",
+        "Categoría": d["gasto"].get("categoria") or "", "Tipo": TIPO_DEVOLUCION.get(d["tipo"], d["tipo"]), "Monto": float(d["monto"]),
+        "Estado": "Por devolver" if d["estado"] == "por_devolver" else "Devuelto", "Fecha de devolución": d.get("devuelto_en") or "",
+        "Referencia": d.get("devuelto_ref") or "", "Motivo": d.get("nota") or ""} for d in vista])
+    ev = st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 380),
+                      on_select="rerun", selection_mode="single-row",
+                      key=f"tabla_dev_{st.session_state.get('rev_ver', 0)}_{alcance}_{filtro}_{_firma(d['id'] for d in vista)}",
+                      column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f"), "Sol. #": st.column_config.NumberColumn("Sol. #", format="%d", width="small")})
+    st.download_button("⬇️ Excel de devoluciones", reportes.excel_tabla(tabla, "Devoluciones"), file_name=f"Devoluciones_{datetime.date.today():%Y%m%d}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="xl_dev")
+    sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(vista)]
+    if not sel:
+        st.caption("Selecciona una devolución para registrar que el colaborador ya regresó el dinero.")
+        return
+    d = vista[sel[0]]
+    with st.container(border=True):
+        st.markdown(f"**{TIPO_DEVOLUCION.get(d['tipo'], d['tipo'])}** · {money_md(d['monto'])} · {d['solicitud'].get('employee_name') or '—'} · solicitud #{d['solicitud'].get('numero')}")
+        if d["estado"] == "devuelto":
+            st.success(f"Devuelto el {d.get('devuelto_en')} · referencia {d.get('devuelto_ref')}")
+            return
+        f1, f2 = st.columns(2)
+        fecha = f1.date_input("Fecha en que se devolvió", value=hoy_cdmx(), key=f"dv_f_{d['id']}")
+        ref = f2.text_input("Referencia del depósito / transferencia", key=f"dv_r_{d['id']}")
+        if st.button("✅ Registrar devolución recibida", type="primary", key=f"dv_b_{d['id']}"):
+            try:
+                db.registrar_devolucion_recibida(sb, d["id"], fecha, ref)
+                _nueva_tabla_rev()
+                _flash("Devolución registrada.")
+                st.rerun()
+            except db.ErrorNube as e:
+                st.error(str(e))
 
 
 def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) -> None:
