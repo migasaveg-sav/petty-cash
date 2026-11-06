@@ -1351,7 +1351,8 @@ def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
         st.info("Este mes todavía no tiene movimientos. Carga el estado de cuenta en la pestaña «Estado de cuenta».")
         return
     movs = df.drop_duplicates("id")
-    cu = reportes.cuadre(movs)
+    _sols_c = db.listar_solicitudes(sb, cuenta["id"], periodo["id"])
+    cu = reportes.cuadre(reportes.con_devolucion(movs, db.listar_gastos(sb, [x["id"] for x in _sols_c]) if _sols_c else []))
     cols = st.columns(4)
     for col, (est, titulo) in zip(cols, (("comprobado", "Comprobados"), ("no_necesario", "No necesarios"),
                                          ("pendiente", "Sin comprobar"), ("en_espera", "Pendientes"))):
@@ -1860,7 +1861,7 @@ def _cola_revision(sb, cuenta: dict, periodo: dict) -> None:
                                                   ("en_lote", "En lote · por pagar", "alerta"), ("pagado", "Pagadas", "comprobado"))):
         n, m = _suma(estado)
         col.markdown(estilos.tarjeta(titulo, str(n), estilos.money_html(m), tono), unsafe_allow_html=True)
-    cu = reportes.cuadre(df.drop_duplicates("id"))
+    cu = reportes.cuadre(reportes.con_devolucion(df.drop_duplicates("id"), gastos))
     st.markdown(estilos.cuadre_html(cu), unsafe_allow_html=True)
 
     # ---- Envíos por fecha: revisar y aprobar cada envío por separado (o todos juntos) ----
@@ -2088,7 +2089,8 @@ def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
     sols = db.listar_solicitudes(sb, cuenta["id"], periodo["id"])
     gastos = db.listar_gastos(sb, [x["id"] for x in sols]) if sols else []
     comprobacion_de = {f["id"]: f["comprobacion"] for f in reportes.filas_desglose(df, gastos) if f["tipo"] == "solicitud"}
-    cu = reportes.cuadre(movs)
+    movs_dev = reportes.con_devolucion(movs, gastos)
+    cu = reportes.cuadre(movs_dev)
     cols = st.columns(4)
     for col, (est, titulo) in zip(cols, (("comprobado", "Comprobados"), ("no_necesario", "No necesarios"),
                                          ("pendiente", "Sin comprobar"), ("en_espera", "Pendientes"))):
@@ -2096,7 +2098,7 @@ def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
     p = cu["por_estado"]
     st.markdown(estilos.barra_progreso(p["comprobado"]["n"], p["no_necesario"]["n"], p["pendiente"]["n"], p["en_espera"]["n"]), unsafe_allow_html=True)
     st.markdown(estilos.cuadre_html(cu), unsafe_allow_html=True)
-    _overview_categorias(movs, cu, comprobacion_de)
+    _overview_categorias(movs_dev, cu, comprobacion_de)
     st.caption("Aquí ves **todos** los cargos del estado de cuenta tal como los clasificó el aplicante. "
                "Selecciona uno o varios para pasarlos al rubro correcto.")
 
