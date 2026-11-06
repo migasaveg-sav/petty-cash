@@ -183,6 +183,15 @@ def barra_progreso(comprobados: int, no_necesarios: int, sin_comprobar: int, pen
 
 def cuadre_html(c: dict) -> str:
     """Línea de validación: comprobados + no necesarios + sin comprobar + pendientes = total del estado de cuenta."""
+    html = _cuadre_html(c)
+    dev = (c.get("devolucion") or {}).get("monto") or 0
+    if dev:
+        html += (f'<div style="color:#92400E;font-size:0.85rem;margin:-2px 0 6px 4px">↳ «Pendientes» incluye {money_html(dev)} de devolución del colaborador '
+                 f'({c["devolucion"]["n"]} gasto(s): tip sin comprobación / sin comprobación) que salió de «Comprobados».</div>')
+    return html
+
+
+def _cuadre_html(c: dict) -> str:
     por = c["por_estado"]
     n = lambda k: por[k]["n"]
     suma = f'{n("comprobado")} + {n("no_necesario")} + {n("pendiente")} + {n("en_espera")}'
