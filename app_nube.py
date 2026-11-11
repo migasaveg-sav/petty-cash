@@ -2099,6 +2099,8 @@ def _estado_cuenta_revisor(sb, cuenta: dict, periodo: dict) -> None:
     p = cu["por_estado"]
     st.markdown(estilos.barra_progreso(p["comprobado"]["n"], p["no_necesario"]["n"], p["pendiente"]["n"], p["en_espera"]["n"]), unsafe_allow_html=True)
     st.markdown(estilos.cuadre_html(cu), unsafe_allow_html=True)
+    st.markdown(estilos.resumen_tarjeta_html(reportes.resumen_tarjeta(cu, reportes.saldo_final(movs), cuenta.get("limite_reembolso"))),
+                unsafe_allow_html=True)
     _overview_categorias(movs_dev, cu, comprobacion_de)
     st.caption("Aquí ves **todos** los cargos del estado de cuenta tal como los clasificó el aplicante. "
                "Selecciona uno o varios para pasarlos al rubro correcto.")
@@ -2464,7 +2466,8 @@ def _descargas_revisor(sb, cuentas: list[dict], periodos: list[dict], cuenta: di
                         continue
                     gastos = db.listar_gastos(sb, [x["id"] for x in sols]) if sols else []
                     conjuntos.append({"cuenta": nc, "periodo": em, "applicant": aplicantes.get(cta["id"], ""), "movs": movs, "sols": sols,
-                                      "gastos": gastos, "env_g": db.listar_envio_gastos(sb, cta["id"], per["id"])})
+                                      "gastos": gastos, "env_g": db.listar_envio_gastos(sb, cta["id"], per["id"]),
+                                      "limite": cta.get("limite_reembolso")})
         if not conjuntos:
             st.warning("No hay datos en las cuentas y meses elegidos.")
         else:
