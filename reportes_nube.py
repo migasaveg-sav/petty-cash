@@ -261,6 +261,41 @@ def cuadre(movs: pd.DataFrame) -> dict[str, Any]:
             "devolucion": {"n": dev_n, "monto": dev_m}}
 
 
+def saldo_final(movs: pd.DataFrame) -> float | None:
+    """Saldo de la cuenta tras el último movimiento del estado de cuenta (None si no hay saldos).
+    Con varios movimientos en la última fecha, toma el que no antecede a ningún otro (saldo_n = saldo_m + monto_n)."""
+    if movs is None or len(movs) == 0 or "saldo" not in movs.columns:
+        return None
+    m = movs.copy()
+    m["saldo"] = pd.to_numeric(m["saldo"], errors="coerce")
+    m = m[m["saldo"].notna()]
+    if m.empty:
+        return None
+    ultima = m[m["fecha"] == m["fecha"].max()]
+    if len(ultima) > 1:
+        filas = list(ultima.itertuples())
+        finales = [a for a in filas
+                   if not any(abs(float(b.saldo) - (float(a.saldo) + float(b.monto))) < 0.005 for b in filas if b is not a)]
+        if len(finales) == 1:
+            return round(float(finales[0].saldo), 2)
+    return round(float(ultima.iloc[-1]["saldo"]), 2)
+
+
+def resumen_tarjeta(cu: dict, balance: float | None, limite: float | None) -> dict:
+    """Resumen de la tarjeta: comprobados + pendientes (+ sin comprobar) = subtotal; + balance = suma; diferencia = límite − suma.
+    `cu` es el resultado de cuadre(con_devolucion(...)); `limite` es el límite de la cuenta (Total card)."""
+    por = cu["por_estado"]
+    comp = round(por["comprobado"]["monto"], 2)
+    pend = round(por["en_espera"]["monto"], 2)
+    sin = round(por["pendiente"]["monto"], 2)
+    subtotal = round(comp + pend + sin, 2)
+    suma = round(subtotal + (balance or 0.0), 2)
+    lim = float(limite) if limite else None
+    return {"comprobados": comp, "pendientes": pend, "sin_comprobar": sin, "subtotal": subtotal,
+            "balance": balance, "suma": suma, "limite": lim,
+            "diferencia": round(lim - suma, 2) if lim is not None else None}
+
+
 def overview_categorias(movs: pd.DataFrame) -> list[dict]:
     """Estado de cuenta resumido: comprobados por categoría + no necesarios + sin comprobar + pendientes.
     Las filas suman exactamente el total del estado de cuenta. Cada fila: rubro, grupo, n, monto."""
@@ -676,6 +711,7 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
     marcar: list[bool] = []
     resumen_filas: list[dict] = []
     nn, sc, pe = [], [], []
+    resumenes_tarjeta: list[tuple[str, str, dict]] = []
     for c in conjuntos:
         filas, resaltar = filas_comprobados(c["sols"], c["gastos"], c["env_g"], c.get("applicant") or "")
         por_gasto: dict[str, tuple[str, float]] = {}
@@ -688,11 +724,16 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
             if f.get("Expense Outflow Amt") is not None:
                 por_gasto[f["_gasto"]] = (f["_estatus"], float(f["Expense Outflow Amt"]))
         cu = cuadre(con_devolucion(c["movs"], c["gastos"]))
+        rt = resumen_tarjeta(cu, saldo_final(c["movs"]), c.get("limite"))
+        resumenes_tarjeta.append((c["cuenta"], c["periodo"], rt))
         fila = {"Cuenta": c["cuenta"], "Mes": c["periodo"]}
         for est, nombre in ESTADOS_CUADRE:
             fila[f"{nombre} (mov.)"] = cu["por_estado"][est]["n"]
             fila[f"{nombre} ($)"] = cu["por_estado"][est]["monto"]
         fila["Pendientes: devolución del colaborador ($)"] = cu["devolucion"]["monto"]
+        fila["Balance ($)"] = rt["balance"]
+        fila["Total card / límite ($)"] = rt["limite"]
+        fila["Diferencia vs. tarjeta ($)"] = rt["diferencia"]
         fila["Total (mov.)"] = cu["n_total"]
         fila["Total ($)"] = cu["monto_total"]
         fila["Cuadra"] = "Sí" if cu["cuadra"] else "No"
@@ -752,6 +793,30 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
                         ws.write_number(r, i, float(v), dinero_am)
                     else:
                         ws.write(r, i, v, texto_am)
+            # Resumen de la tarjeta (uno por cuenta y mes) al pie de la hoja
+            fila_x = len(df) + 3
+            lbl = wb.add_format({"bold": True}); lbl_g = wb.add_format({"bold": True, "top": 1})
+            val = wb.add_format({"num_format": FORMATO_DINERO}); val_g = wb.add_format({"bold": True, "top": 1, "num_format": FORMATO_DINERO})
+            tit = wb.add_format({"bold": True, "bg_color": "#E5E7EB", "border": 1})
+            for cta_n, mes_n, rt in resumenes_tarjeta:
+                ws.merge_range(fila_x, 0, fila_x, 3, f"Resumen de la tarjeta · {cta_n} · {mes_n}", tit)
+                lineas = [("Total comprobados", rt["comprobados"], False), ("PENDIENTE DE REEMBOLSO", rt["pendientes"], False)]
+                if rt["sin_comprobar"]:
+                    lineas.append(("SIN COMPROBAR", rt["sin_comprobar"], False))
+                r0 = fila_x + 1
+                for k, (n, v, _) in enumerate(lineas):
+                    ws.merge_range(r0 + k, 0, r0 + k, 2, n, lbl); ws.write_number(r0 + k, 3, v, val)
+                r = r0 + len(lineas)
+                ws.merge_range(r, 0, r, 2, "Subtotal", lbl_g); ws.write_formula(r, 3, f"=SUM(D{r0 + 1}:D{r})", val_g, rt["subtotal"])
+                if rt["balance"] is not None:
+                    ws.merge_range(r + 1, 0, r + 1, 2, "BALANCE (saldo de la cuenta)", lbl); ws.write_number(r + 1, 3, rt["balance"], val)
+                    ws.merge_range(r + 2, 0, r + 2, 2, "Subtotal + balance", lbl); ws.write_formula(r + 2, 3, f"=D{r + 1}+D{r + 2}", val, rt["suma"])
+                    r += 2
+                if rt["limite"] is not None:
+                    ws.merge_range(r + 1, 0, r + 1, 2, "DIFERENCIA", lbl); ws.write_formula(r + 1, 3, f"=D{r + 3}-D{r + 1}", val, rt["diferencia"])
+                    ws.merge_range(r + 2, 0, r + 2, 2, "Total card (límite)", lbl_g); ws.write_number(r + 2, 3, rt["limite"], val_g)
+                    r += 2
+                fila_x = r + 3
             escritas += 1
         for clave, nombre, listas, anchos in (
                 ("no_necesarios", "No necesarios", nn, {"Cuenta": 16, "Mes": 9, "Fecha Estado": 14, "Descripción Estado": 46, "Monto Estado": 16, "Nota del revisor": 40}),
