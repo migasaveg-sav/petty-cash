@@ -1817,7 +1817,7 @@ def _vista_revisor(sb) -> None:
         if cuenta.get("limite_reembolso"):
             st.caption(f"Límite de reembolso: {money_md(cuenta['limite_reembolso'])}")
 
-    secciones = ["📥 Cola de revisión", "🏦 Estado de cuenta", "💸 Lotes y pagos", "↩️ Devoluciones", "📊 Resumen y cierre de mes", "⬇️ Descargas"]
+    secciones = ["📥 Cola de revisión", "🏦 Estado de cuenta", "💸 Lotes y pagos", "💳 Pagos y reembolsos", "↩️ Devoluciones", "📊 Resumen y cierre de mes", "⬇️ Descargas"]
     elegida = st.segmented_control("Sección", secciones, default=secciones[0], label_visibility="collapsed", key="rev_seccion")
     vista = elegida or st.session_state.get("_rev_seccion_ult", secciones[0])
     st.session_state["_rev_seccion_ult"] = vista
@@ -1829,8 +1829,10 @@ def _vista_revisor(sb) -> None:
     elif vista == secciones[2]:
         _lotes_revisor(sb, cuenta, cuentas, periodos)
     elif vista == secciones[3]:
-        _devoluciones_revisor(sb, cuenta, cuentas, periodos)
+        _pagos_reembolsos(sb, cuenta, cuentas, periodos, revisor=True)
     elif vista == secciones[4]:
+        _devoluciones_revisor(sb, cuenta, cuentas, periodos)
+    elif vista == secciones[5]:
         _resumen_revisor(sb, cuentas, periodo)
     else:
         _descargas_revisor(sb, cuentas, periodos, cuenta, periodo)
@@ -2325,14 +2327,139 @@ def _devoluciones_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[
         f1, f2 = st.columns(2)
         fecha = f1.date_input("Fecha en que se devolvió", value=hoy_cdmx(), key=f"dv_f_{d['id']}")
         ref = f2.text_input("Referencia del depósito / transferencia", key=f"dv_r_{d['id']}")
+        arch_dev = st.file_uploader("📎 Comprobante de la devolución (PDF o foto, opcional)", type=FORMATOS_COMPROBANTE_PAGO,
+                                    key=f"dv_a_{d['id']}_{st.session_state.get('dv_ver', 0)}")
         if st.button("✅ Registrar devolución recibida", type="primary", key=f"dv_b_{d['id']}"):
+            subidas: list[str] = []
             try:
-                db.registrar_devolucion_recibida(sb, d["id"], fecha, ref)
+                dato, subidas = _subir_comprobante(sb, d["cuenta_id"], _preparar_comprobante(arch_dev))
+                db.registrar_devolucion_recibida(sb, d["id"], fecha, ref, dato)
+                st.session_state["dv_ver"] = st.session_state.get("dv_ver", 0) + 1
                 _nueva_tabla_rev()
                 _flash("Devolución registrada.")
                 st.rerun()
             except db.ErrorNube as e:
+                db.borrar_adjuntos_huerfanos(sb, subidas)
                 st.error(str(e))
+
+
+FORMATOS_COMPROBANTE_PAGO = ["pdf", "jpg", "jpeg", "png"]
+
+
+def _preparar_comprobante(archivo) -> tuple[bytes, dict] | None:
+    """Comprime el archivo subido (PDF o foto) a PDF. None si no se eligió archivo; muestra el error si no se pudo leer."""
+    if archivo is None:
+        return None
+    try:
+        return adj.comprimir_a_pdf(archivo.getvalue(), archivo.name)
+    except adj.AdjuntoError as e:
+        raise db.ErrorNube(str(e)) from e
+
+
+def _subir_comprobante(sb, cuenta_id: str, preparado: tuple[bytes, dict] | None) -> tuple[dict | None, list[str]]:
+    """Sube el PDF al almacén y regresa ({ruta, ...} para el RPC, [rutas subidas para limpiar si falla el RPC])."""
+    if not preparado:
+        return None, []
+    pdf, info = preparado
+    ruta = db.subir_adjunto(sb, cuenta_id, hoy_cdmx().strftime("%Y-%m"), pdf)
+    return {"ruta": ruta, **{k: info[k] for k in ("nombre_original", "bytes_original", "bytes_final", "sha256")}}, [ruta]
+
+
+def _boton_comprobante(sb, adjunto: dict | None, key: str) -> None:
+    """Abre el comprobante en una pestaña nueva (o en el visor integrado)."""
+    if not adjunto:
+        st.caption("Sin comprobante adjunto.")
+        return
+    url = db.url_firmada(sb, adjunto["ruta"])
+    if url:
+        st.link_button("📎 Abrir comprobante", url)
+    elif st.button("📎 Ver comprobante", key=key):
+        st.session_state.adj_ver = adjunto["ruta"]
+
+
+def _pagos_reembolsos(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict], revisor: bool) -> None:
+    """Pagos de lotes (reembolsos a la cuenta) y devoluciones recibidas del colaborador, cada uno con su comprobante.
+    El revisor puede adjuntar o reemplazar el comprobante; el aplicante solo lo ve y lo descarga."""
+    nombre_cta = {c["id"]: c["nombre"] for c in cuentas}
+    mes = {p["id"]: db.etiqueta_periodo(p) for p in periodos}
+    todas = False
+    if revisor:
+        c1, c2 = st.columns([1.4, 1.4])
+        todas = c1.radio("Mostrar", ["Esta cuenta", "Todas las cuentas"], horizontal=True, key="pr_alc") == "Todas las cuentas"
+        tipo_f = c2.radio("Tipo", ["Todos", "Pagos de lotes", "Devoluciones recibidas"], horizontal=True, key="pr_tipo")
+    else:
+        tipo_f = st.radio("Mostrar", ["Todos", "Pagos de lotes", "Devoluciones recibidas"], horizontal=True, key="pr_tipo_apl")
+    cid = None if todas else cuenta["id"]
+    try:
+        pagos = db.listar_pagos_cuenta(sb, cid)
+    except db.ErrorNube as e:
+        st.error(f"{e} (¿ya corriste el script 017?)")
+        return
+    try:
+        devs = [d for d in db.listar_devoluciones(sb, cid) if d["estado"] == "devuelto"]
+    except db.ErrorNube:
+        devs = []
+    lotes = db.listar_lotes(sb, cid)
+    por_pagar = sum(_saldo_de(l) for l in lotes if l["estado"] == "por_pagar")
+    k = st.columns(3)
+    k[0].markdown(estilos.tarjeta("Pagado", f"{len(pagos)} pago(s)", estilos.money_html(sum(float(p["monto"]) for p in pagos)), "comprobado"), unsafe_allow_html=True)
+    k[1].markdown(estilos.tarjeta("Por pagar (saldo)", f"{sum(1 for l in lotes if l['estado'] == 'por_pagar')} lote(s)", estilos.money_html(por_pagar), "alerta"), unsafe_allow_html=True)
+    k[2].markdown(estilos.tarjeta("Devoluciones recibidas", f"{len(devs)}", estilos.money_html(sum(float(d['monto']) for d in devs)), "acento"), unsafe_allow_html=True)
+
+    filas: list[dict] = []
+    for p in pagos:
+        l = p.get("lote") or {}
+        filas.append({"_k": ("pago", p["id"]), "_o": p, "Tipo": "💸 Pago de lote", "Fecha": str(p["fecha_pago"]), "Cuenta": nombre_cta.get(p["cuenta_id"], ""),
+                      "Mes": mes.get(l.get("periodo_id"), ""), "Detalle": f"Lote {l.get('numero', '')} · {l.get('num_gastos', '')} gasto(s)",
+                      "Monto": float(p["monto"]), "Referencia": p.get("referencia") or "", "Comprobante": "📎 Sí" if p.get("adjunto") else "—"})
+    for d in devs:
+        s = d.get("solicitud") or {}
+        filas.append({"_k": ("dev", d["id"]), "_o": d, "Tipo": "↩️ Devolución del colaborador", "Fecha": str(d.get("devuelto_en") or ""), "Cuenta": nombre_cta.get(d["cuenta_id"], ""),
+                      "Mes": mes.get(s.get("periodo_id"), ""), "Detalle": f"Sol. #{s.get('numero', '')} · {TIPO_DEVOLUCION.get(d['tipo'], d['tipo'])} · {s.get('employee_name') or ''}",
+                      "Monto": float(d["monto"]), "Referencia": d.get("devuelto_ref") or "", "Comprobante": "📎 Sí" if d.get("devuelto_adjunto") else "—"})
+    if tipo_f == "Pagos de lotes":
+        filas = [f for f in filas if f["_k"][0] == "pago"]
+    elif tipo_f == "Devoluciones recibidas":
+        filas = [f for f in filas if f["_k"][0] == "dev"]
+    filas.sort(key=lambda f: f["Fecha"], reverse=True)
+    if not filas:
+        st.info("Todavía no hay pagos ni devoluciones registrados." if revisor else "Todavía no se ha registrado ningún pago de tus gastos. Cuando el revisor pague un lote, aparecerá aquí.")
+        return
+    cols = ["Tipo", "Fecha", *(["Cuenta"] if revisor and todas else []), "Mes", "Detalle", "Monto", "Referencia", "Comprobante"]
+    tabla = pd.DataFrame(filas)[cols]
+    ev = st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 380),
+                      on_select="rerun", selection_mode="single-row",
+                      key=f"tabla_pr_{st.session_state.get('rev_ver', 0)}_{revisor}_{todas}_{tipo_f}_{_firma(f['_k'][1] for f in filas)}",
+                      column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
+    sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(filas)]
+    if not sel:
+        st.caption("Selecciona un renglón para abrir su comprobante" + (" o adjuntarlo." if revisor else "."))
+        return
+    f = filas[sel[0]]
+    o = f["_o"]
+    es_pago = f["_k"][0] == "pago"
+    adjunto = o.get("adjunto") if es_pago else o.get("devuelto_adjunto")
+    with st.container(border=True):
+        st.markdown(f"**{f['Tipo']}** · {money_md(f['Monto'])} · {f['Fecha']} · referencia {f['Referencia'] or '—'}")
+        st.caption(f["Detalle"])
+        _boton_comprobante(sb, adjunto, f"pr_ver_{f['_k'][1]}")
+        if revisor:
+            v = st.session_state.get("pr_up_ver", 0)
+            arch = st.file_uploader("📎 " + ("Reemplazar comprobante" if adjunto else "Adjuntar comprobante") + " (PDF o foto)", type=FORMATOS_COMPROBANTE_PAGO,
+                                    key=f"pr_up_{f['_k'][1]}_{v}")
+            if st.button("Guardar comprobante", type="primary", key=f"pr_gb_{f['_k'][1]}", disabled=arch is None):
+                subidas: list[str] = []
+                try:
+                    prep = _preparar_comprobante(arch)
+                    dato, subidas = _subir_comprobante(sb, o["cuenta_id"], prep)
+                    (db.adjuntar_comprobante_pago if es_pago else db.adjuntar_comprobante_devolucion)(sb, o["id"], dato)
+                    st.session_state["pr_up_ver"] = v + 1
+                    _nueva_tabla_rev()
+                    _flash("Comprobante guardado.")
+                    st.rerun()
+                except db.ErrorNube as e:
+                    db.borrar_adjuntos_huerfanos(sb, subidas)
+                    st.error(str(e))
 
 
 def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) -> None:
@@ -2393,16 +2520,22 @@ def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) 
                 monto = st.number_input("Monto a pagar ahora", min_value=0.0, max_value=float(saldo), value=float(saldo), step=100.0, format="%.2f", key=f"pg_m_{lote['id']}_{saldo}")
                 fecha = st.date_input("Fecha de pago", value=hoy_cdmx(), key=f"pg_f_{lote['id']}")
                 ref = st.text_input("Referencia / folio de pago (por ejemplo AP-MX o PY-MX)", key=f"pg_r_{lote['id']}")
+                arch_pago = st.file_uploader("📎 Comprobante de pago (PDF o foto, opcional)", type=FORMATOS_COMPROBANTE_PAGO,
+                                             key=f"pg_a_{lote['id']}_{st.session_state.get('pg_ver', 0)}")
                 quedara = round(saldo - monto, 2)
                 st.caption("Con este pago el lote queda **pagado por completo**." if quedara <= 0.005 else f"Con este pago quedará un saldo de **{money_md(quedara)}**.")
                 if st.button("✅ Registrar pago", type="primary", key=f"pg_b_{lote['id']}", disabled=monto <= 0):
+                    subidas: list[str] = []
                     try:
-                        db.registrar_pago_lote(sb, lote["id"], fecha, monto, ref)
+                        dato, subidas = _subir_comprobante(sb, lote["cuenta_id"], _preparar_comprobante(arch_pago))
+                        db.registrar_pago_lote(sb, lote["id"], fecha, monto, ref, dato)
+                        st.session_state["pg_ver"] = st.session_state.get("pg_ver", 0) + 1
                         _nueva_tabla_rev()
                         _flash("Pago completo registrado: el aplicante ya lo ve como pagado." if quedara <= 0.005
                                else f"Pago parcial registrado. Saldo pendiente: {money_md(quedara)}.")
                         st.rerun()
                     except db.ErrorNube as e:
+                        db.borrar_adjuntos_huerfanos(sb, subidas)
                         st.error(str(e))
             with c2:
                 st.markdown("**↩️ Desbloquear lote**")
@@ -2619,7 +2752,7 @@ def main() -> None:
         return
 
     # Control de sección (en lugar de st.tabs) para conservar la sección elegida después de cada acción.
-    secciones = ["🧾 Bitácora", "🏦 Estado de cuenta", "📤 Enviados a comprobación", "🚩 Pendientes devueltos", "💸 Lotes y pagos"]
+    secciones = ["🧾 Bitácora", "🏦 Estado de cuenta", "📤 Enviados a comprobación", "🚩 Pendientes devueltos", "💸 Lotes y pagos", "💳 Pagos recibidos"]
     elegida = st.segmented_control("Sección", secciones, default=secciones[0], label_visibility="collapsed", key="seccion")
     vista = elegida or st.session_state.get("_seccion_ult", secciones[0])
     st.session_state["_seccion_ult"] = vista
@@ -2632,8 +2765,10 @@ def main() -> None:
         _tab_enviados(sb, cuenta, periodo, cerrado)
     elif vista == secciones[3]:
         _tab_pendientes(sb, cuenta)
-    else:
+    elif vista == secciones[4]:
         _tab_lotes(sb, cuenta, periodos)
+    else:
+        _pagos_reembolsos(sb, cuenta, [cuenta], periodos, revisor=False)
     _visor_adjunto(sb)
 
 
