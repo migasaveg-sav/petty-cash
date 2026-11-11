@@ -2377,55 +2377,128 @@ def _boton_comprobante(sb, adjunto: dict | None, key: str) -> None:
         st.session_state.adj_ver = adjunto["ruta"]
 
 
+def _mes_de(fecha) -> str:
+    return str(fecha)[:7]
+
+
+def _tarjeta_disponibilidad(sb, cuenta: dict) -> None:
+    """Cruce de fondos de la cuenta a una fecha de corte: gasto neto (sin «no necesarios») contra pagos acumulados y saldo de la tarjeta."""
+    st.markdown("##### 🧮 Disponibilidad de recursos")
+    corte = st.date_input("Fecha de corte", value=hoy_cdmx(), key=f"pr_corte_{cuenta['id']}",
+                          help="Considera los movimientos y los pagos con fecha hasta este día (de todos los meses).")
+    try:
+        movs = db.listar_movimientos(sb, cuenta["id"])
+        pagos = db.listar_pagos_cuenta(sb, cuenta["id"])
+    except db.ErrorNube:
+        st.caption("No se pudo calcular la disponibilidad.")
+        return
+    d = reportes.disponibilidad(movs, pagos, corte, cuenta.get("limite_reembolso"))
+    k = st.columns(4)
+    k[0].markdown(estilos.tarjeta("Gasto neto a la fecha", "sin «no necesarios»", estilos.money_html(d["gasto_neto"]), "acento"), unsafe_allow_html=True)
+    k[1].markdown(estilos.tarjeta("Pagado a la fecha", "AP / PY", estilos.money_html(d["pagado"]), "comprobado"), unsafe_allow_html=True)
+    xr = d["por_reponer"]
+    k[2].markdown(estilos.tarjeta("Por reponer" if xr >= 0 else "Fondos de sobra", "gasto neto − pagado", estilos.money_html(abs(xr)), "alerta" if xr > 0.005 else "comprobado"), unsafe_allow_html=True)
+    k[3].markdown(estilos.tarjeta("Saldo de la tarjeta", "estado de cuenta", estilos.money_html(d["saldo"]) if d["saldo"] is not None else "—", "pendiente"), unsafe_allow_html=True)
+    p = d["por_estado"]
+    st.caption(f"Gasto neto = comprobados {money_md(p['comprobado'])} + pendientes {money_md(p['en_espera'])} + sin comprobar {money_md(p['pendiente'])}. "
+               f"Excluye {money_md(d['no_necesarios'])} de «no necesarios».")
+    if d["limite"] is not None and d["saldo"] is not None:
+        gastado = d["gastado_limite"]
+        st.caption(f"Límite de la cuenta {money_md(d['limite'])}: saldo {money_md(d['saldo'])} → "
+                   + (f"gastado del límite {money_md(gastado)}." if gastado >= 0 else f"el saldo supera el límite por {money_md(-gastado)}."))
+    elif d["limite"] is None:
+        st.caption("Esta cuenta no tiene límite configurado (script 016).")
+
+
+def _form_pago(sb, cuenta: dict, periodos: list[dict]) -> None:
+    """Captura de un pago real: fecha, mes al que se aplica, número de AP o PY, monto y comprobante opcional."""
+    with st.expander("➕ Registrar pago", expanded=False):
+        v = st.session_state.get("pc_ver", 0)
+        f1, f2, f3 = st.columns(3)
+        fecha = f1.date_input("Fecha de pago", value=hoy_cdmx(), key=f"pc_f_{v}")
+        etiquetas = sorted({db.etiqueta_periodo(p) for p in periodos}, reverse=True)
+        mes_def = _mes_de(fecha)
+        mes = f2.selectbox("Mes al que se aplica", etiquetas, index=etiquetas.index(mes_def) if mes_def in etiquetas else 0, key=f"pc_m_{v}_{mes_def}")
+        ref = f3.text_input("Número de AP o PY", placeholder="AP-12345 / PY-6789", key=f"pc_r_{v}")
+        g1, g2 = st.columns([1, 2])
+        monto = g1.number_input("Monto pagado", min_value=0.0, step=100.0, format="%.2f", key=f"pc_mo_{v}")
+        nota = g2.text_input("Nota (opcional)", key=f"pc_n_{v}")
+        arch = st.file_uploader("📎 Comprobante de pago (PDF o foto, opcional)", type=FORMATOS_COMPROBANTE_PAGO, key=f"pc_a_{v}")
+        if st.button("✅ Registrar pago", type="primary", key=f"pc_b_{v}", disabled=monto <= 0 or not ref.strip()):
+            subidas: list[str] = []
+            try:
+                dato, subidas = _subir_comprobante(sb, cuenta["id"], _preparar_comprobante(arch))
+                db.registrar_pago_cuenta(sb, cuenta["id"], mes, fecha, ref, monto, nota, dato)
+                st.session_state["pc_ver"] = v + 1
+                _nueva_tabla_rev()
+                _flash(f"Pago de {money_md(monto)} registrado ({ref.strip()}).")
+                st.rerun()
+            except db.ErrorNube as e:
+                db.borrar_adjuntos_huerfanos(sb, subidas)
+                st.error(f"{e} (¿ya corriste el script 018?)" if "pagos_cuenta" in str(e) or "registrar_pago_cuenta" in str(e) else str(e))
+
+
 def _pagos_reembolsos(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict], revisor: bool) -> None:
-    """Pagos de lotes (reembolsos a la cuenta) y devoluciones recibidas del colaborador, cada uno con su comprobante.
-    El revisor puede adjuntar o reemplazar el comprobante; el aplicante solo lo ve y lo descarga."""
+    """Pagos reales por cuenta (independientes de los lotes) con su acumulado por mes y comprobante, más las devoluciones recibidas.
+    El revisor captura, edita y anula; el aplicante solo ve y descarga."""
     nombre_cta = {c["id"]: c["nombre"] for c in cuentas}
-    mes = {p["id"]: db.etiqueta_periodo(p) for p in periodos}
     todas = False
     if revisor:
+        _tarjeta_disponibilidad(sb, cuenta)
+        st.divider()
+        _form_pago(sb, cuenta, periodos)
         c1, c2 = st.columns([1.4, 1.4])
         todas = c1.radio("Mostrar", ["Esta cuenta", "Todas las cuentas"], horizontal=True, key="pr_alc") == "Todas las cuentas"
-        tipo_f = c2.radio("Tipo", ["Todos", "Pagos de lotes", "Devoluciones recibidas"], horizontal=True, key="pr_tipo")
+        tipo_f = c2.radio("Tipo", ["Todos", "Pagos", "Devoluciones recibidas"], horizontal=True, key="pr_tipo")
     else:
-        tipo_f = st.radio("Mostrar", ["Todos", "Pagos de lotes", "Devoluciones recibidas"], horizontal=True, key="pr_tipo_apl")
+        tipo_f = st.radio("Mostrar", ["Todos", "Pagos", "Devoluciones recibidas"], horizontal=True, key="pr_tipo_apl")
     cid = None if todas else cuenta["id"]
     try:
         pagos = db.listar_pagos_cuenta(sb, cid)
     except db.ErrorNube as e:
-        st.error(f"{e} (¿ya corriste el script 017?)")
+        st.error(f"{e} (¿ya corriste el script 018?)")
         return
     try:
         devs = [d for d in db.listar_devoluciones(sb, cid) if d["estado"] == "devuelto"]
     except db.ErrorNube:
         devs = []
-    lotes = db.listar_lotes(sb, cid)
-    por_pagar = sum(_saldo_de(l) for l in lotes if l["estado"] == "por_pagar")
+    total_pagado = sum(float(p["monto"]) for p in pagos)
     k = st.columns(3)
-    k[0].markdown(estilos.tarjeta("Pagado", f"{len(pagos)} pago(s)", estilos.money_html(sum(float(p["monto"]) for p in pagos)), "comprobado"), unsafe_allow_html=True)
-    k[1].markdown(estilos.tarjeta("Por pagar (saldo)", f"{sum(1 for l in lotes if l['estado'] == 'por_pagar')} lote(s)", estilos.money_html(por_pagar), "alerta"), unsafe_allow_html=True)
-    k[2].markdown(estilos.tarjeta("Devoluciones recibidas", f"{len(devs)}", estilos.money_html(sum(float(d['monto']) for d in devs)), "acento"), unsafe_allow_html=True)
+    k[0].markdown(estilos.tarjeta("Pagado (acumulado)", f"{len(pagos)} pago(s)", estilos.money_html(total_pagado), "comprobado"), unsafe_allow_html=True)
+    ult = pagos[0] if pagos else None
+    k[1].markdown(estilos.tarjeta("Último pago", str(ult["fecha_pago"]) if ult else "—", estilos.money_html(float(ult["monto"])) if ult else "", "acento"), unsafe_allow_html=True)
+    k[2].markdown(estilos.tarjeta("Devoluciones recibidas", f"{len(devs)}", estilos.money_html(sum(float(d['monto']) for d in devs)), "pendiente"), unsafe_allow_html=True)
+
+    if pagos:
+        st.markdown("##### 📅 Acumulado por mes")
+        filas_m = []
+        for cid_ in dict.fromkeys(p["cuenta_id"] for p in pagos):
+            for r in reportes.acumulado_pagos([p for p in pagos if p["cuenta_id"] == cid_]):
+                filas_m.append({**({"Cuenta": nombre_cta.get(cid_, "")} if todas else {}), "Mes": r["mes"], "Pagos": r["n"],
+                                "Pagado en el mes": r["monto"], "Acumulado": r["acumulado"]})
+        st.dataframe(pd.DataFrame(filas_m), hide_index=True, use_container_width=True,
+                     column_config={"Pagado en el mes": st.column_config.NumberColumn(format="$%.2f"), "Acumulado": st.column_config.NumberColumn(format="$%.2f")})
 
     filas: list[dict] = []
     for p in pagos:
-        l = p.get("lote") or {}
-        filas.append({"_k": ("pago", p["id"]), "_o": p, "Tipo": "💸 Pago de lote", "Fecha": str(p["fecha_pago"]), "Cuenta": nombre_cta.get(p["cuenta_id"], ""),
-                      "Mes": mes.get(l.get("periodo_id"), ""), "Detalle": f"Lote {l.get('numero', '')} · {l.get('num_gastos', '')} gasto(s)",
-                      "Monto": float(p["monto"]), "Referencia": p.get("referencia") or "", "Comprobante": "📎 Sí" if p.get("adjunto") else "—"})
+        filas.append({"_k": ("pago", p["id"]), "_o": p, "Tipo": "💸 Pago", "Fecha": str(p["fecha_pago"]), "Cuenta": nombre_cta.get(p["cuenta_id"], ""),
+                      "Mes": p["mes"], "Detalle": p.get("nota") or "", "Monto": float(p["monto"]), "Referencia": p.get("referencia") or "",
+                      "Comprobante": "📎 Sí" if p.get("adjunto") else "—"})
+    mes_p = {pp["id"]: db.etiqueta_periodo(pp) for pp in periodos}
     for d in devs:
         s = d.get("solicitud") or {}
         filas.append({"_k": ("dev", d["id"]), "_o": d, "Tipo": "↩️ Devolución del colaborador", "Fecha": str(d.get("devuelto_en") or ""), "Cuenta": nombre_cta.get(d["cuenta_id"], ""),
-                      "Mes": mes.get(s.get("periodo_id"), ""), "Detalle": f"Sol. #{s.get('numero', '')} · {TIPO_DEVOLUCION.get(d['tipo'], d['tipo'])} · {s.get('employee_name') or ''}",
+                      "Mes": mes_p.get(s.get("periodo_id"), ""), "Detalle": f"Sol. #{s.get('numero', '')} · {TIPO_DEVOLUCION.get(d['tipo'], d['tipo'])} · {s.get('employee_name') or ''}",
                       "Monto": float(d["monto"]), "Referencia": d.get("devuelto_ref") or "", "Comprobante": "📎 Sí" if d.get("devuelto_adjunto") else "—"})
-    if tipo_f == "Pagos de lotes":
+    if tipo_f == "Pagos":
         filas = [f for f in filas if f["_k"][0] == "pago"]
     elif tipo_f == "Devoluciones recibidas":
         filas = [f for f in filas if f["_k"][0] == "dev"]
     filas.sort(key=lambda f: f["Fecha"], reverse=True)
     if not filas:
-        st.info("Todavía no hay pagos ni devoluciones registrados." if revisor else "Todavía no se ha registrado ningún pago de tus gastos. Cuando el revisor pague un lote, aparecerá aquí.")
+        st.info("Todavía no hay pagos registrados." if revisor else "Todavía no se ha registrado ningún pago en tu cuenta. Cuando el revisor registre uno, aparecerá aquí.")
         return
-    cols = ["Tipo", "Fecha", *(["Cuenta"] if revisor and todas else []), "Mes", "Detalle", "Monto", "Referencia", "Comprobante"]
+    cols = ["Tipo", "Fecha", *(["Cuenta"] if revisor and todas else []), "Mes", "Referencia", "Monto", "Detalle", "Comprobante"]
     tabla = pd.DataFrame(filas)[cols]
     ev = st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(36 * (len(tabla) + 1) + 4, 380),
                       on_select="rerun", selection_mode="single-row",
@@ -2433,33 +2506,65 @@ def _pagos_reembolsos(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict
                       column_config={"Monto": st.column_config.NumberColumn("Monto", format="$%.2f")})
     sel = [i for i in (ev.selection.rows if ev and ev.selection else []) if i < len(filas)]
     if not sel:
-        st.caption("Selecciona un renglón para abrir su comprobante" + (" o adjuntarlo." if revisor else "."))
+        st.caption("Selecciona un renglón para abrir su comprobante" + (", editarlo o anularlo." if revisor else "."))
         return
     f = filas[sel[0]]
     o = f["_o"]
     es_pago = f["_k"][0] == "pago"
     adjunto = o.get("adjunto") if es_pago else o.get("devuelto_adjunto")
     with st.container(border=True):
-        st.markdown(f"**{f['Tipo']}** · {money_md(f['Monto'])} · {f['Fecha']} · referencia {f['Referencia'] or '—'}")
-        st.caption(f["Detalle"])
+        st.markdown(f"**{f['Tipo']}** · {money_md(f['Monto'])} · {f['Fecha']} · {f['Referencia'] or '—'}")
+        if f["Detalle"]:
+            st.caption(f["Detalle"])
+        if es_pago and o.get("editado_motivo"):
+            st.caption(f"✏️ Editado: {o['editado_motivo']}")
         _boton_comprobante(sb, adjunto, f"pr_ver_{f['_k'][1]}")
-        if revisor:
-            v = st.session_state.get("pr_up_ver", 0)
-            arch = st.file_uploader("📎 " + ("Reemplazar comprobante" if adjunto else "Adjuntar comprobante") + " (PDF o foto)", type=FORMATOS_COMPROBANTE_PAGO,
-                                    key=f"pr_up_{f['_k'][1]}_{v}")
-            if st.button("Guardar comprobante", type="primary", key=f"pr_gb_{f['_k'][1]}", disabled=arch is None):
-                subidas: list[str] = []
-                try:
-                    prep = _preparar_comprobante(arch)
-                    dato, subidas = _subir_comprobante(sb, o["cuenta_id"], prep)
-                    (db.adjuntar_comprobante_pago if es_pago else db.adjuntar_comprobante_devolucion)(sb, o["id"], dato)
-                    st.session_state["pr_up_ver"] = v + 1
-                    _nueva_tabla_rev()
-                    _flash("Comprobante guardado.")
-                    st.rerun()
-                except db.ErrorNube as e:
-                    db.borrar_adjuntos_huerfanos(sb, subidas)
-                    st.error(str(e))
+        if not revisor:
+            return
+        v = st.session_state.get("pr_up_ver", 0)
+        arch = st.file_uploader("📎 " + ("Reemplazar comprobante" if adjunto else "Adjuntar comprobante") + " (PDF o foto)", type=FORMATOS_COMPROBANTE_PAGO,
+                                key=f"pr_up_{f['_k'][1]}_{v}")
+        if st.button("Guardar comprobante", key=f"pr_gb_{f['_k'][1]}", disabled=arch is None):
+            subidas: list[str] = []
+            try:
+                dato, subidas = _subir_comprobante(sb, o["cuenta_id"], _preparar_comprobante(arch))
+                (db.adjuntar_comprobante_pago_cuenta if es_pago else db.adjuntar_comprobante_devolucion)(sb, o["id"], dato)
+                st.session_state["pr_up_ver"] = v + 1
+                _nueva_tabla_rev()
+                _flash("Comprobante guardado.")
+                st.rerun()
+            except db.ErrorNube as e:
+                db.borrar_adjuntos_huerfanos(sb, subidas)
+                st.error(str(e))
+        if not es_pago:
+            return
+        st.markdown("**✏️ Editar o anular este pago**")
+        e1, e2, e3 = st.columns(3)
+        n_fecha = e1.date_input("Fecha de pago", value=pd.to_datetime(o["fecha_pago"]).date(), key=f"pe_f_{o['id']}")
+        etiquetas = sorted({db.etiqueta_periodo(pp) for pp in periodos} | {o["mes"]}, reverse=True)
+        n_mes = e2.selectbox("Mes al que se aplica", etiquetas, index=etiquetas.index(o["mes"]), key=f"pe_m_{o['id']}")
+        n_ref = e3.text_input("Número de AP o PY", value=o.get("referencia") or "", key=f"pe_r_{o['id']}")
+        h1, h2 = st.columns([1, 2])
+        n_monto = h1.number_input("Monto pagado", min_value=0.01, value=float(o["monto"]), step=100.0, format="%.2f", key=f"pe_mo_{o['id']}")
+        n_nota = h2.text_input("Nota", value=o.get("nota") or "", key=f"pe_n_{o['id']}")
+        motivo = st.text_input("Motivo del cambio o de la anulación (obligatorio)", key=f"pe_mt_{o['id']}")
+        b1, b2 = st.columns(2)
+        if b1.button("💾 Guardar cambios", type="primary", key=f"pe_g_{o['id']}", disabled=not motivo.strip()):
+            try:
+                db.editar_pago_cuenta(sb, o["id"], n_mes, n_fecha, n_ref, n_monto, n_nota, motivo)
+                _nueva_tabla_rev()
+                _flash("Pago actualizado.")
+                st.rerun()
+            except db.ErrorNube as e:
+                st.error(str(e))
+        if b2.button("🗑️ Anular pago", key=f"pe_a_{o['id']}", disabled=not motivo.strip()):
+            try:
+                db.anular_pago_cuenta(sb, o["id"], motivo)
+                _nueva_tabla_rev()
+                _flash("Pago anulado.")
+                st.rerun()
+            except db.ErrorNube as e:
+                st.error(str(e))
 
 
 def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) -> None:
@@ -2514,29 +2619,9 @@ def _lotes_revisor(sb, cuenta: dict, cuentas: list[dict], periodos: list[dict]) 
         else:
             c1, c2 = st.columns(2)
             with c1:
-                saldo = _saldo_de(lote)
-                st.markdown("**💸 Registrar pago** (total o parcial)")
-                st.caption("Puedes pagar el lote en varios pagos. Queda «Pagado» (y el aplicante lo ve así) cuando lo pagado alcanza el monto del lote.")
-                monto = st.number_input("Monto a pagar ahora", min_value=0.0, max_value=float(saldo), value=float(saldo), step=100.0, format="%.2f", key=f"pg_m_{lote['id']}_{saldo}")
-                fecha = st.date_input("Fecha de pago", value=hoy_cdmx(), key=f"pg_f_{lote['id']}")
-                ref = st.text_input("Referencia / folio de pago (por ejemplo AP-MX o PY-MX)", key=f"pg_r_{lote['id']}")
-                arch_pago = st.file_uploader("📎 Comprobante de pago (PDF o foto, opcional)", type=FORMATOS_COMPROBANTE_PAGO,
-                                             key=f"pg_a_{lote['id']}_{st.session_state.get('pg_ver', 0)}")
-                quedara = round(saldo - monto, 2)
-                st.caption("Con este pago el lote queda **pagado por completo**." if quedara <= 0.005 else f"Con este pago quedará un saldo de **{money_md(quedara)}**.")
-                if st.button("✅ Registrar pago", type="primary", key=f"pg_b_{lote['id']}", disabled=monto <= 0):
-                    subidas: list[str] = []
-                    try:
-                        dato, subidas = _subir_comprobante(sb, lote["cuenta_id"], _preparar_comprobante(arch_pago))
-                        db.registrar_pago_lote(sb, lote["id"], fecha, monto, ref, dato)
-                        st.session_state["pg_ver"] = st.session_state.get("pg_ver", 0) + 1
-                        _nueva_tabla_rev()
-                        _flash("Pago completo registrado: el aplicante ya lo ve como pagado." if quedara <= 0.005
-                               else f"Pago parcial registrado. Saldo pendiente: {money_md(quedara)}.")
-                        st.rerun()
-                    except db.ErrorNube as e:
-                        db.borrar_adjuntos_huerfanos(sb, subidas)
-                        st.error(str(e))
+                st.markdown("**💳 Pagos**")
+                st.info("Los pagos ya no se registran por lote: se capturan en **💳 Pagos y reembolsos** (fecha, mes, número de AP/PY y monto), "
+                        "porque lo que se paga depende de la liquidez y no coincide con los lotes aprobados.")
             with c2:
                 st.markdown("**↩️ Desbloquear lote**")
                 st.caption("Anula el lote y regresa sus solicitudes a «Por revisar». Solo si aún no tiene ningún pago.")
