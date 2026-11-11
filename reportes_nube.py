@@ -296,6 +296,44 @@ def resumen_tarjeta(cu: dict, balance: float | None, limite: float | None) -> di
             "diferencia": round(lim - suma, 2) if lim is not None else None}
 
 
+def acumulado_pagos(pagos: list[dict]) -> list[dict]:
+    """Pagos por mes de aplicación: cuántos, cuánto se pagó en el mes y el acumulado corrido (de lo más antiguo a lo más reciente)."""
+    por: dict[str, list[dict]] = {}
+    for p in pagos:
+        if p.get("anulado"):
+            continue
+        por.setdefault(str(p["mes"]), []).append(p)
+    out, acum = [], 0.0
+    for mes in sorted(por):
+        m = round(sum(float(p["monto"]) for p in por[mes]), 2)
+        acum = round(acum + m, 2)
+        out.append({"mes": mes, "n": len(por[mes]), "monto": m, "acumulado": acum})
+    return out
+
+
+def disponibilidad(movs: pd.DataFrame, pagos: list[dict], corte, limite: float | None) -> dict:
+    """Cruce de fondos de la cuenta a una fecha de corte (movimientos y pagos con fecha ≤ corte).
+    gasto_neto = comprobados + pendientes + sin comprobar, SIN los «no necesarios».
+    por_reponer = gasto_neto − pagos acumulados (negativo: hay fondos de sobra).
+    saldo = saldo de la tarjeta tras el último movimiento a la fecha; gastado_limite = límite − saldo."""
+    corte_s = str(corte)
+    m = movs.copy() if movs is not None else pd.DataFrame(columns=["fecha", "monto", "estado", "saldo"])
+    if len(m):
+        m = m[m["fecha"].astype(str) <= corte_s]
+    por: dict[str, float] = {}
+    for est in ("comprobado", "en_espera", "pendiente"):
+        sub = m[m["estado"] == est] if len(m) else m
+        por[est] = round(float(sub["monto"].abs().sum()), 2) if len(sub) else 0.0
+    no_nec = round(float(m[m["estado"] == "no_necesario"]["monto"].abs().sum()), 2) if len(m) else 0.0
+    gasto = round(sum(por.values()), 2)
+    pagado = round(sum(float(p["monto"]) for p in pagos if not p.get("anulado") and str(p["fecha_pago"]) <= corte_s), 2)
+    saldo = saldo_final(m) if len(m) else None
+    lim = float(limite) if limite else None
+    return {"corte": corte_s, "por_estado": por, "no_necesarios": no_nec, "gasto_neto": gasto, "pagado": pagado,
+            "por_reponer": round(gasto - pagado, 2), "saldo": saldo, "limite": lim,
+            "gastado_limite": round(lim - saldo, 2) if lim is not None and saldo is not None else None}
+
+
 def overview_categorias(movs: pd.DataFrame) -> list[dict]:
     """Estado de cuenta resumido: comprobados por categoría + no necesarios + sin comprobar + pendientes.
     Las filas suman exactamente el total del estado de cuenta. Cada fila: rubro, grupo, n, monto."""
