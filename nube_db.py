@@ -518,24 +518,52 @@ def _adjuntos_por_id(sb, ids: list[str]) -> dict[str, dict]:
     return {a["id"]: a for a in _en_trozos(sb, "adjuntos", "id,ruta,nombre_original,bytes_final", "id", ids)}
 
 
-def listar_pagos_cuenta(sb, cuenta_id: str | None = None) -> list[dict]:
-    """Todos los pagos de lotes (de una cuenta o de todas), del más reciente al más antiguo, con su lote y su comprobante."""
+def listar_pagos_cuenta(sb, cuenta_id: str | None = None, incluir_anulados: bool = False) -> list[dict]:
+    """Pagos libres (script 018) de una cuenta o de todas, del más reciente al más antiguo, con su comprobante."""
     def construir():
-        q = sb.table("pagos_lote").select("*")
+        q = sb.table("pagos_cuenta").select("*")
         if cuenta_id:
             q = q.eq("cuenta_id", cuenta_id)
+        if not incluir_anulados:
+            q = q.eq("anulado", False)
         return q.order("fecha_pago", desc=True).order("creado_en", desc=True).order("id", desc=False)
     pagos = _paginado(construir)
-    if not pagos:
-        return []
-    lotes = {l["id"]: l for l in _en_trozos(sb, "lotes", "id,numero,periodo_id,monto,monto_pagado,estado,num_gastos", "id", list({p["lote_id"] for p in pagos}))}
     adj = _adjuntos_por_id(sb, [p.get("adjunto_id") for p in pagos])
-    return [{**p, "lote": lotes.get(p["lote_id"], {}), "adjunto": adj.get(p.get("adjunto_id"))} for p in pagos]
+    return [{**p, "adjunto": adj.get(p.get("adjunto_id"))} for p in pagos]
 
 
-def listar_pagos_lote(sb, lote_id: str) -> list[dict]:
-    return _ejecutar(sb.table("pagos_lote").select("*").eq("lote_id", lote_id).order("fecha_pago", desc=False)
-                     .order("creado_en", desc=False)) or []
+def registrar_pago_cuenta(sb, cuenta_id: str, mes: str, fecha, referencia: str, monto: float,
+                          nota: str | None = None, adjunto: dict | None = None) -> str:
+    if not (referencia or "").strip():
+        raise ErrorNube("Escribe el número de AP o PY.")
+    if not monto or float(monto) <= 0:
+        raise ErrorNube("El monto del pago debe ser mayor a cero.")
+    params = {"p_cuenta": cuenta_id, "p_mes": mes, "p_fecha": str(fecha), "p_referencia": referencia.strip(),
+              "p_monto": round(float(monto), 2), "p_nota": (nota or "").strip() or None}
+    if adjunto:
+        params["p_adjunto"] = adjunto
+    return _ejecutar(sb.rpc("registrar_pago_cuenta", params))
+
+
+def editar_pago_cuenta(sb, pago_id: str, mes: str, fecha, referencia: str, monto: float, nota: str | None, motivo: str) -> None:
+    if not (motivo or "").strip():
+        raise ErrorNube("Escribe el motivo del cambio.")
+    if not (referencia or "").strip():
+        raise ErrorNube("Escribe el número de AP o PY.")
+    if not monto or float(monto) <= 0:
+        raise ErrorNube("El monto del pago debe ser mayor a cero.")
+    _ejecutar(sb.rpc("editar_pago_cuenta", {"p_pago": pago_id, "p_mes": mes, "p_fecha": str(fecha), "p_referencia": referencia.strip(),
+                                            "p_monto": round(float(monto), 2), "p_nota": (nota or "").strip() or None, "p_motivo": motivo.strip()}))
+
+
+def anular_pago_cuenta(sb, pago_id: str, motivo: str) -> None:
+    if not (motivo or "").strip():
+        raise ErrorNube("Escribe el motivo de la anulación.")
+    _ejecutar(sb.rpc("anular_pago_cuenta", {"p_pago": pago_id, "p_motivo": motivo.strip()}))
+
+
+def adjuntar_comprobante_pago_cuenta(sb, pago_id: str, adjunto: dict) -> None:
+    _ejecutar(sb.rpc("adjuntar_comprobante_pago_cuenta", {"p_pago": pago_id, "p_adjunto": adjunto}))
 
 
 def reclasificar_fuente_facturas(sb, factura_ids: list[str], fuente: str, motivo: str) -> int:
