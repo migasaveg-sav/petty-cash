@@ -1,808 +1,976 @@
-"""Capa de datos del Petty Cash en la nube (Supabase).
+"""Reportes de la nube: lote por enviar y Excel del mes (mismo formato que el de la app anterior).
 
-Todas las funciones reciben el cliente de Supabase `sb` ya autenticado con el
-usuario (los permisos por cuenta los aplica la base de datos, no esta capa).
-No importa Streamlit: se puede probar fuera de la interfaz.
-
-Convención: los errores de la base de datos se convierten en `ErrorNube` con un
-mensaje en español listo para mostrar al usuario.
+Funciones puras (no tocan la base): reciben datos ya consultados y devuelven filas o bytes.
 """
 from __future__ import annotations
 
 import datetime
-import re
-import uuid
+from io import BytesIO
 from typing import Any
 
 import pandas as pd
-from postgrest.exceptions import APIError
+from xlsxwriter.utility import xl_col_to_name
 
-BUCKET = "comprobantes"
-_PAGINA = 1000
+C_HEADER = "#DC143C"          # rojo de la bitácora
+C_AMARILLO = "#FFF2CC"        # fila con diferencia (dentro de tolerancia)
+C_GRIS = "#E5E7EB"
+FORMATO_DINERO = "$#,##0.00"
 
+NOMBRE_RESULTADO = {"aprobado": "Aprobado para pago", "devuelto": "Devuelto", "en_revision": "En revisión"}
+ELEGIBLES = ("borrador", "con_pendientes")
 
-class ErrorNube(Exception):
-    """Error de base de datos / red con mensaje amable para el usuario."""
-
-
-# ----------------------------------------------------------------------
-# Utilidades
-# ----------------------------------------------------------------------
-def _mensaje(e: Exception) -> str:
-    if isinstance(e, APIError):
-        msg = (getattr(e, "message", None) or str(e) or "").strip()
-        if "facturas_uuid_unico" in msg or "facturas_uuid_unico" in str(e):
-            return "Una de las facturas (UUID) ya fue usada en otro gasto."
-        if "row-level security" in msg:
-            return "No tienes permiso para hacer este cambio (o el registro está bloqueado)."
-        if "permission denied" in msg:
-            return "No tienes permiso para esta operación."
-        return msg or "Error de base de datos."
-    texto = str(e)
-    if "JWT" in texto or "expired" in texto.lower():
-        return "Tu sesión expiró. Vuelve a iniciar sesión."
-    return texto or e.__class__.__name__
+# Cómo se comprobó un gasto: con el XML del CFDI (lectura automática) o capturando los datos a mano.
+COLOR_COMPROBACION = {   # (fondo, texto)
+    "XML": ("#E0F2FE", "#075985"), "Manual": ("#FFEDD5", "#9A3412"), "XML + manual": ("#FEF3C7", "#92400E")}
+FONDO_FILA_MANUAL = "#FFF7ED"      # sombreado tenue de toda la fila cuando hay captura manual
 
 
-def _ejecutar(consulta) -> Any:
-    try:
-        return consulta.execute().data
-    except APIError as e:
-        raise ErrorNube(_mensaje(e)) from e
-    except ErrorNube:
-        raise
-    except Exception as e:  # red, timeout, token...
-        raise ErrorNube(_mensaje(e)) from e
+def tipo_factura(f: dict) -> str:
+    """'xml' o 'manual' (si la factura no trae la marca, un CFDI sin UUID se considera manual)."""
+    fu = str(f.get("fuente") or "").strip().lower()
+    if fu in ("xml", "manual"):
+        return fu
+    return "xml" if f.get("uuid_cfdi") else "manual"
 
 
-def _paginado(construir) -> list[dict]:
-    """`construir()` debe regresar un query builder NUEVO (select ya aplicado).
-    Pagina de 1000 en 1000 para no truncar resultados grandes."""
-    filas: list[dict] = []
-    inicio = 0
-    while True:
-        lote = _ejecutar(construir().range(inicio, inicio + _PAGINA - 1)) or []
-        filas.extend(lote)
-        if len(lote) < _PAGINA:
-            return filas
-        inicio += _PAGINA
+def tipo_comprobacion(gastos: list[dict]) -> str:
+    """«XML», «Manual», «XML + manual» o «—» (sin facturas) para uno o varios gastos."""
+    tipos = {tipo_factura(f) for g in gastos for f in (g.get("facturas") or [])}
+    if not tipos:
+        return "—"
+    if tipos == {"xml"}:
+        return "XML"
+    if tipos == {"manual"}:
+        return "Manual"
+    return "XML + manual"
 
 
 # ----------------------------------------------------------------------
-# Sesión y perfil
+# Lote por enviar
 # ----------------------------------------------------------------------
-def iniciar_sesion(sb, email: str, password: str) -> str:
-    """Regresa el id del usuario. Lanza ErrorNube si las credenciales no sirven."""
-    try:
-        resp = sb.auth.sign_in_with_password({"email": email.strip(), "password": password})
-    except Exception as e:
-        texto = str(e)
-        bajo = texto.lower()
-        if "invalid login credentials" in bajo or "invalid_credentials" in bajo:
-            raise ErrorNube("Correo o contraseña incorrectos.") from e
-        if "not confirmed" in bajo:
-            raise ErrorNube("El correo aún no está confirmado. En Supabase marca el usuario como confirmado.") from e
-        raise ErrorNube("No se pudo iniciar sesión por un problema de conexión o configuración "
-                        f"(revisa SUPABASE_URL y SUPABASE_KEY en Secrets). Detalle: {texto[:200]}") from e
-    if not getattr(resp, "user", None):
-        raise ErrorNube("Correo o contraseña incorrectos.")
-    return str(resp.user.id)
+def solicitudes_por_enviar(solicitudes: list[dict], gastos: list[dict], con_pendiente_abierto: set[str]) -> list[dict]:
+    """Solicitudes que entrarían al próximo envío: borrador o con pendientes ya atendidos, con al menos
+    un gasto comprobado y sin pendientes abiertos. Mismo criterio que la función enviar_estado_cuenta."""
+    por_sol: dict[str, list[dict]] = {}
+    for g in gastos:
+        if not g.get("eliminado"):
+            por_sol.setdefault(g["solicitud_id"], []).append(g)
+    return [s for s in solicitudes
+            if not s.get("eliminado") and s["estado"] in ELEGIBLES
+            and por_sol.get(s["id"]) and s["id"] not in con_pendiente_abierto]
 
 
-def cerrar_sesion(sb) -> None:
-    try:
-        sb.auth.sign_out()
-    except Exception:
-        pass
-
-
-def sesion_vigente(sb) -> bool:
-    """True si hay sesión; refresca el token si ya venció."""
-    try:
-        return sb.auth.get_session() is not None
-    except Exception:
-        return False
-
-
-def cargar_perfil(sb, user_id: str) -> dict | None:
-    filas = _ejecutar(sb.table("perfiles").select("*").eq("id", user_id))
-    return filas[0] if filas else None
-
-
-def cargar_cuenta(sb, cuenta_id: str) -> dict | None:
-    filas = _ejecutar(sb.table("cuentas").select("*").eq("id", cuenta_id))
-    return filas[0] if filas else None
-
-
-def listar_cuentas(sb) -> list[dict]:
-    return _ejecutar(sb.table("cuentas").select("*").order("nombre")) or []
-
-
-def tolerancia(sb, por_defecto: float = 0.50) -> float:
-    filas = _ejecutar(sb.table("configuracion").select("valor").eq("clave", "diferencia_aceptable"))
-    return float(filas[0]["valor"]) if filas else por_defecto
-
-
-# ----------------------------------------------------------------------
-# Periodos
-# ----------------------------------------------------------------------
-def obtener_o_crear_periodo(sb, anio: int, mes: int) -> str:
-    return _ejecutar(sb.rpc("obtener_o_crear_periodo", {"p_anio": anio, "p_mes": mes}))
-
-
-def listar_periodos(sb) -> list[dict]:
-    return _ejecutar(sb.table("periodos").select("*").order("anio", desc=True).order("mes", desc=True)) or []
-
-
-def etiqueta_periodo(p: dict) -> str:
-    return f"{p['anio']}-{int(p['mes']):02d}"
-
-
-def estado_cierre(sb, cuenta_id: str) -> dict[str, str]:
-    """{periodo_id: 'abierto'|'cerrado'} para la cuenta."""
-    filas = _ejecutar(sb.table("periodos_cuenta").select("periodo_id,estado").eq("cuenta_id", cuenta_id)) or []
-    return {f["periodo_id"]: f["estado"] for f in filas}
-
-
-# ----------------------------------------------------------------------
-# Catálogos
-# ----------------------------------------------------------------------
-def asegurar_catalogos(sb, defaults: dict[str, list[str]]) -> None:
-    """Si un catálogo está vacío, lo llena con los valores por defecto (idempotente)."""
-    for tipo, valores in defaults.items():
-        hay = _ejecutar(sb.table("catalogos").select("id").eq("tipo", tipo).limit(1))
-        if hay:
+def filas_por_enviar(solicitudes: list[dict], gastos: list[dict], con_pendiente_abierto: set[str]) -> pd.DataFrame:
+    """Un renglón por gasto del lote por enviar (para la tabla de revisión del aplicante)."""
+    sols = {s["id"]: s for s in solicitudes_por_enviar(solicitudes, gastos, con_pendiente_abierto)}
+    filas = []
+    for g in gastos:
+        s = sols.get(g["solicitud_id"])
+        if not s or g.get("eliminado"):
             continue
-        filas = [{"tipo": tipo, "valor": v} for v in dict.fromkeys(valores) if str(v).strip()]
-        if filas:
-            _ejecutar(sb.table("catalogos").upsert(filas, on_conflict="tipo,valor", ignore_duplicates=True))
-
-
-def cargar_catalogo(sb, tipo: str) -> list[str]:
-    filas = _ejecutar(
-        sb.table("catalogos").select("valor").eq("tipo", tipo).eq("activo", True).order("valor")
-    ) or []
-    return [f["valor"] for f in filas]
-
-
-def agregar_catalogo(sb, tipo: str, valor: str) -> str:
-    valor = (valor or "").strip()
-    if not valor:
-        raise ErrorNube("El valor no puede estar vacío.")
-    _ejecutar(sb.table("catalogos").upsert(
-        [{"tipo": tipo, "valor": valor}], on_conflict="tipo,valor", ignore_duplicates=True))
-    return valor
-
-
-# ----------------------------------------------------------------------
-# Estado de cuenta (movimientos)
-# ----------------------------------------------------------------------
-def movimientos_desde_df(df: pd.DataFrame) -> tuple[list[dict], int]:
-    """Convierte el DataFrame de bank.cargar_estado_cuenta en filas para la base.
-    Asigna `ocurrencia` (1,2,3...) a movimientos idénticos (misma fecha, descripción y
-    monto) para que cada línea tenga una llave única y se pueda volver a cargar un
-    estado de cuenta más reciente sin duplicar lo ya cargado.
-    Regresa (filas, n_descartadas_sin_fecha)."""
-    filas: list[dict] = []
-    vistos: dict[tuple, int] = {}
-    descartadas = 0
-    for _, r in df.iterrows():
-        fecha = pd.to_datetime(r.get("Fecha"), errors="coerce")
-        monto = r.get("Monto")
-        if pd.isna(fecha) or pd.isna(monto):
-            descartadas += 1
-            continue
-        descripcion = "" if pd.isna(r.get("Descripción")) else str(r.get("Descripción")).strip()
-        llave = (fecha.date().isoformat(), descripcion, round(float(monto), 2))
-        vistos[llave] = vistos.get(llave, 0) + 1
-        saldo = r.get("Saldo")
+        movs = g.get("movimientos") or []
         filas.append({
-            "fecha": llave[0],
-            "descripcion": descripcion or "(sin descripción)",
-            "monto": llave[2],
-            "saldo": None if saldo is None or pd.isna(saldo) else round(float(saldo), 2),
-            "ocurrencia": vistos[llave],
+            "Solicitud": int(s["numero"]),
+            "Fecha": min((m["fecha"] for m in movs), default=s["fecha"]),
+            "Empleado": s.get("employee_name") or "",
+            "Categoría": g.get("categoria") or s.get("category") or "",
+            "Descripción": s.get("description") or "",
+            "Movimientos": len(movs),
+            "Facturas": len(g.get("facturas") or []),
+            "Monto": round(float(g["monto_estado"]), 2),
+            "Diferencia": round(float(g.get("diferencia") or 0), 2),
+            "Devuelto": "Sí" if s["estado"] == "con_pendientes" else "",
         })
-    return filas, descartadas
-
-
-def subir_estado_cuenta(sb, cuenta_id: str, df: pd.DataFrame) -> dict[str, int]:
-    """Inserta solo los movimientos que todavía no existen (según fecha+descripción+monto
-    +ocurrencia). Cada movimiento se liga al periodo (mes) de su propia fecha."""
-    filas, descartadas = movimientos_desde_df(df)
-    if not filas:
-        raise ErrorNube("No se encontraron movimientos con fecha y monto válidos.")
-    periodos: dict[tuple[int, int], str] = {}
-    for f in filas:
-        anio, mes = int(f["fecha"][:4]), int(f["fecha"][5:7])
-        if (anio, mes) not in periodos:
-            periodos[(anio, mes)] = obtener_o_crear_periodo(sb, anio, mes)
-        f["cuenta_id"] = cuenta_id
-        f["periodo_id"] = periodos[(anio, mes)]
-    nuevos = 0
-    for i in range(0, len(filas), 500):
-        lote = filas[i:i + 500]
-        insertados = _ejecutar(sb.table("movimientos").upsert(
-            lote, on_conflict="cuenta_id,fecha,descripcion,monto,ocurrencia", ignore_duplicates=True))
-        nuevos += len(insertados or [])
-    return {"nuevos": nuevos, "ya_existian": len(filas) - nuevos, "sin_fecha_o_monto": descartadas}
-
-
-def listar_movimientos(sb, cuenta_id: str, estado: "str | list[str] | None" = None,
-                       periodo_id: str | None = None) -> pd.DataFrame:
-    def construir():
-        q = sb.table("movimientos").select("*").eq("cuenta_id", cuenta_id)
-        if isinstance(estado, (list, tuple)):
-            q = q.in_("estado", list(estado))
-        elif estado:
-            q = q.eq("estado", estado)
-        if periodo_id:
-            q = q.eq("periodo_id", periodo_id)
-        # `creado_en` es igual para todos los movimientos cargados en un mismo archivo: `id` desempata para que el orden sea siempre el mismo
-        return q.order("fecha", desc=False).order("creado_en", desc=False).order("id", desc=False)
-    filas = _paginado(construir)
-    cols = ["id", "fecha", "descripcion", "monto", "saldo", "estado", "periodo_id", "ocurrencia", "motivo_espera", "espera_desde", "nota_revisor"]
-    df = pd.DataFrame(filas, columns=cols) if filas else pd.DataFrame(columns=cols)
-    if not df.empty:
-        df["monto"] = df["monto"].astype(float)
-    return df
-
-
-def cambiar_estado_movimientos(sb, ids: list[str], estado: str, motivo: str | None = None) -> None:
-    """estado: 'pendiente' (sin comprobar), 'no_necesario' o 'en_espera' (la cuarta clasificación,
-    «Pendiente»: exige un motivo que explique por qué)."""
-    if estado not in ("pendiente", "no_necesario", "en_espera"):
-        raise ErrorNube("Estado no permitido.")
-    if estado == "en_espera" and not (motivo or "").strip():
-        raise ErrorNube("Explica por qué el movimiento queda pendiente.")
-    if ids:
-        cambios = {"estado": estado, "motivo_espera": (motivo or "").strip() or None if estado == "en_espera" else None}
-        _ejecutar(sb.table("movimientos").update(cambios).in_("id", ids))
+    df = pd.DataFrame(filas, columns=["Solicitud", "Fecha", "Empleado", "Categoría", "Descripción", "Movimientos",
+                                      "Facturas", "Monto", "Diferencia", "Devuelto"])
+    return df.sort_values(["Solicitud", "Fecha"]).reset_index(drop=True) if not df.empty else df
 
 
 # ----------------------------------------------------------------------
-# Solicitudes (bitácora)
+# Bitácora del mes: un renglón por registro, con su etiqueta
 # ----------------------------------------------------------------------
-def crear_solicitud(sb, cuenta_id: str, periodo_id: str, datos: dict) -> dict:
-    fila = {
-        "cuenta_id": cuenta_id,
-        "periodo_id": periodo_id,
-        "fecha": str(datos["fecha"]),
-        "monto_tentativo": float(datos.get("monto") or 0),
-        "category": datos.get("category") or None,
-        "material": datos.get("material") or None,
-        "employee_name": datos.get("employee_name") or None,
-        "description": (datos.get("description") or "").strip() or None,
-        "request_number": (datos.get("request_number") or "").strip() or None,
-        "number_of_days": int(datos.get("number_of_days") or 0),
-        "number_of_people": int(datos.get("number_of_people") or 0),
-    }
-    return _ejecutar(sb.table("solicitudes").insert(fila))[0]
+ETIQUETA_REGISTRO = {"comprobado": "Comprobado", "no_necesario": "No necesario",
+                     "sin_comprobar": "Sin comprobar", "pendiente": "Pendiente"}
+PRIORIDAD_REGISTRO = {"sin_comprobar": 0, "pendiente": 1, "comprobado": 2, "no_necesario": 3}
+SITUACION_SOLICITUD = {"borrador": "Borrador", "enviado_revision": "En revisión", "con_pendientes": "Devuelto por el revisor",
+                       "en_lote": "Aprobado (lote cerrado)", "pagado": "Pagado"}
 
 
-def listar_solicitudes(sb, cuenta_id: str, periodo_id: str | None = None) -> list[dict]:
-    def construir():
-        q = sb.table("solicitudes").select("*").eq("cuenta_id", cuenta_id).eq("eliminado", False)
-        if periodo_id:
-            q = q.eq("periodo_id", periodo_id)
-        return q.order("numero", desc=True)
-    return _paginado(construir)
+def _situacion_movimiento(estado: str, motivo: Any, nota: Any) -> str:
+    """Texto de la columna «Situación» de un movimiento que no está comprobado."""
+    base = (str(motivo) if estado == "pendiente" and isinstance(motivo, str) and motivo
+            else "No requiere comprobación" if estado == "no_necesario" else "Movimiento del banco")
+    return f"{base} · 💬 Revisor: {nota}" if isinstance(nota, str) and nota.strip() else base
 
 
-def solicitudes_acumulables(sb, cuenta_id: str) -> list[dict]:
-    """Solicitudes aún sin lote cerrado (lo que cuenta para el límite de reembolso)."""
-    def construir():
-        return (sb.table("solicitudes").select("fecha,monto_tentativo,estado")
-                .eq("cuenta_id", cuenta_id).eq("eliminado", False)
-                .in_("estado", ["borrador", "enviado_revision", "con_pendientes"]))
-    return _paginado(construir)
+def _conceptos(gastos: list[dict]) -> str:
+    """Emisor / concepto de las facturas del gasto («FACEBOOK», «Aeroméxico»…), sin repetir."""
+    vistos: list[str] = []
+    for g in gastos:
+        for f in g.get("facturas") or []:
+            n = (f.get("nombre_emisor") or "").strip()
+            if n and n not in vistos:
+                vistos.append(n)
+    return ", ".join(vistos[:3]) + (f" (+{len(vistos) - 3})" if len(vistos) > 3 else "")
 
 
-def actualizar_solicitud(sb, solicitud_id: str, cambios: dict) -> None:
-    _ejecutar(sb.table("solicitudes").update(cambios).eq("id", solicitud_id))
-
-
-def eliminar_solicitud(sb, solicitud_id: str) -> None:
-    filas = _ejecutar(sb.table("solicitudes").update({"eliminado": True}).eq("id", solicitud_id))
-    if not filas:
-        raise ErrorNube("La solicitud no se pudo eliminar (¿ya está en revisión o en un lote?).")
-
-
-def enviar_a_revision(sb, solicitud_id: str) -> None:
-    filas = _ejecutar(sb.table("solicitudes").update({"estado": "enviado_revision"}).eq("id", solicitud_id))
-    if not filas:
-        raise ErrorNube("No se pudo enviar a revisión.")
-
-
-# ----------------------------------------------------------------------
-# Gastos
-# ----------------------------------------------------------------------
-def _en_trozos(sb, tabla: str, columnas: str, campo: str, valores: list[str], tam: int = 80) -> list[dict]:
-    """select ... where campo in (valores), en trozos para no rebasar el largo de la URL."""
+def registros_bitacora(solicitudes: list[dict], gastos: list[dict], movs: pd.DataFrame) -> list[dict]:
+    """Todo lo del mes en una sola lista:
+      * cada solicitud: «comprobado» si ya tiene gasto, «sin comprobar» si todavía no;
+      * cada movimiento del estado de cuenta que NO está comprobado: «no necesario», «sin comprobar» o «pendiente»
+        (los comprobados ya salen dentro de su solicitud).
+    Primero lo que falta por comprobar (rojo), luego lo comprobado (verde) y lo no necesario, por fecha."""
+    por_sol: dict[str, list[dict]] = {}
+    for g in gastos:
+        if not g.get("eliminado"):
+            por_sol.setdefault(g["solicitud_id"], []).append(g)
     filas: list[dict] = []
-    for i in range(0, len(valores), tam):
-        filas += _ejecutar(sb.table(tabla).select(columnas).in_(campo, valores[i:i + tam])) or []
+    for s in solicitudes:
+        if s.get("eliminado"):
+            continue
+        gs = por_sol.get(s["id"], [])
+        if gs:
+            fechas = [m["fecha"] for g in gs for m in (g.get("movimientos") or [])]
+            filas.append({
+                "tipo": "solicitud", "id": s["id"], "estado": "comprobado", "fecha": min(fechas) if fechas else s["fecha"],
+                "numero": int(s["numero"]), "descripcion": s.get("description") or "", "empleado": s.get("employee_name") or "",
+                "concepto": _conceptos(gs), "movs": sum(len(g.get("movimientos") or []) for g in gs),
+                "categoria": gs[0].get("categoria") or s.get("category") or "",
+                "monto": round(sum(float(g["monto_estado"]) for g in gs), 2),
+                "situacion": SITUACION_SOLICITUD.get(s["estado"], s["estado"])})
+        else:
+            filas.append({
+                "tipo": "solicitud", "id": s["id"], "estado": "sin_comprobar", "fecha": s["fecha"], "numero": int(s["numero"]),
+                "descripcion": s.get("description") or "", "empleado": s.get("employee_name") or "", "categoria": s.get("category") or "",
+                "concepto": "", "movs": 0,
+                "monto": round(float(s.get("monto_tentativo") or 0), 2), "situacion": "Solicitud sin movimiento ligado"})
+    if len(movs):
+        for r in movs.itertuples():
+            if r.estado == "comprobado":
+                continue
+            estado = {"no_necesario": "no_necesario", "en_espera": "pendiente"}.get(r.estado, "sin_comprobar")
+            motivo = getattr(r, "motivo_espera", None)
+            filas.append({
+                "tipo": "movimiento", "id": r.id, "estado": estado, "fecha": r.fecha, "numero": None,
+                "descripcion": r.descripcion, "empleado": "", "categoria": "", "concepto": "", "movs": 1, "monto": round(abs(float(r.monto)), 2),
+                "situacion": _situacion_movimiento(estado, motivo, getattr(r, "nota_revisor", None))})
+    filas.sort(key=lambda f: (PRIORIDAD_REGISTRO[f["estado"]], str(f["fecha"]), f["numero"] or 0, str(f["id"])))
     return filas
 
 
-def listar_gastos(sb, solicitud_ids: list[str]) -> list[dict]:
-    """Gastos (con suma de facturas y diferencia) de las solicitudes dadas, con los
-    movimientos y facturas que los componen."""
-    if not solicitud_ids:
-        return []
-    gastos = [g for g in _en_trozos(sb, "v_gastos", "*", "solicitud_id", solicitud_ids) if not g.get("eliminado")]
-    if not gastos:
-        return []
-    ids = [g["id"] for g in gastos]
-    movs = _en_trozos(sb, "gasto_movimientos", "gasto_id,movimiento_id", "gasto_id", ids)
-    mov_ids = list({m["movimiento_id"] for m in movs})
-    detalle_mov = {m["id"]: m for m in _en_trozos(sb, "movimientos", "id,fecha,descripcion,monto", "id", mov_ids)} if mov_ids else {}
-    gf = _en_trozos(sb, "gasto_facturas", "*", "gasto_id", ids)
-    fact_ids = list({x["factura_id"] for x in gf})
-    detalle_fact = {f["id"]: f for f in _en_trozos(sb, "facturas", "*", "id", fact_ids)} if fact_ids else {}
-    adj_ids = list({f["adjunto_id"] for f in detalle_fact.values() if f.get("adjunto_id")})
-    adj = {a["id"]: a for a in _en_trozos(sb, "adjuntos", "id,ruta,bytes_original,bytes_final", "id", adj_ids)} if adj_ids else {}
-    for f in detalle_fact.values():
-        f["adjunto"] = adj.get(f.get("adjunto_id"))
-    movs_por_gasto: dict[str, list[dict]] = {}
-    for m in movs:
-        if m["movimiento_id"] in detalle_mov:
-            movs_por_gasto.setdefault(m["gasto_id"], []).append(detalle_mov[m["movimiento_id"]])
-    fact_por_gasto: dict[str, list[dict]] = {}
-    for x in gf:
-        if x["factura_id"] in detalle_fact:
-            fact_por_gasto.setdefault(x["gasto_id"], []).append(
-                {**detalle_fact[x["factura_id"]], "monto_aplicado": x["monto_total"], "iva_aplicado": x.get("iva", 0),
-                 "isr_aplicado": x.get("isr_retenido", 0), "iva_ret_aplicado": x.get("iva_retenido", 0), "ish_aplicado": x.get("ish", 0)})
-    try:
-        tc = {x["gasto_id"]: x.get("detalle") for x in _en_trozos(sb, "gasto_tc", "gasto_id,detalle", "gasto_id", ids)}
-    except Exception:
-        tc = {}   # todavía no se corrió el script 013
-    try:
-        devs = [d for d in _en_trozos(sb, "gasto_devoluciones", "*", "gasto_id", ids) if not d.get("anulada")]
-        tips = _en_trozos(sb, "gasto_tip", "gasto_id,adjunto_id", "gasto_id", ids)
-        adj_tip = {a["id"]: a for a in _en_trozos(sb, "adjuntos", "id,ruta", "id", list({t["adjunto_id"] for t in tips}))} if tips else {}
-        tip_por_gasto = {t["gasto_id"]: adj_tip.get(t["adjunto_id"]) for t in tips}
-    except Exception:
-        devs, tip_por_gasto = [], {}   # todavía no se corrió el script 015
-    devs_por_gasto: dict[str, list[dict]] = {}
-    for d in devs:
-        devs_por_gasto.setdefault(d["gasto_id"], []).append(d)
-    for g in gastos:
-        g["movimientos"] = movs_por_gasto.get(g["id"], [])
-        g["facturas"] = fact_por_gasto.get(g["id"], [])
-        g["dif_tc"] = g["id"] in tc
-        g["detalle_tc"] = tc.get(g["id"])
-        g["devoluciones"] = devs_por_gasto.get(g["id"], [])
-        g["devolucion_total"] = round(sum(float(d["monto"]) for d in g["devoluciones"]), 2)
-        g["tip_adjunto"] = tip_por_gasto.get(g["id"])
-    return gastos
-
-
-def guardar_gasto(sb, solicitud_id: str, movimiento_ids: list[str], categoria: str | None,
-                  material: str | None, propina: float, facturas: list[dict],
-                  dif_tc: bool = False, detalle_tc: str | None = None, propina_adjunto: dict | None = None) -> str:
-    """Guarda un gasto. dif_tc=True marca «factura con diferencia de tipo de cambio» (exige detalle; ignora la tolerancia)."""
-    if dif_tc and not (detalle_tc or "").strip():
-        raise ErrorNube("Explica en «Detalles» por qué hay diferencia por tipo de cambio.")
-    params = {
-        "p_solicitud": solicitud_id,
-        "p_movimientos": movimiento_ids,
-        "p_categoria": categoria,
-        "p_material": material,
-        "p_propina": round(float(propina or 0), 2),
-        "p_facturas": facturas,
-    }
-    if dif_tc:   # sin la marca se llama igual que antes (compatible aunque aún no se corra el script 013)
-        params["p_dif_tc"] = True
-        params["p_detalle_tc"] = detalle_tc.strip()
-    if propina_adjunto:   # comprobante de la propina; sin él, la propina queda como «tip sin comprobación»
-        params["p_propina_adjunto"] = propina_adjunto
-    return _ejecutar(sb.rpc("guardar_gasto", params))
-
-
-def revertir_gasto(sb, gasto_id: str) -> None:
-    _ejecutar(sb.rpc("revertir_gasto", {"p_gasto": gasto_id}))
-
-
-def factura_a_json(f: dict, adjunto: dict | None = None) -> dict:
-    """Convierte la factura del parser (parse_cfdi / captura manual) al formato de guardar_gasto."""
-    uuid_cfdi = f.get("UUID")
-    if not uuid_cfdi or uuid_cfdi == "SIN-UUID":
-        uuid_cfdi = None
-    fecha = str(f.get("Fecha Factura") or "")[:10] or None
-    return {
-        "uuid_cfdi": uuid_cfdi,
-        "rfc_emisor": f.get("RFC Emisor") or None,
-        # Una factura manual (sin XML) no trae razón social: se guarda el concepto («FACEBOOK») para poder identificarla.
-        "nombre_emisor": (f.get("Razón Social") or f.get("Razon Social") or f.get("Nombre Emisor")
-                          or ((f.get("Concepto") or "").strip()[:80] if uuid_cfdi is None else None) or None),
-        "fecha_factura": fecha,
-        "monto_total": round(float(f.get("Monto Total") or 0), 2),
-        "iva": round(float(f.get("IVA") or 0), 2),
-        "isr_retenido": round(float(f.get("ISR Retenido") or 0), 2),
-        "iva_retenido": round(float(f.get("IVA Retenido") or 0), 2),
-        "ish": round(float(f.get("ISH") or 0), 2),
-        "incompleta": bool(f.get("Incompleta")),
-        "fuente": "manual" if str(f.get("Fuente") or "").strip().lower() == "manual" or uuid_cfdi is None else "xml",
-        "adjunto": adjunto,
-    }
+# ----------------------------------------------------------------------
+# Desglose del estado de cuenta, condensado por solicitud
+# ----------------------------------------------------------------------
+def filas_desglose(df: pd.DataFrame, gastos: list[dict]) -> list[dict]:
+    """Una fila por solicitud comprobada (con el total de todos sus cargos) y una fila por cada movimiento que
+    no está comprobado (no necesario, sin comprobar, pendiente). `df` es el estado de cuenta del mes con su
+    solicitud/gasto/lote (v_movimientos_revision)."""
+    gastos_por_id = {g["id"]: g for g in gastos}
+    filas: list[dict] = []
+    if df is None or df.empty:
+        return filas
+    comp = df[df["estado"] == "comprobado"]
+    con_sol = comp[comp["solicitud_id"].notna()]
+    for sid, sub in con_sol.groupby("solicitud_id", sort=False):
+        movs = sub.drop_duplicates("id")
+        gasto_ids = list(dict.fromkeys(sub["gasto_id"].dropna()))
+        por_gasto = sub.drop_duplicates("gasto_id")
+        r0 = sub.iloc[0]
+        lote = ""
+        if pd.notna(r0["lote_numero"]):
+            lote = f"Lote de pago {int(r0['lote_numero'])}" + (f" · pagado el {r0['fecha_pago']}" if r0["lote_estado"] == "pagado" else " · por pagar")
+        filas.append({
+            "tipo": "solicitud", "id": sid, "estado": "comprobado", "fecha": min(str(x) for x in movs["fecha"]),
+            "numero": int(r0["solicitud_numero"]), "solicitud_estado": str(r0["solicitud_estado"]), "gasto_ids": gasto_ids,
+            "descripcion": (r0.get("solicitud_descripcion") or movs.iloc[0]["descripcion"] or ""),
+            "concepto": _conceptos([gastos_por_id[g] for g in gasto_ids if g in gastos_por_id]),
+            "comprobacion": tipo_comprobacion([gastos_por_id[g] for g in gasto_ids if g in gastos_por_id]),
+            "movs": int(len(movs)), "monto": round(float(movs["monto"].abs().sum()), 2),
+            "diferencia": round(float(pd.to_numeric(por_gasto["diferencia"], errors="coerce").fillna(0).sum()), 2),
+            "tiene_diferencia": bool(por_gasto["tiene_diferencia"].fillna(False).astype(bool).any()),
+            "dif_tc": any(gastos_por_id[g].get("dif_tc") for g in gasto_ids if g in gastos_por_id),
+            "devolucion": round(sum(float(gastos_por_id[g].get("devolucion_total") or 0) for g in gasto_ids if g in gastos_por_id), 2),
+            "detalle_tc": " | ".join(str(gastos_por_id[g]["detalle_tc"]) for g in gasto_ids
+                                     if g in gastos_por_id and gastos_por_id[g].get("dif_tc") and gastos_por_id[g].get("detalle_tc")),
+            "situacion": " · ".join(x for x in (SITUACION_SOLICITUD.get(r0["solicitud_estado"], str(r0["solicitud_estado"])), lote) if x)})
+    resto = df[(df["estado"] != "comprobado") | (df["solicitud_id"].isna())].drop_duplicates("id")
+    for r in resto.itertuples():
+        estado = {"comprobado": "comprobado", "no_necesario": "no_necesario", "en_espera": "pendiente"}.get(r.estado, "sin_comprobar")
+        motivo = getattr(r, "motivo_espera", None)
+        filas.append({
+            "tipo": "movimiento", "id": r.id, "estado": estado, "fecha": str(r.fecha), "numero": None, "descripcion": r.descripcion,
+            "concepto": "", "comprobacion": "", "movs": 1, "monto": round(abs(float(r.monto)), 2), "diferencia": 0.0, "tiene_diferencia": False,
+            "situacion": _situacion_movimiento(estado, motivo, getattr(r, "nota_revisor", None))})
+    filas.sort(key=lambda f: (f["fecha"], f["numero"] or 0, str(f["id"])))
+    return filas
 
 
 # ----------------------------------------------------------------------
-# Pendientes y comentarios
+# Cuadre del estado de cuenta
 # ----------------------------------------------------------------------
-def listar_pendientes_abiertos(sb, cuenta_id: str) -> list[dict]:
-    pend = _ejecutar(sb.table("gastos_pendientes").select("*").eq("cuenta_id", cuenta_id)
-                     .neq("estado", "resuelto").order("creado_en", desc=True).order("id", desc=False)) or []
-    if not pend:
-        return []
-    gastos = {g["id"]: g for g in (_ejecutar(sb.table("gastos").select("id,solicitud_id,monto_estado")
-                                              .in_("id", list({p["gasto_id"] for p in pend}))) or [])}
-    sol_ids = list({g["solicitud_id"] for g in gastos.values()})
-    sols = {s["id"]: s for s in (_ejecutar(sb.table("solicitudes").select("id,numero,description")
-                                            .in_("id", sol_ids)) or [])} if sol_ids else {}
-    coment = _ejecutar(sb.table("comentarios").select("*").in_("pendiente_id", [p["id"] for p in pend])
-                       .order("creado_en")) or []
-    autores = {}
-    ids_autores = list({c["autor_id"] for c in coment})
-    if ids_autores:
-        autores = {a["id"]: a["nombre"] for a in (_ejecutar(sb.table("perfiles").select("id,nombre").in_("id", ids_autores)) or [])}
-    for p in pend:
-        g = gastos.get(p["gasto_id"], {})
-        s = sols.get(g.get("solicitud_id"), {})
-        p["solicitud_numero"] = s.get("numero")
-        p["solicitud_descripcion"] = s.get("description")
-        p["monto_estado"] = g.get("monto_estado")
-        p["comentarios"] = [{**c, "autor": autores.get(c["autor_id"], "—")} for c in coment if c["pendiente_id"] == p["id"]]
-    return pend
+ESTADOS_CUADRE = (("comprobado", "Comprobados"), ("no_necesario", "No necesarios"),
+                  ("pendiente", "Sin comprobar"), ("en_espera", "Pendientes"))
 
 
-def agregar_comentario(sb, cuenta_id: str, pendiente_id: str, texto: str) -> None:
-    if not (texto or "").strip():
-        raise ErrorNube("Escribe el comentario.")
-    _ejecutar(sb.table("comentarios").insert({"cuenta_id": cuenta_id, "pendiente_id": pendiente_id, "texto": texto.strip()}))
-
-
-def resolver_pendiente(sb, pendiente_id: str, comentario: str | None = None) -> None:
-    _ejecutar(sb.rpc("resolver_pendiente", {"p_pendiente": pendiente_id, "p_comentario": comentario or None}))
-
-
-# ----------------------------------------------------------------------
-# Lotes
-# ----------------------------------------------------------------------
-def listar_lotes(sb, cuenta_id: str | None = None) -> list[dict]:
-    q = sb.table("lotes").select("*")
-    if cuenta_id:
-        q = q.eq("cuenta_id", cuenta_id)
-    return _ejecutar(q.order("cerrado_en", desc=True).order("id", desc=False)) or []
-
-
-# ----------------------------------------------------------------------
-# Revisor: visto bueno, devolución, pagos y cierre de mes
-# ----------------------------------------------------------------------
-def cerrar_lote(sb, cuenta_id: str, periodo_id: str, solicitud_ids: list[str]) -> str:
-    """Visto bueno: crea y cierra (bloquea) el lote de pago de una cuenta y un mes. Regresa el id del lote."""
-    return _ejecutar(sb.rpc("cerrar_lote", {"p_cuenta": cuenta_id, "p_periodo": periodo_id, "p_solicitudes": solicitud_ids}))
-
-
-def pagar_lote(sb, lote_id: str, fecha, referencia: str) -> None:
-    _ejecutar(sb.rpc("pagar_lote", {"p_lote": lote_id, "p_fecha": str(fecha), "p_referencia": referencia}))
-
-
-def registrar_pago_lote(sb, lote_id: str, fecha, monto: float, referencia: str, adjunto: dict | None = None) -> None:
-    """Registra un pago (total o parcial) de un lote. El lote queda «pagado» cuando lo pagado alcanza su monto.
-    `adjunto` (opcional, requiere el script 017): {ruta, nombre_original, bytes_original, bytes_final, sha256} del comprobante ya subido."""
-    if not (referencia or "").strip():
-        raise ErrorNube("Escribe la referencia / folio del pago.")
-    if not monto or float(monto) <= 0:
-        raise ErrorNube("El monto del pago debe ser mayor a cero.")
-    params = {"p_lote": lote_id, "p_fecha": str(fecha), "p_monto": round(float(monto), 2), "p_referencia": referencia.strip()}
-    if adjunto:
-        params["p_adjunto"] = adjunto
-    _ejecutar(sb.rpc("registrar_pago_lote", params))
-
-
-def adjuntar_comprobante_pago(sb, pago_id: str, adjunto: dict) -> None:
-    _ejecutar(sb.rpc("adjuntar_comprobante_pago", {"p_pago": pago_id, "p_adjunto": adjunto}))
-
-
-def adjuntar_comprobante_devolucion(sb, dev_id: str, adjunto: dict) -> None:
-    _ejecutar(sb.rpc("adjuntar_comprobante_devolucion", {"p_dev": dev_id, "p_adjunto": adjunto}))
-
-
-def _adjuntos_por_id(sb, ids: list[str]) -> dict[str, dict]:
-    ids = [i for i in dict.fromkeys(ids) if i]
-    if not ids:
-        return {}
-    return {a["id"]: a for a in _en_trozos(sb, "adjuntos", "id,ruta,nombre_original,bytes_final", "id", ids)}
-
-
-def listar_pagos_cuenta(sb, cuenta_id: str | None = None, incluir_anulados: bool = False) -> list[dict]:
-    """Pagos libres (script 018) de una cuenta o de todas, del más reciente al más antiguo, con su comprobante."""
-    def construir():
-        q = sb.table("pagos_cuenta").select("*")
-        if cuenta_id:
-            q = q.eq("cuenta_id", cuenta_id)
-        if not incluir_anulados:
-            q = q.eq("anulado", False)
-        return q.order("fecha_pago", desc=True).order("creado_en", desc=True).order("id", desc=False)
-    pagos = _paginado(construir)
-    adj = _adjuntos_por_id(sb, [p.get("adjunto_id") for p in pagos])
-    return [{**p, "adjunto": adj.get(p.get("adjunto_id"))} for p in pagos]
-
-
-def registrar_pago_cuenta(sb, cuenta_id: str, mes: str, fecha, referencia: str, monto: float,
-                          nota: str | None = None, adjunto: dict | None = None) -> str:
-    if not (referencia or "").strip():
-        raise ErrorNube("Escribe el número de AP o PY.")
-    if not monto or float(monto) <= 0:
-        raise ErrorNube("El monto del pago debe ser mayor a cero.")
-    params = {"p_cuenta": cuenta_id, "p_mes": mes, "p_fecha": str(fecha), "p_referencia": referencia.strip(),
-              "p_monto": round(float(monto), 2), "p_nota": (nota or "").strip() or None}
-    if adjunto:
-        params["p_adjunto"] = adjunto
-    return _ejecutar(sb.rpc("registrar_pago_cuenta", params))
-
-
-def editar_pago_cuenta(sb, pago_id: str, mes: str, fecha, referencia: str, monto: float, nota: str | None, motivo: str) -> None:
-    if not (motivo or "").strip():
-        raise ErrorNube("Escribe el motivo del cambio.")
-    if not (referencia or "").strip():
-        raise ErrorNube("Escribe el número de AP o PY.")
-    if not monto or float(monto) <= 0:
-        raise ErrorNube("El monto del pago debe ser mayor a cero.")
-    _ejecutar(sb.rpc("editar_pago_cuenta", {"p_pago": pago_id, "p_mes": mes, "p_fecha": str(fecha), "p_referencia": referencia.strip(),
-                                            "p_monto": round(float(monto), 2), "p_nota": (nota or "").strip() or None, "p_motivo": motivo.strip()}))
-
-
-def anular_pago_cuenta(sb, pago_id: str, motivo: str) -> None:
-    if not (motivo or "").strip():
-        raise ErrorNube("Escribe el motivo de la anulación.")
-    _ejecutar(sb.rpc("anular_pago_cuenta", {"p_pago": pago_id, "p_motivo": motivo.strip()}))
-
-
-def adjuntar_comprobante_pago_cuenta(sb, pago_id: str, adjunto: dict) -> None:
-    _ejecutar(sb.rpc("adjuntar_comprobante_pago_cuenta", {"p_pago": pago_id, "p_adjunto": adjunto}))
-
-
-def reclasificar_fuente_facturas(sb, factura_ids: list[str], fuente: str, motivo: str) -> int:
-    """El revisor corrige si una factura se comprobó con XML o a mano. Regresa cuántas cambió."""
-    if fuente not in ("xml", "manual"):
-        raise ErrorNube("Tipo de comprobación no válido.")
-    if not (motivo or "").strip():
-        raise ErrorNube("Escribe el motivo del cambio.")
-    return int(_ejecutar(sb.rpc("reclasificar_fuente_facturas", {"p_facturas": factura_ids, "p_fuente": fuente, "p_motivo": motivo.strip()})) or 0)
-
-
-def marcar_devolucion(sb, gasto_id: str, monto: float, nota: str) -> None:
-    """El revisor cataloga un gasto (completo o parcial) como «sin comprobación, devolución»."""
-    if not monto or float(monto) <= 0:
-        raise ErrorNube("Captura el monto a devolver.")
-    if not (nota or "").strip():
-        raise ErrorNube("Explica el motivo de la devolución.")
-    _ejecutar(sb.rpc("marcar_devolucion", {"p_gasto": gasto_id, "p_monto": round(float(monto), 2), "p_nota": nota.strip()}))
-
-
-def anular_devolucion(sb, dev_id: str, motivo: str) -> None:
-    if not (motivo or "").strip():
-        raise ErrorNube("Escribe el motivo.")
-    _ejecutar(sb.rpc("anular_devolucion", {"p_dev": dev_id, "p_motivo": motivo.strip()}))
-
-
-def registrar_devolucion_recibida(sb, dev_id: str, fecha, referencia: str, adjunto: dict | None = None) -> None:
-    if not (referencia or "").strip():
-        raise ErrorNube("Escribe la referencia de la devolución.")
-    params = {"p_dev": dev_id, "p_fecha": str(fecha), "p_referencia": referencia.strip()}
-    if adjunto:
-        params["p_adjunto"] = adjunto   # requiere el script 017
-    _ejecutar(sb.rpc("registrar_devolucion_recibida", params))
-
-
-def listar_devoluciones(sb, cuenta_id: str | None = None) -> list[dict]:
-    """Devoluciones vigentes (no anuladas) con los datos de su gasto y solicitud. Una fila por devolución."""
-    def construir():
-        q = sb.table("gasto_devoluciones").select("*").eq("anulada", False)
-        if cuenta_id:
-            q = q.eq("cuenta_id", cuenta_id)
-        return q.order("creado_en", desc=True).order("id", desc=False)
-    devs = _paginado(construir)
-    if not devs:
-        return []
-    gastos = {g["id"]: g for g in _en_trozos(sb, "gastos", "id,solicitud_id,monto_estado,categoria,eliminado", "id", list({d["gasto_id"] for d in devs}))}
-    sols = {x["id"]: x for x in _en_trozos(sb, "solicitudes", "id,numero,description,employee_name,periodo_id", "id",
-                                           list({g["solicitud_id"] for g in gastos.values()}))}
-    adj = _adjuntos_por_id(sb, [d.get("devuelto_adjunto_id") for d in devs])
-    out = []
-    for d in devs:
-        g = gastos.get(d["gasto_id"])
-        if not g or g.get("eliminado"):
+def con_devolucion(movs: pd.DataFrame, gastos: list[dict]) -> pd.DataFrame:
+    """Copia del estado de cuenta con la columna `dev_monto`: lo que el colaborador debe devolver de un gasto comprobado
+    (tip sin comprobación / sin comprobación, devolución). Se asigna al primer movimiento comprobado del gasto.
+    En el cuadre y los overviews ese monto sale de «Comprobados» y entra a «Pendientes»; el total no cambia."""
+    m = movs.copy()
+    m["dev_monto"] = 0.0
+    if m.empty or "id" not in m.columns:
+        return m
+    for g in gastos or []:
+        total = float(g.get("devolucion_total") or 0)
+        if total <= 0 or g.get("eliminado"):
             continue
-        out.append({**d, "gasto": g, "solicitud": sols.get(g["solicitud_id"], {}), "devuelto_adjunto": adj.get(d.get("devuelto_adjunto_id"))})
+        ids = [x["id"] for x in sorted(g.get("movimientos") or [], key=lambda x: str(x.get("fecha"))) if x.get("id") is not None]
+        for mid in ids:
+            fila = (m["id"] == mid) & (m["estado"] == "comprobado")
+            if fila.any():
+                m.loc[fila.idxmax(), "dev_monto"] += total
+                break
+    return m
+
+
+def _dev_total(movs: pd.DataFrame) -> tuple[float, int]:
+    if movs is None or len(movs) == 0 or "dev_monto" not in movs.columns:
+        return 0.0, 0
+    d = movs["dev_monto"].fillna(0.0)
+    return round(float(d.sum()), 2), int((d > 0).sum())
+
+
+def cuadre(movs: pd.DataFrame) -> dict[str, Any]:
+    """comprobados + no necesarios + sin comprobar + pendientes debe ser igual al total del estado de cuenta.
+    Si `movs` trae `dev_monto` (ver con_devolucion), ese monto pasa de comprobados a pendientes."""
+    n_tot = int(len(movs))
+    m_tot = round(float(movs["monto"].abs().sum()), 2) if n_tot else 0.0
+    por: dict[str, dict[str, float]] = {}
+    for est, _ in ESTADOS_CUADRE:
+        sub = movs[movs["estado"] == est] if n_tot else movs
+        por[est] = {"n": int(len(sub)), "monto": round(float(sub["monto"].abs().sum()), 2) if len(sub) else 0.0}
+    dev_m, dev_n = _dev_total(movs)
+    if dev_m:
+        por["comprobado"]["monto"] = round(por["comprobado"]["monto"] - dev_m, 2)
+        por["en_espera"]["monto"] = round(por["en_espera"]["monto"] + dev_m, 2)
+    suma_n = sum(v["n"] for v in por.values())
+    suma_m = round(sum(v["monto"] for v in por.values()), 2)
+    return {"por_estado": por, "n_total": n_tot, "monto_total": m_tot, "n_suma": suma_n, "monto_suma": suma_m,
+            "cuadra": suma_n == n_tot and abs(suma_m - m_tot) < 0.005,
+            "dif_n": n_tot - suma_n, "dif_monto": round(m_tot - suma_m, 2),
+            "devolucion": {"n": dev_n, "monto": dev_m}}
+
+
+def saldo_final(movs: pd.DataFrame) -> float | None:
+    """Saldo de la cuenta tras el último movimiento del estado de cuenta (None si no hay saldos).
+    Con varios movimientos en la última fecha, toma el que no antecede a ningún otro (saldo_n = saldo_m + monto_n)."""
+    if movs is None or len(movs) == 0 or "saldo" not in movs.columns:
+        return None
+    m = movs.copy()
+    m["saldo"] = pd.to_numeric(m["saldo"], errors="coerce")
+    m = m[m["saldo"].notna()]
+    if m.empty:
+        return None
+    ultima = m[m["fecha"] == m["fecha"].max()]
+    if len(ultima) > 1:
+        filas = list(ultima.itertuples())
+        finales = [a for a in filas
+                   if not any(abs(float(b.saldo) - (float(a.saldo) + float(b.monto))) < 0.005 for b in filas if b is not a)]
+        if len(finales) == 1:
+            return round(float(finales[0].saldo), 2)
+    return round(float(ultima.iloc[-1]["saldo"]), 2)
+
+
+def resumen_tarjeta(cu: dict, balance: float | None, limite: float | None) -> dict:
+    """Resumen de la tarjeta: comprobados + pendientes (+ sin comprobar) = subtotal; + balance = suma; diferencia = límite − suma.
+    `cu` es el resultado de cuadre(con_devolucion(...)); `limite` es el límite de la cuenta (Total card)."""
+    por = cu["por_estado"]
+    comp = round(por["comprobado"]["monto"], 2)
+    pend = round(por["en_espera"]["monto"], 2)
+    sin = round(por["pendiente"]["monto"], 2)
+    subtotal = round(comp + pend + sin, 2)
+    suma = round(subtotal + (balance or 0.0), 2)
+    lim = float(limite) if limite else None
+    return {"comprobados": comp, "pendientes": pend, "sin_comprobar": sin, "subtotal": subtotal,
+            "balance": balance, "suma": suma, "limite": lim,
+            "diferencia": round(lim - suma, 2) if lim is not None else None}
+
+
+def acumulado_pagos(pagos: list[dict]) -> list[dict]:
+    """Pagos por mes de aplicación: cuántos, cuánto se pagó en el mes y el acumulado corrido (de lo más antiguo a lo más reciente)."""
+    por: dict[str, list[dict]] = {}
+    for p in pagos:
+        if p.get("anulado"):
+            continue
+        por.setdefault(str(p["mes"]), []).append(p)
+    out, acum = [], 0.0
+    for mes in sorted(por):
+        m = round(sum(float(p["monto"]) for p in por[mes]), 2)
+        acum = round(acum + m, 2)
+        out.append({"mes": mes, "n": len(por[mes]), "monto": m, "acumulado": acum})
     return out
 
 
-def desbloquear_lote(sb, lote_id: str, motivo: str) -> None:
-    _ejecutar(sb.rpc("desbloquear_lote", {"p_lote": lote_id, "p_motivo": motivo}))
+def disponibilidad(movs: pd.DataFrame, pagos: list[dict], corte, limite: float | None) -> dict:
+    """Cruce de fondos de la cuenta a una fecha de corte (movimientos y pagos con fecha ≤ corte).
+    gasto_neto = comprobados + pendientes + sin comprobar, SIN los «no necesarios».
+    por_reponer = gasto_neto − pagos acumulados (negativo: hay fondos de sobra).
+    saldo = saldo de la tarjeta tras el último movimiento a la fecha; gastado_limite = límite − saldo."""
+    corte_s = str(corte)
+    m = movs.copy() if movs is not None else pd.DataFrame(columns=["fecha", "monto", "estado", "saldo"])
+    if len(m):
+        m = m[m["fecha"].astype(str) <= corte_s]
+    por: dict[str, float] = {}
+    for est in ("comprobado", "en_espera", "pendiente"):
+        sub = m[m["estado"] == est] if len(m) else m
+        por[est] = round(float(sub["monto"].abs().sum()), 2) if len(sub) else 0.0
+    no_nec = round(float(m[m["estado"] == "no_necesario"]["monto"].abs().sum()), 2) if len(m) else 0.0
+    gasto = round(sum(por.values()), 2)
+    pagado = round(sum(float(p["monto"]) for p in pagos if not p.get("anulado") and str(p["fecha_pago"]) <= corte_s), 2)
+    saldo = saldo_final(m) if len(m) else None
+    lim = float(limite) if limite else None
+    return {"corte": corte_s, "por_estado": por, "no_necesarios": no_nec, "gasto_neto": gasto, "pagado": pagado,
+            "por_reponer": round(gasto - pagado, 2), "saldo": saldo, "limite": lim,
+            "gastado_limite": round(lim - saldo, 2) if lim is not None and saldo is not None else None}
 
 
-def marcar_pendiente(sb, gasto_id: str, motivo: str, comentario: str | None = None) -> str:
-    """El revisor devuelve un gasto al aplicante con un pendiente (la solicitud regresa a «con pendientes»)."""
-    return _ejecutar(sb.rpc("marcar_pendiente", {"p_gasto": gasto_id, "p_motivo": motivo, "p_comentario": comentario or None}))
+def overview_categorias(movs: pd.DataFrame) -> list[dict]:
+    """Estado de cuenta resumido: comprobados por categoría + no necesarios + sin comprobar + pendientes.
+    Las filas suman exactamente el total del estado de cuenta. Cada fila: rubro, grupo, n, monto."""
+    filas: list[dict] = []
+    if movs is None or len(movs) == 0:
+        return filas
+    comp = movs[movs["estado"] == "comprobado"]
+    cat = comp["categoria"].fillna("").astype(str).str.strip().replace("", "Sin categoría")
+    dev = comp["dev_monto"].fillna(0.0) if "dev_monto" in comp.columns else pd.Series(0.0, index=comp.index)
+    for nombre, sub in comp.groupby(cat, sort=True):
+        filas.append({"rubro": nombre, "grupo": "Comprobado", "n": int(len(sub)),
+                      "monto": round(float(sub["monto"].abs().sum()) - float(dev.loc[sub.index].sum()), 2)})
+    for est, nombre in ESTADOS_CUADRE[1:]:
+        sub = movs[movs["estado"] == est]
+        if len(sub):
+            filas.append({"rubro": nombre, "grupo": nombre, "n": int(len(sub)), "monto": round(float(sub["monto"].abs().sum()), 2)})
+        if est == "en_espera":
+            dev_m, dev_n = _dev_total(movs)
+            if dev_m:
+                filas.append({"rubro": f"Pendientes · devolución del colaborador ({dev_n} gasto(s))", "grupo": "Pendientes", "n": 0, "monto": dev_m})
+    return filas
 
 
-def reclasificar_movimientos(sb, ids: list[str], estado: str, nota: str, motivo_espera: str | None = None) -> int:
-    """El revisor cambia la clasificación de movimientos (también los ya comprobados: se revierte su gasto).
-    estado: 'pendiente' (sin comprobar) | 'no_necesario' | 'en_espera' (pendiente, exige motivo_espera).
-    Regresa cuántos gastos comprobados se revirtieron."""
-    if estado not in ("pendiente", "no_necesario", "en_espera"):
-        raise ErrorNube("Clasificación no permitida.")
-    if not (nota or "").strip():
-        raise ErrorNube("Escribe la nota para el aplicante: por qué se reclasifica.")
-    if estado == "en_espera" and not (motivo_espera or "").strip():
-        raise ErrorNube("Explica por qué el movimiento queda pendiente.")
-    return int(_ejecutar(sb.rpc("reclasificar_movimientos", {"p_movimientos": ids, "p_estado": estado, "p_nota": nota,
-                                                             "p_motivo_espera": (motivo_espera or "").strip() or None})) or 0)
-
-
-def gastos_de_lote(sb, lote_id: str) -> list[dict]:
-    """Gastos incluidos en un lote, con los datos de su solicitud."""
-    gastos = _ejecutar(sb.table("v_gastos").select("*").eq("lote_id", lote_id).eq("eliminado", False)) or []
-    if not gastos:
-        return []
-    sol_ids = list({g["solicitud_id"] for g in gastos})
-    sols = {x["id"]: x for x in (_ejecutar(sb.table("solicitudes").select("id,numero,fecha,description,employee_name,category")
-                                           .in_("id", sol_ids)) or [])}
-    for g in gastos:
-        g["solicitud"] = sols.get(g["solicitud_id"], {})
-    return sorted(gastos, key=lambda g: (g["solicitud"].get("numero") or 0, str(g["id"])))
-
-
-def listar_cobertura(sb, periodo_id: str) -> list[dict]:
-    return _ejecutar(sb.table("v_cobertura_mes").select("*").eq("periodo_id", periodo_id)) or []
-
-
-def estados_cierre_periodo(sb, periodo_id: str) -> dict[str, str]:
-    """{cuenta_id: 'abierto'|'cerrado'} del mes dado, para todas las cuentas (vista del revisor)."""
-    filas = _ejecutar(sb.table("periodos_cuenta").select("cuenta_id,estado").eq("periodo_id", periodo_id)) or []
-    return {f["cuenta_id"]: f["estado"] for f in filas}
-
-
-def cerrar_mes_cuenta(sb, periodo_id: str, cuenta_id: str) -> None:
-    _ejecutar(sb.rpc("cerrar_mes_cuenta", {"p_periodo": periodo_id, "p_cuenta": cuenta_id}))
-
-
-def reabrir_mes_cuenta(sb, periodo_id: str, cuenta_id: str, motivo: str) -> None:
-    _ejecutar(sb.rpc("reabrir_mes_cuenta", {"p_periodo": periodo_id, "p_cuenta": cuenta_id, "p_motivo": motivo}))
-
-
-def aplicantes_por_cuenta(sb) -> dict[str, str]:
-    """{cuenta_id: nombre del aplicante}."""
-    filas = _ejecutar(sb.table("perfiles").select("nombre,cuenta_id,rol").eq("rol", "aplicante")) or []
-    return {f["cuenta_id"]: f["nombre"] for f in filas if f.get("cuenta_id")}
-
-
-# ----------------------------------------------------------------------
-# Adjuntos (Storage)
-# ----------------------------------------------------------------------
-def subir_adjunto(sb, cuenta_id: str, etiqueta_mes: str, pdf: bytes) -> str:
-    ruta = f"{cuenta_id}/{etiqueta_mes}/{uuid.uuid4().hex}.pdf"
-    try:
-        sb.storage.from_(BUCKET).upload(path=ruta, file=pdf, file_options={"content-type": "application/pdf"})
-    except Exception as e:
-        raise ErrorNube(f"No se pudo subir el archivo: {_mensaje(e)}") from e
-    return ruta
-
-
-def borrar_adjuntos_huerfanos(sb, rutas: list[str]) -> None:
-    if rutas:
-        try:
-            sb.storage.from_(BUCKET).remove(rutas)
-        except Exception:
-            pass
-
-
-def url_firmada(sb, ruta: str, segundos: int = 3600) -> str | None:
-    """Enlace temporal al PDF (para abrirlo en una pestaña nueva). None si no se pudo generar."""
-    try:
-        r = sb.storage.from_(BUCKET).create_signed_url(ruta, segundos)
-        url = r.get("signedURL") or r.get("signedUrl") or r.get("signed_url") if isinstance(r, dict) else None
-        if url and url.startswith("/"):
-            base = str(getattr(sb, "supabase_url", "") or "").rstrip("/")
-            url = f"{base}/storage/v1{url}" if "/storage/v1" not in url else f"{base}{url}"
-        return url
-    except Exception:
-        return None
-
-
-def descargar_adjunto(sb, ruta: str) -> bytes:
-    try:
-        return sb.storage.from_(BUCKET).download(ruta)
-    except Exception as e:
-        raise ErrorNube(f"No se pudo descargar el archivo: {_mensaje(e)}") from e
+def overview_estados(movs: pd.DataFrame, comprobacion_de: dict | None = None) -> list[dict]:
+    """Estado de cuenta por tipo de comprobación: comprobados (con su desglose XML / manual), no necesarios,
+    sin comprobar y pendientes. Las filas de nivel 0 suman el total. Cada fila: rubro, nivel (0 total / 1 detalle), n, monto."""
+    filas: list[dict] = []
+    if movs is None or len(movs) == 0:
+        return filas
+    comprobacion_de = comprobacion_de or {}
+    dev_m, dev_n = _dev_total(movs)
+    for est, nombre in ESTADOS_CUADRE:
+        sub = movs[movs["estado"] == est]
+        if len(sub):
+            monto = round(float(sub["monto"].abs().sum()), 2)
+            if est == "comprobado":
+                monto = round(monto - dev_m, 2)
+            filas.append({"rubro": nombre, "nivel": 0, "n": int(len(sub)), "monto": monto})
+        if est == "comprobado" and len(sub):
+            tipo = sub["solicitud_id"].map(lambda x: comprobacion_de.get(x) if comprobacion_de.get(x) in ("XML", "Manual", "XML + manual") else "Sin dato")
+            dev = sub["dev_monto"].fillna(0.0) if "dev_monto" in sub.columns else pd.Series(0.0, index=sub.index)
+            for t in ("XML", "Manual", "XML + manual", "Sin dato"):
+                ss = sub[tipo == t]
+                if len(ss):
+                    filas.append({"rubro": f"↳ {t}", "nivel": 1, "n": int(len(ss)),
+                                  "monto": round(float(ss["monto"].abs().sum()) - float(dev.loc[ss.index].sum()), 2)})
+        if est == "en_espera" and dev_m:
+            filas.append({"rubro": f"Pendientes · devolución del colaborador ({dev_n} gasto(s))", "nivel": 0, "n": 0, "monto": dev_m})
+    return filas
 
 
 # ----------------------------------------------------------------------
-# Envío del estado de cuenta a revisión (005_envios_estado_cuenta.sql)
+# Excel del mes
 # ----------------------------------------------------------------------
-def enviar_estado_cuenta(sb, periodo_id: str, nota: str | None = None, solicitud_ids: list[str] | None = None) -> str:
-    """Envía a revisión las solicitudes del mes con gastos comprobados y guarda la foto del avance.
-    Con `solicitud_ids` solo se envían esas (requiere el script 011); sin él, todas las elegibles."""
-    params = {"p_periodo": periodo_id, "p_nota": nota}
-    if solicitud_ids is not None:
-        params["p_solicitudes"] = solicitud_ids
-    try:
-        return _ejecutar(sb.rpc("enviar_estado_cuenta", params))
-    except ErrorNube as e:
-        if solicitud_ids is not None and "p_solicitudes" in str(e):
-            raise ErrorNube("Falta correr el script 011_enviar_seleccion.sql en Supabase para enviar solo las solicitudes marcadas.") from e
-        raise
-
-
-def listar_envios(sb, cuenta_id: str | None = None, periodo_id: str | None = None) -> list[dict]:
-    q = sb.table("envios_estado_cuenta").select("*")
-    if cuenta_id:
-        q = q.eq("cuenta_id", cuenta_id)
-    if periodo_id:
-        q = q.eq("periodo_id", periodo_id)
-    return _ejecutar(q.order("enviado_en", desc=True)) or []
-
-
-COLUMNAS_REVISION = [
-    "id", "cuenta_id", "periodo_id", "fecha", "descripcion", "monto", "saldo", "estado", "gasto_id", "categoria",
-    "material", "monto_estado", "suma_facturas", "diferencia", "tiene_diferencia", "propina", "solicitud_id",
-    "solicitud_numero", "solicitud_estado", "employee_name", "solicitud_descripcion", "request_number",
-    "lote_id", "lote_numero", "lote_estado", "fecha_pago", "referencia_pago", "motivo_espera", "espera_desde",
-    "nota_revisor", "nota_revisor_en",
+# La hoja tiene dos columnas «No.» (solicitud y banco); internamente la segunda se llama «No. (gasto)».
+COLUMNAS_COMPROBADOS = [
+    "No.", "Applicant", "Category", "Description", "Linked Request No.", "Number of Days", "Total Number of People",
+    "Employee Name", "Material", "Payment Date", "Expense Outflow Amt", "Propina", "No. (gasto)", "Invoice date", "CFDI Folio",
+    "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap (With IVA)", "Diferencia", "Tip sin comprobación", "Devolución sin comprobación", "Status",
+    "Lote enviado a revisión", "Resultado de la revisión", "Monto revisado y aprobado para pago", "Fecha de pago", "Lote de pago",
+    "Cómo se comprobó", "Detalle de la diferencia (tipo de cambio)",
 ]
+_DINERO = {"Diferencia", "Tip sin comprobación", "Devolución sin comprobación", "Expense Outflow Amt", "Propina", "IVA", "ISR Retenido", "IVA Retenido", "ISH",
+           "Reimbursement Cap (With IVA)", "Monto revisado y aprobado para pago"}
 
 
-def listar_movimientos_revision(sb, cuenta_id: str, periodo_id: str) -> pd.DataFrame:
-    """Todo el estado de cuenta del mes, un renglón por movimiento, con su solicitud/gasto/lote."""
-    def construir():
-        return (sb.table("v_movimientos_revision").select("*").eq("cuenta_id", cuenta_id)
-                .eq("periodo_id", periodo_id).order("fecha", desc=False).order("id", desc=False))
-    filas = _paginado(construir)
-    df = pd.DataFrame(filas, columns=COLUMNAS_REVISION) if filas else pd.DataFrame(columns=COLUMNAS_REVISION)
-    if not df.empty:
-        df["monto"] = df["monto"].astype(float)
-    return df
+def _encabezado(c: str) -> str:
+    return "No." if c == "No. (gasto)" else c
 
 
-def uuids_usados(sb, uuids: list[str]) -> set[str]:
-    """Cuáles de estos UUID de CFDI ya están en alguna factura (que no esté eliminada)."""
-    usados: set[str] = set()
-    lista = [u for u in dict.fromkeys(uuids) if u]
-    for i in range(0, len(lista), 100):
-        filas = _ejecutar(sb.table("facturas").select("uuid_cfdi").in_("uuid_cfdi", lista[i:i + 100]).eq("eliminado", False)) or []
-        usados |= {f["uuid_cfdi"] for f in filas}
-    return usados
+def _fecha_corta(valor: Any) -> str:
+    if not valor:
+        return ""
+    try:
+        d = pd.to_datetime(valor)
+        if d.tzinfo is not None:
+            d = d.tz_convert("America/Mexico_City")
+        return d.strftime("%d/%m/%Y")
+    except Exception:
+        return str(valor)[:10]
+
+
+def _ultimo_envio_por_gasto(envio_gastos: list[dict]) -> dict[str, dict]:
+    ultimo: dict[str, dict] = {}
+    for r in sorted(envio_gastos, key=lambda x: (x["envio_numero"], str(x["enviado_en"]))):
+        ultimo[r["gasto_id"]] = r
+    return ultimo
+
+
+def filas_comprobados(solicitudes: list[dict], gastos: list[dict], envio_gastos: list[dict],
+                      applicant: str) -> tuple[list[dict], list[bool]]:
+    """Filas de la hoja «Comprobados»: una por factura. Los datos de la solicitud van en la primera fila de la
+    solicitud y los del gasto/pago en la primera fila de cada gasto. Ordenadas por lote enviado y solicitud.
+    Regresa (filas, resaltar) donde resaltar marca los gastos con diferencia."""
+    sols = {s["id"]: s for s in solicitudes if not s.get("eliminado")}
+    ultimo = _ultimo_envio_por_gasto(envio_gastos)
+
+    def clave(g: dict) -> tuple:
+        e = ultimo.get(g["id"])
+        s = sols[g["solicitud_id"]]
+        return (e["envio_numero"] if e else 10_000, int(s["numero"]), min((m["fecha"] for m in g.get("movimientos") or []), default=""))
+
+    gs = [g for g in gastos if not g.get("eliminado") and g["solicitud_id"] in sols]
+    gs.sort(key=clave)
+    filas: list[dict] = []
+    resaltar: list[bool] = []
+    vistas: set[str] = set()
+    for g in gs:
+        s = sols[g["solicitud_id"]]
+        e = ultimo.get(g["id"])
+        if e:
+            lote_env = f"Lote #{e['envio_numero']} – {_fecha_corta(e['enviado_en'])}"
+            resultado = NOMBRE_RESULTADO.get(e["resultado"], e["resultado"])
+        else:
+            lote_env, resultado = "Por enviar", ""
+        aprobado = e.get("monto_aprobado") if e else None
+        pagado = bool(e and e.get("lote_estado") == "pagado")
+        lote_pago = ""
+        if e and e.get("lote_numero") is not None:
+            lote_pago = f"Lote {int(e['lote_numero'])} · " + ("pagado" if pagado else "por pagar") + (f" · ref. {e['referencia_pago']}" if pagado and e.get("referencia_pago") else "")
+        if not e:
+            estatus = "por_enviar"
+        elif e["resultado"] == "aprobado":
+            estatus = "pagado" if pagado else "aprobado"
+        else:
+            estatus = e["resultado"]
+        movs = sorted(g.get("movimientos") or [], key=lambda m: m["fecha"])
+        fecha_pago_mov = movs[0]["fecha"] if movs else s["fecha"]
+        facturas = g.get("facturas") or [None]
+        primera_sol = s["id"] not in vistas
+        vistas.add(s["id"])
+        for j, f in enumerate(facturas):
+            primera_gasto = j == 0
+            fila = {c: None for c in COLUMNAS_COMPROBADOS}
+            fila["_estatus"] = estatus
+            fila["_gasto"] = g["id"]
+            if primera_sol and primera_gasto:
+                fila.update({
+                    "No.": int(s["numero"]), "Applicant": applicant, "Category": s.get("category") or g.get("categoria") or "",
+                    "Description": s.get("description") or "", "Linked Request No.": s.get("request_number") or "",
+                    "Number of Days": s.get("number_of_days") or 0, "Total Number of People": s.get("number_of_people") or 0,
+                    "Employee Name": s.get("employee_name") or "", "Material": g.get("material") or s.get("material") or "",
+                    "Status": "Comprobado"})
+            if primera_gasto:
+                fila.update({
+                    "Payment Date": fecha_pago_mov, "Expense Outflow Amt": round(float(g["monto_estado"]), 2),
+                    "Propina": _propina_comprobada(g), "No. (gasto)": int(s["numero"]),
+                    "Diferencia": _diferencia_gasto(g),
+                    "Tip sin comprobación": _devuelto_por_tipo(g, "tip_sin_comprobacion"),
+                    "Devolución sin comprobación": _devuelto_por_tipo(g, "sin_comprobacion_devolucion"),
+                    "Detalle de la diferencia (tipo de cambio)": ("Dif. por tipo de cambio: " + str(g.get("detalle_tc") or "")) if g.get("dif_tc") else "",
+                    "Lote enviado a revisión": lote_env, "Resultado de la revisión": resultado,
+                    "Monto revisado y aprobado para pago": round(float(aprobado), 2) if aprobado is not None else None,
+                    "Fecha de pago": _fecha_corta(e.get("fecha_pago")) if pagado else "", "Lote de pago": lote_pago})
+            if f is not None:
+                fila.update({
+                    "Invoice date": f.get("fecha_factura") or "", "CFDI Folio": f.get("uuid_cfdi") or "sin factura",
+                    "IVA": round(float(f.get("iva_aplicado", f.get("iva") or 0)), 2),
+                    "ISR Retenido": round(float(f.get("isr_aplicado", f.get("isr_retenido") or 0)), 2),
+                    "IVA Retenido": round(float(f.get("iva_ret_aplicado", f.get("iva_retenido") or 0)), 2),
+                    "ISH": round(float(f.get("ish_aplicado", f.get("ish") or 0)), 2),
+                    "Reimbursement Cap (With IVA)": round(float(f.get("monto_aplicado") or 0), 2),
+                    "Cómo se comprobó": "XML" if tipo_factura(f) == "xml" else "Manual"})
+            filas.append(fila)
+            resaltar.append(bool(g.get("tiene_diferencia")))
+    return filas, resaltar
+
+
+def _diferencia_gasto(g: dict) -> float:
+    """Cargo del estado de cuenta − facturas − propina (positivo: el cargo es mayor que lo facturado)."""
+    if g.get("diferencia") is not None:
+        return round(float(g["diferencia"]), 2)
+    suma = sum(float(f.get("monto_aplicado") or 0) for f in g.get("facturas") or [])
+    return round(float(g["monto_estado"]) - suma - float(g.get("propina") or 0), 2)
+
+
+def _propina_comprobada(g: dict) -> float:
+    """Propina con comprobante; la que quedó como «tip sin comprobación» no cuenta como propina."""
+    p = float(g.get("propina") or 0) - _devuelto_por_tipo_bruto(g, "tip_sin_comprobacion")
+    return round(max(p, 0.0), 2)
+
+
+def _devuelto_por_tipo_bruto(g: dict, tipo: str) -> float:
+    """Igual que _devuelto_por_tipo pero incluye devoluciones anuladas (la propina sigue sin comprobarse)."""
+    return sum(float(d["monto"]) for d in g.get("devoluciones") or [] if d.get("tipo") == tipo)
+
+
+def _devuelto_por_tipo(g: dict, tipo: str) -> float:
+    """Monto que el colaborador debe devolver de un gasto, por tipo (tip sin comprobación / sin comprobación, devolución)."""
+    return round(sum(float(d["monto"]) for d in g.get("devoluciones") or [] if d.get("tipo") == tipo), 2)
+
+
+def _tabla_movs(movs: pd.DataFrame, estado: str, con_motivo: bool = False) -> pd.DataFrame:
+    sub = movs[movs["estado"] == estado].sort_values(["fecha", "descripcion"]) if len(movs) else movs
+    if estado == "no_necesario":
+        return pd.DataFrame({"Fecha Estado": sub["fecha"], "Descripción Estado": sub["descripcion"], "Monto Estado": sub["monto"].abs()})
+    cols = {"Fecha": sub["fecha"], "Descripción": sub["descripcion"], "Monto": sub["monto"], "Saldo": sub["saldo"]}
+    if con_motivo:
+        cols["Motivo (por qué está pendiente)"] = sub["motivo_espera"]
+        hoy = datetime.date.today()
+        cols["Días pendiente"] = [
+            (hoy - pd.to_datetime(d).date()).days if pd.notna(d) and d else None
+            for d in sub["espera_desde"]]
+        # Movimiento pendiente cuyo motivo es una devolución: su monto es lo que el colaborador debe regresar.
+        cols["Devolución del colaborador"] = [
+            abs(float(m)) if "devoluc" in str(mot or "").lower().replace("ó", "o") else None
+            for m, mot in zip(sub["monto"], sub["motivo_espera"])]
+    return pd.DataFrame(cols)
+
+
+TIPO_DEVOLUCION_TXT = {"tip_sin_comprobacion": "Tip sin comprobación", "sin_comprobacion_devolucion": "Sin comprobación, devolución"}
+
+
+def _filas_devolucion_gastos(solicitudes: list[dict], gastos: list[dict]) -> list[dict]:
+    """Devoluciones del colaborador (tip sin comprobación y gastos «sin comprobación, devolución») como renglones de «Pendientes».
+    No son movimientos del banco: no entran al cuadre del estado de cuenta; van en su propia columna de monto."""
+    sols = {x["id"]: x for x in solicitudes if not x.get("eliminado")}
+    hoy = datetime.date.today()
+    filas: list[dict] = []
+    for g in gastos:
+        if g.get("eliminado") or g["solicitud_id"] not in sols:
+            continue
+        sol = sols[g["solicitud_id"]]
+        movs = sorted(m["fecha"] for m in g.get("movimientos") or [])
+        for d in g.get("devoluciones") or []:
+            devuelto = d.get("estado") == "devuelto"
+            motivo = f"{TIPO_DEVOLUCION_TXT.get(d['tipo'], d['tipo'])}: el colaborador debe devolverlo a la cuenta de la empresa"
+            if devuelto:
+                motivo = f"{TIPO_DEVOLUCION_TXT.get(d['tipo'], d['tipo'])}: YA DEVUELTO el {_fecha_corta(d.get('devuelto_en'))} (ref. {d.get('devuelto_ref') or '—'})"
+            creado = pd.to_datetime(d.get("creado_en"), errors="coerce", utc=True)
+            filas.append({"Fecha": movs[0] if movs else sol["fecha"],
+                          "Descripción": f"[Devolución del colaborador] Sol. #{int(sol['numero'])} · {sol.get('employee_name') or '—'} · {sol.get('description') or ''}",
+                          "Monto": None, "Saldo": None, "Motivo (por qué está pendiente)": motivo,
+                          "Días pendiente": None if devuelto or pd.isna(creado) else (hoy - creado.date()).days,
+                          "Devolución del colaborador": round(float(d["monto"]), 2)})
+    return filas
+
+
+def _pendientes_con_devoluciones(pe: pd.DataFrame, solicitudes: list[dict], gastos: list[dict]) -> pd.DataFrame:
+    extra = _filas_devolucion_gastos(solicitudes, gastos)
+    if not extra:
+        return pe
+    return pd.concat([pe, pd.DataFrame(extra, columns=list(pe.columns))], ignore_index=True)
+
+
+def _formato_comprobacion(wb, ws, col: int, n: int) -> None:
+    """Sombrea la columna «Cómo se comprobó»: XML en azul, manual en naranja."""
+    if n <= 0:
+        return
+    for texto, (fondo, color) in COLOR_COMPROBACION.items():
+        ws.conditional_format(1, col, n, col, {"type": "cell", "criteria": "==", "value": f'"{texto}"',
+                                               "format": wb.add_format({"bg_color": fondo, "font_color": color, "bold": True})})
+
+
+def excel_mes(cuenta_nombre: str, periodo: str, applicant: str, movs: pd.DataFrame, solicitudes: list[dict],
+              gastos: list[dict], envio_gastos: list[dict], envios_resumen: list[dict]) -> bytes:
+    """Excel del mes: Comprobados (con la columna del lote enviado a revisión), No necesarios, Sin comprobar,
+    Pendientes, Solicitudes abiertas y Resumen (cuadre + lotes enviados vs. aprobados)."""
+    filas, resaltar = filas_comprobados(solicitudes, gastos, envio_gastos, applicant)
+    df = pd.DataFrame(filas, columns=COLUMNAS_COMPROBADOS)
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as w:
+        wb = w.book
+        head = wb.add_format({"bold": True, "bg_color": C_HEADER, "font_color": "white", "border": 1,
+                              "align": "center", "valign": "vcenter", "text_wrap": True})
+        head_gris = wb.add_format({"bold": True, "bg_color": "#374151", "font_color": "white", "border": 1,
+                                   "align": "center", "valign": "vcenter", "text_wrap": True})
+        dinero = wb.add_format({"num_format": FORMATO_DINERO})
+        dinero_am = wb.add_format({"num_format": FORMATO_DINERO, "bg_color": C_AMARILLO})
+        texto_am = wb.add_format({"bg_color": C_AMARILLO})
+        negrita = wb.add_format({"bold": True})
+        titulo = wb.add_format({"bold": True, "font_size": 14})
+        total_f = wb.add_format({"bold": True, "num_format": FORMATO_DINERO, "top": 1})
+        total_t = wb.add_format({"bold": True, "top": 1})
+        ok_f = wb.add_format({"bold": True, "font_color": "#15803D"})
+        mal_f = wb.add_format({"bold": True, "font_color": "#DC2626"})
+
+        # ---- Comprobados ----
+        df.to_excel(w, index=False, sheet_name="Comprobados", header=False, startrow=1)
+        ws = w.sheets["Comprobados"]
+        for i, c in enumerate(COLUMNAS_COMPROBADOS):
+            ws.write(0, i, _encabezado(c), head_gris if i >= COLUMNAS_COMPROBADOS.index("Lote enviado a revisión") else head)
+        anchos = {"No.": 6, "No. (gasto)": 6, "Applicant": 12, "Category": 20, "Description": 26, "Linked Request No.": 18, "Number of Days": 10,
+                  "Total Number of People": 12, "Employee Name": 28, "Material": 12, "Payment Date": 13, "Invoice date": 13,
+                  "CFDI Folio": 38, "Status": 13, "Lote enviado a revisión": 24, "Resultado de la revisión": 20,
+                  "Fecha de pago": 13, "Lote de pago": 30, "Cómo se comprobó": 16, "Detalle de la diferencia (tipo de cambio)": 44}
+        for i, c in enumerate(COLUMNAS_COMPROBADOS):
+            ws.set_column(i, i, anchos.get(c, 16), dinero if c in _DINERO else None)
+        ws.set_row(0, 42)
+        ws.freeze_panes(1, 0)
+        ws.autofilter(0, 0, max(len(df), 1), len(COLUMNAS_COMPROBADOS) - 1)
+        _formato_comprobacion(wb, ws, COLUMNAS_COMPROBADOS.index("Cómo se comprobó"), len(df))
+        for r, marcar in enumerate(resaltar, start=1):     # diferencia dentro de tolerancia: fila en amarillo tenue
+            if not marcar:
+                continue
+            for i, c in enumerate(COLUMNAS_COMPROBADOS):
+                v = df.iloc[r - 1, i]
+                v = v.item() if hasattr(v, "item") else v
+                if pd.isna(v):
+                    ws.write_blank(r, i, None, texto_am)
+                elif c in _DINERO:
+                    ws.write_number(r, i, float(v), dinero_am)
+                else:
+                    ws.write(r, i, v, texto_am)
+        # Totales al pie
+        fin = len(df) + 2
+        ws.write(fin, COLUMNAS_COMPROBADOS.index("Expense Outflow Amt") - 1, "Total", total_t)
+        for c in ("Expense Outflow Amt", "Propina", "Reimbursement Cap (With IVA)", "Diferencia", "Tip sin comprobación",
+                  "Devolución sin comprobación", "Monto revisado y aprobado para pago"):
+            i = COLUMNAS_COMPROBADOS.index(c)
+            col = xl_col_to_name(i)
+            ws.write_formula(fin, i, f"=SUBTOTAL(109,{col}2:{col}{len(df) + 1})", total_f)
+
+        # ---- No necesarios / Sin comprobar / Pendientes ----
+        nn = _tabla_movs(movs, "no_necesario")
+        nn.to_excel(w, index=False, sheet_name="No necesarios", header=False, startrow=1)
+        sc = _tabla_movs(movs, "pendiente")
+        sc.to_excel(w, index=False, sheet_name="Sin comprobar", header=False, startrow=1)
+        pe = _pendientes_con_devoluciones(_tabla_movs(movs, "en_espera", con_motivo=True), solicitudes, gastos)
+        pe.to_excel(w, index=False, sheet_name="Pendientes", header=False, startrow=1)
+        for nombre, tabla, anchos_h in (("No necesarios", nn, [14, 46, 16]), ("Sin comprobar", sc, [14, 46, 16, 16]),
+                                         ("Pendientes", pe, [14, 56, 16, 16, 60, 14, 20])):
+            h = w.sheets[nombre]
+            for i, c in enumerate(tabla.columns):
+                h.write(0, i, c, head)
+                h.set_column(i, i, anchos_h[i], dinero if c in ("Monto", "Monto Estado", "Saldo", "Devolución del colaborador") else None)
+            h.freeze_panes(1, 0)
+            h.autofilter(0, 0, max(len(tabla), 1), len(tabla.columns) - 1)
+            if nombre == "Pendientes" and "Devolución del colaborador" in tabla.columns and len(tabla):
+                j = list(tabla.columns).index("Devolución del colaborador")
+                h.write(len(tabla) + 2, j - 1, "Total a devolver por el colaborador", total_t)
+                h.write_formula(len(tabla) + 2, j, f"=SUBTOTAL(109,{xl_col_to_name(j)}2:{xl_col_to_name(j)}{len(tabla) + 1})", total_f)
+
+        # ---- Solicitudes abiertas (bitácora sin gasto) ----
+        con_gasto = {g["solicitud_id"] for g in gastos if not g.get("eliminado")}
+        abiertas = [{"No.": int(s["numero"]), "Fecha": s["fecha"], "Category": s.get("category") or "", "Description": s.get("description") or "",
+                     "Employee Name": s.get("employee_name") or "", "Linked Request No.": s.get("request_number") or "",
+                     "Monto tentativo": float(s.get("monto_tentativo") or 0)}
+                    for s in sorted(solicitudes, key=lambda x: int(x["numero"])) if not s.get("eliminado") and s["id"] not in con_gasto]
+        sa = pd.DataFrame(abiertas, columns=["No.", "Fecha", "Category", "Description", "Employee Name", "Linked Request No.", "Monto tentativo"])
+        sa.to_excel(w, index=False, sheet_name="Solicitudes sin comprobar", header=False, startrow=1)
+        h = w.sheets["Solicitudes sin comprobar"]
+        for i, c in enumerate(sa.columns):
+            h.write(0, i, c, head)
+            h.set_column(i, i, [6, 13, 22, 34, 28, 20, 16][i], dinero if c == "Monto tentativo" else None)
+
+        # ---- Resumen ----
+        rs = wb.add_worksheet("Resumen")
+        rs.set_column(0, 0, 30); rs.set_column(1, 8, 17)
+        rs.write(0, 0, f"Comprobación de caja chica · {cuenta_nombre} · {periodo}", titulo)
+        rs.write(1, 0, f"Generado el {datetime.date.today().strftime('%d/%m/%Y')}")
+        c = cuadre(con_devolucion(movs, gastos))
+        rs.write(3, 0, "Cuadre del estado de cuenta", negrita)
+        for i, t in enumerate(("Clasificación", "Movimientos", "Monto")):
+            rs.write(4, i, t, head)
+        fila = 5
+        for est, nombre in ESTADOS_CUADRE:
+            rs.write(fila, 0, nombre); rs.write_number(fila, 1, c["por_estado"][est]["n"]); rs.write_number(fila, 2, c["por_estado"][est]["monto"], dinero)
+            fila += 1
+        rs.write(fila, 0, "Suma de las 4 clasificaciones", total_t); rs.write_number(fila, 1, c["n_suma"], total_t); rs.write_number(fila, 2, c["monto_suma"], total_f)
+        rs.write(fila + 1, 0, "Total del estado de cuenta", negrita); rs.write_number(fila + 1, 1, c["n_total"]); rs.write_number(fila + 1, 2, c["monto_total"], dinero)
+        rs.write(fila + 2, 0, "Resultado", negrita)
+        rs.write(fila + 2, 1, "✔ Cuadra" if c["cuadra"] else f"✘ No cuadra (dif. {c['dif_n']} mov. / {c['dif_monto']:,.2f})", ok_f if c["cuadra"] else mal_f)
+        if c["devolucion"]["monto"]:
+            rs.write(fila + 3, 0, f"Nota: «Pendientes» incluye {c['devolucion']['monto']:,.2f} de devolución del colaborador "
+                                  f"({c['devolucion']['n']} gasto(s): tip sin comprobación / sin comprobación). Ese monto salió de «Comprobados».", negrita)
+
+        fila += 5
+        rs.write(fila, 0, "Lotes enviados a revisión", negrita)
+        enc = ["Lote enviado", "Fecha de envío", "Gastos", "Monto enviado", "Monto revisado y aprobado para pago",
+               "Devuelto", "En revisión", "Pagado", "Fecha de pago"]
+        for i, t in enumerate(enc):
+            rs.write(fila + 1, i, t, head)
+        rs.set_row(fila + 1, 44)
+        r = fila + 2
+        for e in envios_resumen:
+            rs.write(r, 0, f"Lote enviado #{e['numero']}"); rs.write(r, 1, _fecha_corta(e["enviado_en"]))
+            rs.write_number(r, 2, int(e["gastos_enviados"]))
+            for i, k in enumerate(("monto_enviado", "monto_aprobado", "monto_devuelto", "monto_en_revision", "monto_pagado"), start=3):
+                rs.write_number(r, i, float(e[k] or 0), dinero)
+            if e.get("ultimo_pago"):
+                p1, p2 = _fecha_corta(e.get("primer_pago")), _fecha_corta(e["ultimo_pago"])
+                rs.write(r, 8, p1 if p1 == p2 else f"{p1} a {p2}")
+            r += 1
+        if envios_resumen:
+            rs.write(r, 0, "Total", total_t); rs.write(r, 1, "", total_t)
+            rs.write_number(r, 2, sum(int(e["gastos_enviados"]) for e in envios_resumen), total_t)
+            for i, k in enumerate(("monto_enviado", "monto_aprobado", "monto_devuelto", "monto_en_revision", "monto_pagado"), start=3):
+                rs.write_number(r, i, sum(float(e[k] or 0) for e in envios_resumen), total_f)
+            rs.write(r + 2, 0, "Un gasto devuelto y reenviado aparece en el lote donde se envió por primera vez como «devuelto» y de nuevo en el lote en que se reenvía.")
+        else:
+            rs.write(r, 0, "Aún no hay lotes enviados a revisión este mes.")
+    return out.getvalue()
 
 
 # ----------------------------------------------------------------------
-# Lotes enviados a revisión (envíos numerados) y reportes
+# Excel completo del revisor (varias cuentas y meses, total o parcial)
 # ----------------------------------------------------------------------
-def listar_envio_gastos(sb, cuenta_id: str, periodo_id: str | None = None) -> list[dict]:
-    """Cada gasto de cada envío (del mes dado, o de todos) con su resultado (en_revision / aprobado / devuelto)."""
-    def construir():
-        q = sb.table("v_envio_gastos").select("*").eq("cuenta_id", cuenta_id)
-        if periodo_id:
-            q = q.eq("periodo_id", periodo_id)
-        return q.order("envio_numero", desc=False).order("gasto_id", desc=False)
-    return _paginado(construir)
+ESTATUS_GASTO = {"por_enviar": "Por enviar", "en_revision": "En revisión", "devuelto": "Devuelto",
+                 "aprobado": "Aprobado · por pagar", "pagado": "Pagado"}
 
 
-def listar_envios_resumen(sb, cuenta_id: str, periodo_id: str) -> list[dict]:
-    """Un renglón por envío: monto enviado vs. aprobado para pago, devuelto, en revisión, pagado y fecha de pago."""
-    return _ejecutar(sb.table("v_envios_resumen").select("*").eq("cuenta_id", cuenta_id)
-                     .eq("periodo_id", periodo_id).order("numero", desc=False)) or []
+def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus: set[str] | None = None) -> bytes:
+    """Excel con el desglose de comprobación de una o varias cuentas y meses.
+
+    conjuntos: lista de {cuenta, periodo, applicant, movs, sols, gastos, env_g}.
+    hojas: subconjunto de {'comprobados','no_necesarios','sin_comprobar','pendientes','resumen'} (por omisión, todas).
+    estatus: de los comprobados, solo los gastos con estos estatus (claves de ESTATUS_GASTO); por omisión, todos."""
+    hojas = hojas or {"comprobados", "no_necesarios", "sin_comprobar", "pendientes", "resumen"}
+    estatus = estatus or set(ESTATUS_GASTO)
+    cols_c = ["Cuenta", "Mes", *COLUMNAS_COMPROBADOS, "Estatus del gasto"]
+    filas_c: list[dict] = []
+    marcar: list[bool] = []
+    resumen_filas: list[dict] = []
+    nn, sc, pe = [], [], []
+    resumenes_tarjeta: list[tuple[str, str, dict]] = []
+    for c in conjuntos:
+        filas, resaltar = filas_comprobados(c["sols"], c["gastos"], c["env_g"], c.get("applicant") or "")
+        por_gasto: dict[str, tuple[str, float]] = {}
+        for f, r in zip(filas, resaltar):
+            if f["_estatus"] not in estatus:
+                continue
+            f = {**f, "Cuenta": c["cuenta"], "Mes": c["periodo"], "Estatus del gasto": ESTATUS_GASTO.get(f["_estatus"], f["_estatus"])}
+            filas_c.append(f)
+            marcar.append(r)
+            if f.get("Expense Outflow Amt") is not None:
+                por_gasto[f["_gasto"]] = (f["_estatus"], float(f["Expense Outflow Amt"]))
+        cu = cuadre(con_devolucion(c["movs"], c["gastos"]))
+        rt = resumen_tarjeta(cu, saldo_final(c["movs"]), c.get("limite"))
+        resumenes_tarjeta.append((c["cuenta"], c["periodo"], rt))
+        fila = {"Cuenta": c["cuenta"], "Mes": c["periodo"]}
+        for est, nombre in ESTADOS_CUADRE:
+            fila[f"{nombre} (mov.)"] = cu["por_estado"][est]["n"]
+            fila[f"{nombre} ($)"] = cu["por_estado"][est]["monto"]
+        fila["Pendientes: devolución del colaborador ($)"] = cu["devolucion"]["monto"]
+        fila["Balance ($)"] = rt["balance"]
+        fila["Total card / límite ($)"] = rt["limite"]
+        fila["Diferencia vs. tarjeta ($)"] = rt["diferencia"]
+        fila["Total (mov.)"] = cu["n_total"]
+        fila["Total ($)"] = cu["monto_total"]
+        fila["Cuadra"] = "Sí" if cu["cuadra"] else "No"
+        for k, nombre in ESTATUS_GASTO.items():
+            fila[f"Gastos {nombre.lower()} ($)"] = round(sum(m for e, m in por_gasto.values() if e == k), 2)
+        resumen_filas.append(fila)
+        for lista, est, con_motivo in ((nn, "no_necesario", False), (sc, "pendiente", False), (pe, "en_espera", True)):
+            t = _tabla_movs(c["movs"], est, con_motivo)
+            if len(t):
+                t.insert(0, "Mes", c["periodo"]); t.insert(0, "Cuenta", c["cuenta"])
+                if "nota_revisor" in c["movs"].columns:
+                    sub = c["movs"][c["movs"]["estado"] == est].sort_values(["fecha", "descripcion"])
+                    t["Nota del revisor"] = sub["nota_revisor"].values
+                lista.append(t)
+        # Devoluciones del colaborador por gastos (tip sin comprobación, sin comprobación) → también en «Pendientes»
+        extra = _filas_devolucion_gastos(c["sols"], c["gastos"])
+        if extra:
+            tx = pd.DataFrame(extra)
+            tx.insert(0, "Mes", c["periodo"]); tx.insert(0, "Cuenta", c["cuenta"])
+            tx["Nota del revisor"] = ""
+            pe.append(tx)
+
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as w:
+        wb = w.book
+        head = wb.add_format({"bold": True, "bg_color": C_HEADER, "font_color": "white", "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True})
+        head_gris = wb.add_format({"bold": True, "bg_color": "#374151", "font_color": "white", "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True})
+        dinero = wb.add_format({"num_format": FORMATO_DINERO})
+        dinero_am = wb.add_format({"num_format": FORMATO_DINERO, "bg_color": C_AMARILLO})
+        texto_am = wb.add_format({"bg_color": C_AMARILLO})
+        titulo = wb.add_format({"bold": True, "font_size": 14})
+        escritas = 0
+        if "comprobados" in hojas:
+            df = pd.DataFrame(filas_c, columns=cols_c)
+            df.to_excel(w, index=False, sheet_name="Comprobados", header=False, startrow=1)
+            ws = w.sheets["Comprobados"]
+            ini_gris = cols_c.index("Lote enviado a revisión")
+            for i, c in enumerate(cols_c):
+                ws.write(0, i, _encabezado(c), head_gris if i >= ini_gris else head)
+            for i, c in enumerate(cols_c):
+                ws.set_column(i, i, {"Cuenta": 16, "Mes": 9, "Estatus del gasto": 22}.get(c, 14 if c in _DINERO else {
+                    "No.": 6, "No. (gasto)": 6, "Description": 26, "Employee Name": 28, "CFDI Folio": 38, "Lote enviado a revisión": 24,
+                    "Resultado de la revisión": 20, "Lote de pago": 30, "Category": 20, "Detalle de la diferencia (tipo de cambio)": 44}.get(c, 14)), dinero if c in _DINERO else None)
+            ws.set_row(0, 42)
+            ws.freeze_panes(1, 2)
+            ws.autofilter(0, 0, max(len(df), 1), len(cols_c) - 1)
+            _formato_comprobacion(wb, ws, cols_c.index("Cómo se comprobó"), len(df))
+            for r, m in enumerate(marcar, start=1):
+                if not m:
+                    continue
+                for i, c in enumerate(cols_c):
+                    v = df.iloc[r - 1, i]
+                    v = v.item() if hasattr(v, "item") else v
+                    if pd.isna(v):
+                        ws.write_blank(r, i, None, texto_am)
+                    elif c in _DINERO:
+                        ws.write_number(r, i, float(v), dinero_am)
+                    else:
+                        ws.write(r, i, v, texto_am)
+            # Resumen de la tarjeta (uno por cuenta y mes) al pie de la hoja
+            fila_x = len(df) + 3
+            lbl = wb.add_format({"bold": True}); lbl_g = wb.add_format({"bold": True, "top": 1})
+            val = wb.add_format({"num_format": FORMATO_DINERO}); val_g = wb.add_format({"bold": True, "top": 1, "num_format": FORMATO_DINERO})
+            tit = wb.add_format({"bold": True, "bg_color": "#E5E7EB", "border": 1})
+            for cta_n, mes_n, rt in resumenes_tarjeta:
+                ws.merge_range(fila_x, 0, fila_x, 3, f"Resumen de la tarjeta · {cta_n} · {mes_n}", tit)
+                lineas = [("Total comprobados", rt["comprobados"], False), ("PENDIENTE DE REEMBOLSO", rt["pendientes"], False)]
+                if rt["sin_comprobar"]:
+                    lineas.append(("SIN COMPROBAR", rt["sin_comprobar"], False))
+                r0 = fila_x + 1
+                for k, (n, v, _) in enumerate(lineas):
+                    ws.merge_range(r0 + k, 0, r0 + k, 2, n, lbl); ws.write_number(r0 + k, 3, v, val)
+                r = r0 + len(lineas)
+                ws.merge_range(r, 0, r, 2, "Subtotal", lbl_g); ws.write_formula(r, 3, f"=SUM(D{r0 + 1}:D{r})", val_g, rt["subtotal"])
+                if rt["balance"] is not None:
+                    ws.merge_range(r + 1, 0, r + 1, 2, "BALANCE (saldo de la cuenta)", lbl); ws.write_number(r + 1, 3, rt["balance"], val)
+                    ws.merge_range(r + 2, 0, r + 2, 2, "Subtotal + balance", lbl); ws.write_formula(r + 2, 3, f"=D{r + 1}+D{r + 2}", val, rt["suma"])
+                    r += 2
+                if rt["limite"] is not None:
+                    ws.merge_range(r + 1, 0, r + 1, 2, "DIFERENCIA", lbl); ws.write_formula(r + 1, 3, f"=D{r + 3}-D{r + 1}", val, rt["diferencia"])
+                    ws.merge_range(r + 2, 0, r + 2, 2, "Total card (límite)", lbl_g); ws.write_number(r + 2, 3, rt["limite"], val_g)
+                    r += 2
+                fila_x = r + 3
+            escritas += 1
+        for clave, nombre, listas, anchos in (
+                ("no_necesarios", "No necesarios", nn, {"Cuenta": 16, "Mes": 9, "Fecha Estado": 14, "Descripción Estado": 46, "Monto Estado": 16, "Nota del revisor": 40}),
+                ("sin_comprobar", "Sin comprobar", sc, {"Cuenta": 16, "Mes": 9, "Fecha": 14, "Descripción": 46, "Monto": 16, "Saldo": 16, "Nota del revisor": 40}),
+                ("pendientes", "Pendientes", pe, {"Cuenta": 16, "Mes": 9, "Fecha": 14, "Descripción": 46, "Monto": 16, "Saldo": 16,
+                                                  "Motivo (por qué está pendiente)": 60, "Días pendiente": 14, "Devolución del colaborador": 20, "Nota del revisor": 40})):
+            if clave not in hojas:
+                continue
+            t = pd.concat(listas, ignore_index=True) if listas else pd.DataFrame(columns=["Cuenta", "Mes", "Fecha", "Descripción", "Monto"])
+            t.to_excel(w, index=False, sheet_name=nombre, header=False, startrow=1)
+            h = w.sheets[nombre]
+            for i, c in enumerate(t.columns):
+                h.write(0, i, c, head)
+                h.set_column(i, i, anchos.get(c, 14), dinero if c in ("Monto", "Monto Estado", "Saldo", "Devolución del colaborador") else None)
+            h.freeze_panes(1, 0)
+            h.autofilter(0, 0, max(len(t), 1), len(t.columns) - 1)
+            if nombre == "Pendientes" and "Devolución del colaborador" in t.columns and len(t):
+                j = list(t.columns).index("Devolución del colaborador")
+                tot_pe = wb.add_format({"bold": True, "top": 1, "num_format": FORMATO_DINERO})
+                h.write(len(t) + 2, j - 1, "Total a devolver por el colaborador", wb.add_format({"bold": True, "top": 1}))
+                h.write_formula(len(t) + 2, j, f"=SUBTOTAL(109,{xl_col_to_name(j)}2:{xl_col_to_name(j)}{len(t) + 1})", tot_pe)
+            escritas += 1
+        if "resumen" in hojas or escritas == 0:
+            rs = pd.DataFrame(resumen_filas)
+            rs.to_excel(w, index=False, sheet_name="Resumen", startrow=3)
+            h = w.sheets["Resumen"]
+            h.write(0, 0, "Comprobación de caja chica · desglose del revisor", titulo)
+            h.write(1, 0, f"Generado el {datetime.date.today().strftime('%d/%m/%Y')} · {len(conjuntos)} cuenta(s)/mes(es)")
+            for i, c in enumerate(rs.columns):
+                h.write(3, i, c, head)
+                h.set_column(i, i, 16 if i < 2 else 15, dinero if "($)" in c else None)
+            h.set_row(3, 44)
+            if len(rs):
+                fin = len(rs) + 4
+                tot = wb.add_format({"bold": True, "top": 1, "num_format": FORMATO_DINERO})
+                tot_t = wb.add_format({"bold": True, "top": 1})
+                h.write(fin, 0, "Total", tot_t)
+                for i, c in enumerate(rs.columns):
+                    if i < 2 or c == "Cuadra":
+                        continue
+                    col = xl_col_to_name(i)
+                    h.write_formula(fin, i, f"=SUM({col}5:{col}{fin})", tot if "($)" in c else tot_t)
+    return out.getvalue()
 
 
-def solicitudes_con_pendiente_abierto(sb, cuenta_id: str) -> set[str]:
-    """Ids de solicitudes que tienen algún pendiente abierto del revisor (no se pueden reenviar)."""
-    pend = _ejecutar(sb.table("gastos_pendientes").select("gasto_id").eq("cuenta_id", cuenta_id).neq("estado", "resuelto")) or []
-    if not pend:
-        return set()
-    ids = list({p["gasto_id"] for p in pend})
-    gastos = _ejecutar(sb.table("gastos").select("solicitud_id").in_("id", ids)) or []
-    return {g["solicitud_id"] for g in gastos}
+# ----------------------------------------------------------------------
+# Búsqueda del aplicante (todos los meses de su cuenta)
+# ----------------------------------------------------------------------
+COLUMNAS_BUSQUEDA = ["Tipo", "Mes", "Fecha", "Sol. #", "Descripción", "Concepto", "Empleado", "Categoría", "Request", "Monto",
+                     "UUID", "Cómo se comprobó", "Estado", "Lote enviado", "Resultado de la revisión", "Lote de pago",
+                     "Fecha de pago", "Referencia de pago"]
+
+
+def filas_busqueda(solicitudes: list[dict], gastos: list[dict], movs: pd.DataFrame, envio_gastos: list[dict],
+                   etiqueta_periodo: dict[str, str]) -> list[dict]:
+    """Un renglón por solicitud (con o sin gasto) y por cada movimiento del banco que no está comprobado,
+    de todos los meses; sirve para buscar un pago por monto, concepto, request, empleado o categoría."""
+    sols = {s["id"]: s for s in solicitudes if not s.get("eliminado")}
+    por_sol: dict[str, list[dict]] = {}
+    for g in gastos:
+        if not g.get("eliminado") and g["solicitud_id"] in sols:
+            por_sol.setdefault(g["solicitud_id"], []).append(g)
+    ultimo = _ultimo_envio_por_gasto(envio_gastos)
+    filas: list[dict] = []
+    for sid, s in sols.items():
+        gs = por_sol.get(sid, [])
+        base = {"Mes": etiqueta_periodo.get(s.get("periodo_id"), str(s["fecha"])[:7]), "Sol. #": int(s["numero"]),
+                "Descripción": s.get("description") or "", "Empleado": s.get("employee_name") or "",
+                "Categoría": s.get("category") or "", "Request": s.get("request_number") or ""}
+        if not gs:
+            filas.append({**base, "Tipo": "Solicitud sin comprobar", "Fecha": str(s["fecha"])[:10], "Concepto": "",
+                          "Monto": round(float(s.get("monto_tentativo") or 0), 2), "UUID": "", "Cómo se comprobó": "",
+                          "Estado": "Sin comprobar", "Lote enviado": "", "Resultado de la revisión": "", "Lote de pago": "",
+                          "Fecha de pago": "", "Referencia de pago": ""})
+            continue
+        es = [ultimo[g["id"]] for g in gs if g["id"] in ultimo]
+        e = max(es, key=lambda x: x["envio_numero"]) if es else None
+        pagado = bool(e and e.get("lote_estado") == "pagado")
+        uuids = [f["uuid_cfdi"] for g in gs for f in g.get("facturas") or [] if f.get("uuid_cfdi")]
+        fechas = [m["fecha"] for g in gs for m in g.get("movimientos") or []]
+        filas.append({
+            **base, "Tipo": "Gasto comprobado", "Fecha": min(fechas) if fechas else str(s["fecha"])[:10], "Concepto": _conceptos(gs),
+            "Categoría": gs[0].get("categoria") or base["Categoría"],
+            "Monto": round(sum(float(g["monto_estado"]) for g in gs), 2), "UUID": ", ".join(uuids),
+            "Cómo se comprobó": tipo_comprobacion(gs), "Estado": SITUACION_SOLICITUD.get(s["estado"], s["estado"]),
+            "Lote enviado": f"#{e['envio_numero']} – {_fecha_corta(e['enviado_en'])}" if e else "Por enviar",
+            "Resultado de la revisión": NOMBRE_RESULTADO.get(e["resultado"], e["resultado"]) if e else "",
+            "Lote de pago": (f"Lote {int(e['lote_numero'])} · " + ("pagado" if pagado else "por pagar")) if e and e.get("lote_numero") is not None else "",
+            "Fecha de pago": _fecha_corta(e.get("fecha_pago")) if pagado else "",
+            "Referencia de pago": (e.get("referencia_pago") or "") if pagado else ""})
+    if movs is not None and len(movs):
+        for r in movs.itertuples():
+            if r.estado == "comprobado":
+                continue
+            estado = {"no_necesario": "No necesario", "en_espera": "Pendiente"}.get(r.estado, "Sin comprobar")
+            motivo = getattr(r, "motivo_espera", None)
+            filas.append({"Tipo": "Movimiento del banco", "Mes": etiqueta_periodo.get(r.periodo_id, str(r.fecha)[:7]), "Fecha": str(r.fecha)[:10],
+                          "Sol. #": None, "Descripción": r.descripcion, "Concepto": str(motivo) if isinstance(motivo, str) and motivo else "",
+                          "Empleado": "", "Categoría": "", "Request": "", "Monto": round(abs(float(r.monto)), 2), "UUID": "",
+                          "Cómo se comprobó": "", "Estado": estado, "Lote enviado": "", "Resultado de la revisión": "", "Lote de pago": "",
+                          "Fecha de pago": "", "Referencia de pago": ""})
+    filas.sort(key=lambda f: (str(f["Fecha"]), f["Sol. #"] or 0), reverse=True)
+    return filas
+
+
+def excel_tabla(tabla: pd.DataFrame, nombre_hoja: str = "Resultados") -> bytes:
+    """Excel simple de una tabla (resultados de una búsqueda)."""
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as w:
+        tabla.to_excel(w, index=False, sheet_name=nombre_hoja)
+        h = w.sheets[nombre_hoja]
+        head = w.book.add_format({"bold": True, "bg_color": C_HEADER, "font_color": "white", "border": 1, "align": "center", "text_wrap": True})
+        dinero = w.book.add_format({"num_format": FORMATO_DINERO})
+        for i, c in enumerate(tabla.columns):
+            h.write(0, i, c, head)
+            h.set_column(i, i, 16 if c != "Descripción" else 34, dinero if c == "Monto" else None)
+        h.freeze_panes(1, 0)
+        h.autofilter(0, 0, max(len(tabla), 1), len(tabla.columns) - 1)
+    return out.getvalue()
