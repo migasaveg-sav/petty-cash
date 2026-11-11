@@ -191,6 +191,28 @@ def cuadre_html(c: dict) -> str:
     return html
 
 
+def resumen_tarjeta_html(r: dict) -> str:
+    """Resumen de la tarjeta: comprobados + pendientes = subtotal; + balance; diferencia contra el límite (Total card)."""
+    def fila(txt, v, fuerte=False, color=None):
+        est = "font-weight:700;border-top:1px solid #CBD5E1;" if fuerte else ""
+        col = f"color:{color};" if color else ""
+        return (f'<tr style="{est}{col}"><td style="padding:3px 18px 3px 0">{txt}</td>'
+                f'<td style="text-align:right;padding:3px 0">{money_html(v)}</td></tr>')
+    h = fila("Total comprobados", r["comprobados"]) + fila("Pendiente de reembolso", r["pendientes"])
+    if r["sin_comprobar"]:
+        h += fila("Sin comprobar", r["sin_comprobar"])
+    h += fila("Subtotal", r["subtotal"], True)
+    if r["balance"] is not None:
+        h += fila("Balance (saldo de la cuenta)", r["balance"]) + fila("Subtotal + balance", r["suma"], True)
+    if r["limite"] is not None:
+        dif = r["diferencia"]
+        h += fila("Diferencia", dif, False, "#B91C1C" if abs(dif) >= 0.005 else "#15803D") + fila("Total card (límite de la cuenta)", r["limite"], True)
+    else:
+        h += '<tr><td colspan="2" style="color:#64748B;font-size:0.82rem;padding-top:4px">Esta cuenta no tiene límite configurado (Total card).</td></tr>'
+    return (f'<div style="border:1px solid #E2E8F0;background:#F8FAFC;border-radius:8px;padding:8px 14px;margin:6px 0;display:inline-block;min-width:360px">'
+            f'<div style="font-weight:700;margin-bottom:4px">💳 Resumen de la tarjeta</div><table style="border-collapse:collapse">{h}</table></div>')
+
+
 def _cuadre_html(c: dict) -> str:
     por = c["por_estado"]
     n = lambda k: por[k]["n"]
