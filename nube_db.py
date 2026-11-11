@@ -490,14 +490,47 @@ def pagar_lote(sb, lote_id: str, fecha, referencia: str) -> None:
     _ejecutar(sb.rpc("pagar_lote", {"p_lote": lote_id, "p_fecha": str(fecha), "p_referencia": referencia}))
 
 
-def registrar_pago_lote(sb, lote_id: str, fecha, monto: float, referencia: str) -> None:
-    """Registra un pago (total o parcial) de un lote. El lote queda «pagado» cuando lo pagado alcanza su monto."""
+def registrar_pago_lote(sb, lote_id: str, fecha, monto: float, referencia: str, adjunto: dict | None = None) -> None:
+    """Registra un pago (total o parcial) de un lote. El lote queda «pagado» cuando lo pagado alcanza su monto.
+    `adjunto` (opcional, requiere el script 017): {ruta, nombre_original, bytes_original, bytes_final, sha256} del comprobante ya subido."""
     if not (referencia or "").strip():
         raise ErrorNube("Escribe la referencia / folio del pago.")
     if not monto or float(monto) <= 0:
         raise ErrorNube("El monto del pago debe ser mayor a cero.")
-    _ejecutar(sb.rpc("registrar_pago_lote", {"p_lote": lote_id, "p_fecha": str(fecha), "p_monto": round(float(monto), 2),
-                                            "p_referencia": referencia.strip()}))
+    params = {"p_lote": lote_id, "p_fecha": str(fecha), "p_monto": round(float(monto), 2), "p_referencia": referencia.strip()}
+    if adjunto:
+        params["p_adjunto"] = adjunto
+    _ejecutar(sb.rpc("registrar_pago_lote", params))
+
+
+def adjuntar_comprobante_pago(sb, pago_id: str, adjunto: dict) -> None:
+    _ejecutar(sb.rpc("adjuntar_comprobante_pago", {"p_pago": pago_id, "p_adjunto": adjunto}))
+
+
+def adjuntar_comprobante_devolucion(sb, dev_id: str, adjunto: dict) -> None:
+    _ejecutar(sb.rpc("adjuntar_comprobante_devolucion", {"p_dev": dev_id, "p_adjunto": adjunto}))
+
+
+def _adjuntos_por_id(sb, ids: list[str]) -> dict[str, dict]:
+    ids = [i for i in dict.fromkeys(ids) if i]
+    if not ids:
+        return {}
+    return {a["id"]: a for a in _en_trozos(sb, "adjuntos", "id,ruta,nombre_original,bytes_final", "id", ids)}
+
+
+def listar_pagos_cuenta(sb, cuenta_id: str | None = None) -> list[dict]:
+    """Todos los pagos de lotes (de una cuenta o de todas), del más reciente al más antiguo, con su lote y su comprobante."""
+    def construir():
+        q = sb.table("pagos_lote").select("*")
+        if cuenta_id:
+            q = q.eq("cuenta_id", cuenta_id)
+        return q.order("fecha_pago", desc=True).order("creado_en", desc=True).order("id", desc=False)
+    pagos = _paginado(construir)
+    if not pagos:
+        return []
+    lotes = {l["id"]: l for l in _en_trozos(sb, "lotes", "id,numero,periodo_id,monto,monto_pagado,estado,num_gastos", "id", list({p["lote_id"] for p in pagos}))}
+    adj = _adjuntos_por_id(sb, [p.get("adjunto_id") for p in pagos])
+    return [{**p, "lote": lotes.get(p["lote_id"], {}), "adjunto": adj.get(p.get("adjunto_id"))} for p in pagos]
 
 
 def listar_pagos_lote(sb, lote_id: str) -> list[dict]:
@@ -529,10 +562,13 @@ def anular_devolucion(sb, dev_id: str, motivo: str) -> None:
     _ejecutar(sb.rpc("anular_devolucion", {"p_dev": dev_id, "p_motivo": motivo.strip()}))
 
 
-def registrar_devolucion_recibida(sb, dev_id: str, fecha, referencia: str) -> None:
+def registrar_devolucion_recibida(sb, dev_id: str, fecha, referencia: str, adjunto: dict | None = None) -> None:
     if not (referencia or "").strip():
         raise ErrorNube("Escribe la referencia de la devolución.")
-    _ejecutar(sb.rpc("registrar_devolucion_recibida", {"p_dev": dev_id, "p_fecha": str(fecha), "p_referencia": referencia.strip()}))
+    params = {"p_dev": dev_id, "p_fecha": str(fecha), "p_referencia": referencia.strip()}
+    if adjunto:
+        params["p_adjunto"] = adjunto   # requiere el script 017
+    _ejecutar(sb.rpc("registrar_devolucion_recibida", params))
 
 
 def listar_devoluciones(sb, cuenta_id: str | None = None) -> list[dict]:
@@ -548,12 +584,13 @@ def listar_devoluciones(sb, cuenta_id: str | None = None) -> list[dict]:
     gastos = {g["id"]: g for g in _en_trozos(sb, "gastos", "id,solicitud_id,monto_estado,categoria,eliminado", "id", list({d["gasto_id"] for d in devs}))}
     sols = {x["id"]: x for x in _en_trozos(sb, "solicitudes", "id,numero,description,employee_name,periodo_id", "id",
                                            list({g["solicitud_id"] for g in gastos.values()}))}
+    adj = _adjuntos_por_id(sb, [d.get("devuelto_adjunto_id") for d in devs])
     out = []
     for d in devs:
         g = gastos.get(d["gasto_id"])
         if not g or g.get("eliminado"):
             continue
-        out.append({**d, "gasto": g, "solicitud": sols.get(g["solicitud_id"], {})})
+        out.append({**d, "gasto": g, "solicitud": sols.get(g["solicitud_id"], {}), "devuelto_adjunto": adj.get(d.get("devuelto_adjunto_id"))})
     return out
 
 
