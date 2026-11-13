@@ -1408,8 +1408,15 @@ def _tab_enviados(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
         st.info("Este mes todavía no tiene movimientos. Carga el estado de cuenta en la pestaña «Estado de cuenta».")
         return
     movs = df.drop_duplicates("id")
-    _sols_c = db.listar_solicitudes(sb, cuenta["id"], periodo["id"])
-    cu = reportes.cuadre(reportes.con_devolucion(movs, db.listar_gastos(sb, [x["id"] for x in _sols_c]) if _sols_c else []))
+    try:
+        _sols_c = db.listar_solicitudes(sb, cuenta["id"], periodo["id"])
+        _gast_c = db.listar_gastos(sb, [x["id"] for x in _sols_c]) if _sols_c else []
+    except db.ErrorNube as e:
+        st.error(f"No se pudo cargar la información de los gastos: {e}. Vuelve a intentar en unos segundos.")
+        if st.button("🔄 Reintentar", key="reint_enviados"):
+            st.rerun()
+        return
+    cu = reportes.cuadre(reportes.con_devolucion(movs, _gast_c))
     cols = st.columns(4)
     for col, (est, titulo) in zip(cols, (("comprobado", "Comprobados"), ("no_necesario", "No necesarios"),
                                          ("pendiente", "Sin comprobar"), ("en_espera", "Pendientes"))):
