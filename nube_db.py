@@ -144,6 +144,20 @@ def estado_cierre(sb, cuenta_id: str) -> dict[str, str]:
     return {f["periodo_id"]: f["estado"] for f in filas}
 
 
+def saldo_inicial(sb, cuenta_id: str, periodo_id: str) -> float | None:
+    """Saldo inicial del mes de la cuenta (script 019). None si no se ha fijado o aún no existe la columna."""
+    try:
+        filas = _ejecutar(sb.table("periodos_cuenta").select("saldo_inicial").eq("cuenta_id", cuenta_id).eq("periodo_id", periodo_id)) or []
+    except Exception:
+        return None
+    v = filas[0].get("saldo_inicial") if filas else None
+    return float(v) if v is not None else None
+
+
+def fijar_saldo_inicial(sb, cuenta_id: str, periodo_id: str, saldo: float) -> None:
+    _ejecutar(sb.rpc("fijar_saldo_inicial", {"p_cuenta": cuenta_id, "p_periodo": periodo_id, "p_saldo": round(float(saldo), 2)}))
+
+
 # ----------------------------------------------------------------------
 # Catálogos
 # ----------------------------------------------------------------------
