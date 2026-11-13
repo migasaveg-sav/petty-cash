@@ -278,7 +278,7 @@ def saldo_final(movs: pd.DataFrame) -> float | None:
                    if not any(abs(float(b.saldo) - (float(a.saldo) + float(b.monto))) < 0.005 for b in filas if b is not a)]
         if len(finales) == 1:
             return round(float(finales[0].saldo), 2)
-    return round(float(ultima.iloc[-1]["saldo"]), 2)
+    return round(_num(ultima.iloc[-1]["saldo"]), 2)
 
 
 def resumen_tarjeta(cu: dict, balance: float | None, limite: float | None) -> dict:
@@ -332,6 +332,52 @@ def disponibilidad(movs: pd.DataFrame, pagos: list[dict], corte, limite: float |
     return {"corte": corte_s, "por_estado": por, "no_necesarios": no_nec, "gasto_neto": gasto, "pagado": pagado,
             "por_reponer": round(gasto - pagado, 2), "saldo": saldo, "limite": lim,
             "gastado_limite": round(lim - saldo, 2) if lim is not None and saldo is not None else None}
+
+
+def _es_abono(monto: float, descripcion) -> bool:
+    """Abono = monto positivo, o un movimiento cuyo concepto dice «abono»."""
+    return monto > 0 or "abono" in str(descripcion or "").lower()
+
+
+def saldo_disponible(movs: pd.DataFrame, pagos: list[dict], saldo_inicial: float, mes: str) -> dict:
+    """Saldo disponible de la cuenta en el mes: saldo inicial − cargos + abonos + pagos registrados por el revisor (aplicados a ese mes).
+    Regresa el resumen y `corrido` {id de movimiento: saldo tras ese movimiento (con los pagos hasta su fecha)}."""
+    pagos_mes = sorted((p for p in pagos if not p.get("anulado") and str(p.get("mes")) == str(mes)), key=lambda p: str(p["fecha_pago"]))
+    m = movs.copy() if movs is not None else pd.DataFrame(columns=["id", "fecha", "descripcion", "monto"])
+    if len(m):
+        m = m.sort_values(["fecha"], kind="stable")
+    cargos = abonos = 0.0
+    corrido: dict[str, float] = {}
+    i_pago, pagado_hasta = 0, 0.0
+    for fila in m.itertuples():
+        while i_pago < len(pagos_mes) and str(pagos_mes[i_pago]["fecha_pago"]) <= str(fila.fecha):
+            pagado_hasta += _num(pagos_mes[i_pago]["monto"]); i_pago += 1
+        monto = _num(fila.monto)
+        if _es_abono(monto, fila.descripcion):
+            abonos += abs(monto)
+        else:
+            cargos += abs(monto)
+        corrido[fila.id] = round(float(saldo_inicial) + (abonos - cargos) + pagado_hasta, 2)
+    total_pagos = round(sum(_num(p["monto"]) for p in pagos_mes), 2)
+    return {"saldo_inicial": round(float(saldo_inicial), 2), "cargos": round(cargos, 2), "abonos": round(abonos, 2),
+            "pagos": total_pagos, "n_pagos": len(pagos_mes),
+            "saldo": round(float(saldo_inicial) - cargos + abonos + total_pagos, 2), "corrido": corrido}
+
+
+def detalle_por_movimiento(solicitudes: list[dict], gastos: list[dict]) -> dict[str, dict]:
+    """Para cada movimiento comprobado: concepto (emisor / concepto de la factura), solicitud, categoría y empleado."""
+    sol = {s["id"]: s for s in solicitudes}
+    out: dict[str, dict] = {}
+    for g in gastos:
+        if g.get("eliminado"):
+            continue
+        s = sol.get(g.get("solicitud_id"), {})
+        info = {"descripcion": s.get("description") or "", "concepto": _conceptos([g]), "solicitud": f"#{s['numero']} · {s.get('description') or ''}".strip(" ·") if s.get("numero") is not None else "",
+                "categoria": g.get("categoria") or s.get("category") or "", "empleado": s.get("employee_name") or ""}
+        for mv in g.get("movimientos") or []:
+            if mv.get("id") is not None:
+                out[mv["id"]] = info
+    return out
 
 
 def overview_categorias(movs: pd.DataFrame) -> list[dict]:
@@ -394,7 +440,7 @@ COLUMNAS_COMPROBADOS = [
     "Employee Name", "Material", "Payment Date", "Expense Outflow Amt", "Propina", "No. (gasto)", "Invoice date", "CFDI Folio",
     "IVA", "ISR Retenido", "IVA Retenido", "ISH", "Reimbursement Cap (With IVA)", "Diferencia", "Tip sin comprobación", "Devolución sin comprobación", "Status",
     "Lote enviado a revisión", "Resultado de la revisión", "Monto revisado y aprobado para pago", "Fecha de pago", "Lote de pago",
-    "Cómo se comprobó", "Detalle de la diferencia (tipo de cambio)",
+    "Cómo se comprobó", "Detalle de la diferencia (tipo de cambio)", "Descripción del gasto (aplicante)",
 ]
 _DINERO = {"Diferencia", "Tip sin comprobación", "Devolución sin comprobación", "Expense Outflow Amt", "Propina", "IVA", "ISR Retenido", "IVA Retenido", "ISH",
            "Reimbursement Cap (With IVA)", "Monto revisado y aprobado para pago"}
@@ -470,6 +516,7 @@ def filas_comprobados(solicitudes: list[dict], gastos: list[dict], envio_gastos:
             fila = {c: None for c in COLUMNAS_COMPROBADOS}
             fila["_estatus"] = estatus
             fila["_gasto"] = g["id"]
+            fila["Descripción del gasto (aplicante)"] = s.get("description") or ""   # en todas las filas, para filtrar y ordenar
             if primera_sol and primera_gasto:
                 fila.update({
                     "No.": int(s["numero"]), "Applicant": applicant, "Category": s.get("category") or g.get("categoria") or "",
@@ -479,23 +526,23 @@ def filas_comprobados(solicitudes: list[dict], gastos: list[dict], envio_gastos:
                     "Status": "Comprobado"})
             if primera_gasto:
                 fila.update({
-                    "Payment Date": fecha_pago_mov, "Expense Outflow Amt": round(float(g["monto_estado"]), 2),
+                    "Payment Date": fecha_pago_mov, "Expense Outflow Amt": round(_num(g.get("monto_estado")), 2),
                     "Propina": _propina_comprobada(g), "No. (gasto)": int(s["numero"]),
                     "Diferencia": _diferencia_gasto(g),
                     "Tip sin comprobación": _devuelto_por_tipo(g, "tip_sin_comprobacion"),
                     "Devolución sin comprobación": _devuelto_por_tipo(g, "sin_comprobacion_devolucion"),
                     "Detalle de la diferencia (tipo de cambio)": ("Dif. por tipo de cambio: " + str(g.get("detalle_tc") or "")) if g.get("dif_tc") else "",
                     "Lote enviado a revisión": lote_env, "Resultado de la revisión": resultado,
-                    "Monto revisado y aprobado para pago": round(float(aprobado), 2) if aprobado is not None else None,
+                    "Monto revisado y aprobado para pago": round(_num(aprobado), 2) if aprobado is not None else None,
                     "Fecha de pago": _fecha_corta(e.get("fecha_pago")) if pagado else "", "Lote de pago": lote_pago})
             if f is not None:
                 fila.update({
                     "Invoice date": f.get("fecha_factura") or "", "CFDI Folio": f.get("uuid_cfdi") or "sin factura",
-                    "IVA": round(float(f.get("iva_aplicado", f.get("iva") or 0)), 2),
-                    "ISR Retenido": round(float(f.get("isr_aplicado", f.get("isr_retenido") or 0)), 2),
-                    "IVA Retenido": round(float(f.get("iva_ret_aplicado", f.get("iva_retenido") or 0)), 2),
-                    "ISH": round(float(f.get("ish_aplicado", f.get("ish") or 0)), 2),
-                    "Reimbursement Cap (With IVA)": round(float(f.get("monto_aplicado") or 0), 2),
+                    "IVA": round(_num(f.get("iva_aplicado") if f.get("iva_aplicado") is not None else f.get("iva")), 2),
+                    "ISR Retenido": round(_num(f.get("isr_aplicado") if f.get("isr_aplicado") is not None else f.get("isr_retenido")), 2),
+                    "IVA Retenido": round(_num(f.get("iva_ret_aplicado") if f.get("iva_ret_aplicado") is not None else f.get("iva_retenido")), 2),
+                    "ISH": round(_num(f.get("ish_aplicado") if f.get("ish_aplicado") is not None else f.get("ish")), 2),
+                    "Reimbursement Cap (With IVA)": round(_num(f.get("monto_aplicado")), 2),
                     "Cómo se comprobó": "XML" if tipo_factura(f) == "xml" else "Manual"})
             filas.append(fila)
             resaltar.append(bool(g.get("tiene_diferencia")))
@@ -506,24 +553,33 @@ def _diferencia_gasto(g: dict) -> float:
     """Cargo del estado de cuenta − facturas − propina (positivo: el cargo es mayor que lo facturado)."""
     if g.get("diferencia") is not None:
         return round(float(g["diferencia"]), 2)
-    suma = sum(float(f.get("monto_aplicado") or 0) for f in g.get("facturas") or [])
-    return round(float(g["monto_estado"]) - suma - float(g.get("propina") or 0), 2)
+    suma = sum(_num((f or {}).get("monto_aplicado")) for f in g.get("facturas") or [])
+    return round(_num(g.get("monto_estado")) - suma - _num(g.get("propina")), 2)
+
+
+def _num(x, defecto: float = 0.0) -> float:
+    """Número seguro: None, texto vacío o NaN dan `defecto` (los datos de la base pueden traer campos vacíos)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return defecto
+    return defecto if v != v or v in (float("inf"), float("-inf")) else v
 
 
 def _propina_comprobada(g: dict) -> float:
     """Propina con comprobante; la que quedó como «tip sin comprobación» no cuenta como propina."""
-    p = float(g.get("propina") or 0) - _devuelto_por_tipo_bruto(g, "tip_sin_comprobacion")
+    p = _num(g.get("propina")) - _devuelto_por_tipo_bruto(g, "tip_sin_comprobacion")
     return round(max(p, 0.0), 2)
 
 
 def _devuelto_por_tipo_bruto(g: dict, tipo: str) -> float:
     """Igual que _devuelto_por_tipo pero incluye devoluciones anuladas (la propina sigue sin comprobarse)."""
-    return sum(float(d["monto"]) for d in g.get("devoluciones") or [] if d.get("tipo") == tipo)
+    return sum(_num(d.get("monto")) for d in g.get("devoluciones") or [] if d.get("tipo") == tipo)
 
 
 def _devuelto_por_tipo(g: dict, tipo: str) -> float:
     """Monto que el colaborador debe devolver de un gasto, por tipo (tip sin comprobación / sin comprobación, devolución)."""
-    return round(sum(float(d["monto"]) for d in g.get("devoluciones") or [] if d.get("tipo") == tipo), 2)
+    return round(sum(_num(d.get("monto")) for d in g.get("devoluciones") or [] if d.get("tipo") == tipo), 2)
 
 
 def _tabla_movs(movs: pd.DataFrame, estado: str, con_motivo: bool = False) -> pd.DataFrame:
@@ -619,7 +675,8 @@ def excel_mes(cuenta_nombre: str, periodo: str, applicant: str, movs: pd.DataFra
         anchos = {"No.": 6, "No. (gasto)": 6, "Applicant": 12, "Category": 20, "Description": 26, "Linked Request No.": 18, "Number of Days": 10,
                   "Total Number of People": 12, "Employee Name": 28, "Material": 12, "Payment Date": 13, "Invoice date": 13,
                   "CFDI Folio": 38, "Status": 13, "Lote enviado a revisión": 24, "Resultado de la revisión": 20,
-                  "Fecha de pago": 13, "Lote de pago": 30, "Cómo se comprobó": 16, "Detalle de la diferencia (tipo de cambio)": 44}
+                  "Fecha de pago": 13, "Lote de pago": 30, "Cómo se comprobó": 16, "Detalle de la diferencia (tipo de cambio)": 44,
+                  "Descripción del gasto (aplicante)": 48}
         for i, c in enumerate(COLUMNAS_COMPROBADOS):
             ws.set_column(i, i, anchos.get(c, 16), dinero if c in _DINERO else None)
         ws.set_row(0, 42)
@@ -711,18 +768,18 @@ def excel_mes(cuenta_nombre: str, periodo: str, applicant: str, movs: pd.DataFra
         r = fila + 2
         for e in envios_resumen:
             rs.write(r, 0, f"Lote enviado #{e['numero']}"); rs.write(r, 1, _fecha_corta(e["enviado_en"]))
-            rs.write_number(r, 2, int(e["gastos_enviados"]))
+            rs.write_number(r, 2, int(_num(e.get("gastos_enviados"))))
             for i, k in enumerate(("monto_enviado", "monto_aprobado", "monto_devuelto", "monto_en_revision", "monto_pagado"), start=3):
-                rs.write_number(r, i, float(e[k] or 0), dinero)
+                rs.write_number(r, i, _num(e.get(k)), dinero)
             if e.get("ultimo_pago"):
                 p1, p2 = _fecha_corta(e.get("primer_pago")), _fecha_corta(e["ultimo_pago"])
                 rs.write(r, 8, p1 if p1 == p2 else f"{p1} a {p2}")
             r += 1
         if envios_resumen:
             rs.write(r, 0, "Total", total_t); rs.write(r, 1, "", total_t)
-            rs.write_number(r, 2, sum(int(e["gastos_enviados"]) for e in envios_resumen), total_t)
+            rs.write_number(r, 2, sum(int(_num(e.get("gastos_enviados"))) for e in envios_resumen), total_t)
             for i, k in enumerate(("monto_enviado", "monto_aprobado", "monto_devuelto", "monto_en_revision", "monto_pagado"), start=3):
-                rs.write_number(r, i, sum(float(e[k] or 0) for e in envios_resumen), total_f)
+                rs.write_number(r, i, sum(_num(e.get(k)) for e in envios_resumen), total_f)
             rs.write(r + 2, 0, "Un gasto devuelto y reenviado aparece en el lote donde se envió por primera vez como «devuelto» y de nuevo en el lote en que se reenvía.")
         else:
             rs.write(r, 0, "Aún no hay lotes enviados a revisión este mes.")
@@ -814,7 +871,7 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
             for i, c in enumerate(cols_c):
                 ws.set_column(i, i, {"Cuenta": 16, "Mes": 9, "Estatus del gasto": 22}.get(c, 14 if c in _DINERO else {
                     "No.": 6, "No. (gasto)": 6, "Description": 26, "Employee Name": 28, "CFDI Folio": 38, "Lote enviado a revisión": 24,
-                    "Resultado de la revisión": 20, "Lote de pago": 30, "Category": 20, "Detalle de la diferencia (tipo de cambio)": 44}.get(c, 14)), dinero if c in _DINERO else None)
+                    "Resultado de la revisión": 20, "Lote de pago": 30, "Category": 20, "Detalle de la diferencia (tipo de cambio)": 44, "Descripción del gasto (aplicante)": 48}.get(c, 14)), dinero if c in _DINERO else None)
             ws.set_row(0, 42)
             ws.freeze_panes(1, 2)
             ws.autofilter(0, 0, max(len(df), 1), len(cols_c) - 1)
