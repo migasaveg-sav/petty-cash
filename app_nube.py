@@ -924,6 +924,12 @@ def _saldo_disponible_ui(sb, cuenta: dict, periodo: dict, movs_mes: pd.DataFrame
     ({} si el mes no tiene saldo inicial). El revisor puede fijar o cambiar el saldo inicial."""
     si = db.saldo_inicial(sb, cuenta["id"], periodo["id"])
     etiqueta = db.etiqueta_periodo(periodo)
+    # Tarjeta del saldo que dice el banco tras el último movimiento del mes (junto a las demás tarjetas)
+    saldo_banco = reportes.saldo_final(movs_mes)
+    fecha_banco = str(movs_mes["fecha"].max()) if movs_mes is not None and len(movs_mes) else ""
+    k = st.columns(3)
+    k[0].markdown(estilos.tarjeta("Saldo en el banco", f"al {fecha_banco}" if fecha_banco else "sin movimientos",
+                                  estilos.money_html(saldo_banco) if saldo_banco is not None else "—", "acento"), unsafe_allow_html=True)
     if revisor:
         with st.expander(f"⚙️ Saldo inicial de {etiqueta}" + (f" · {money_md(si)}" if si is not None else " · sin definir"), expanded=si is None):
             nuevo = st.number_input("Saldo inicial del mes", value=float(si or 0.0), step=100.0, format="%.2f", key=f"si_{cuenta['id']}_{periodo['id']}")
@@ -943,10 +949,9 @@ def _saldo_disponible_ui(sb, cuenta: dict, periodo: dict, movs_mes: pd.DataFrame
     except db.ErrorNube:
         pagos = []
     d = reportes.saldo_disponible(movs_mes, pagos, si, etiqueta)
-    k = st.columns(2)
-    k[0].markdown(estilos.tarjeta(f"Saldo disponible ({etiqueta})", "inicial − cargos + abonos + pagos", estilos.money_html(d["saldo"]),
+    k[1].markdown(estilos.tarjeta(f"Saldo disponible ({etiqueta})", "inicial − cargos + abonos + pagos", estilos.money_html(d["saldo"]),
                                   "comprobado" if d["saldo"] >= 0 else "rojo"), unsafe_allow_html=True)
-    k[1].markdown(estilos.tarjeta("Pagos recibidos", f"{d['n_pagos']} pago(s) del revisor", estilos.money_html(d["pagos"]), "acento"), unsafe_allow_html=True)
+    k[2].markdown(estilos.tarjeta("Pagos recibidos", f"{d['n_pagos']} pago(s) del revisor", estilos.money_html(d["pagos"]), "acento"), unsafe_allow_html=True)
     st.caption(f"Saldo inicial {money_md(si)} − cargos {money_md(d['cargos'])} + abonos {money_md(d['abonos'])} + pagos {money_md(d['pagos'])} = **{money_md(d['saldo'])}**. "
                "Abono = monto positivo o movimiento cuyo concepto dice «abono».")
     return d["corrido"]
