@@ -45,14 +45,25 @@ def _mensaje(e: Exception) -> str:
 
 
 def _ejecutar(consulta) -> Any:
-    try:
-        return consulta.execute().data
-    except APIError as e:
-        raise ErrorNube(_mensaje(e)) from e
-    except ErrorNube:
-        raise
-    except Exception as e:  # red, timeout, token...
-        raise ErrorNube(_mensaje(e)) from e
+    import time
+    for intento in range(3):
+        try:
+            return consulta.execute().data
+        except APIError as e:
+            # Respuesta que no es JSON de error de PostgREST (gateway 502/520, corte de red momentáneo): se reintenta.
+            txt = (str(e) + " " + (getattr(e, "message", "") or "")).lower()
+            transitorio = "json could not be generated" in txt or "<html" in txt or "bad gateway" in txt or "timeout" in txt
+            if transitorio and intento < 2:
+                time.sleep(0.7 * (intento + 1))
+                continue
+            raise ErrorNube(_mensaje(e)) from e
+        except ErrorNube:
+            raise
+        except Exception as e:  # red, timeout, token...
+            if intento < 2 and "remote" in str(e).lower() + e.__class__.__name__.lower():
+                time.sleep(0.7 * (intento + 1))
+                continue
+            raise ErrorNube(_mensaje(e)) from e
 
 
 def _paginado(construir) -> list[dict]:
