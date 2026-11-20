@@ -150,12 +150,16 @@ def _campos_solicitud(sb, pref: str, v: dict | None = None) -> dict:
         monto = st.number_input("Monto (tentativo)", min_value=0.0, step=1.0, format="%.2f", value=float(v.get("monto_tentativo") or 0), key=f"{pref}_monto")
         material = _selector_catalogo(sb, "Material", "material", f"{pref}_mat", v.get("material"))
         request_number = st.text_input("Request number", value=v.get("request_number") or "", key=f"{pref}_req")
-    description = st.text_input("Description", value=v.get("description") or "", key=f"{pref}_desc")
+    description = st.text_input("Description (comentarios: qué se gastó y por qué)", value=v.get("description") or "", key=f"{pref}_desc",
+                                help="Obligatorio cuando la comprobación es manual (factura sin XML).")
     d1, d2 = st.columns(2)
     dias = d1.number_input("Number of days", min_value=0, step=1, value=int(v.get("number_of_days") or 0), key=f"{pref}_dias")
     personas = d2.number_input("Total number of people", min_value=0, step=1, value=int(v.get("number_of_people") or 0), key=f"{pref}_pers")
     return {"fecha": fecha, "monto": monto, "category": category, "material": material, "employee_name": employee,
             "request_number": request_number, "description": description, "number_of_days": dias, "number_of_people": personas}
+
+
+MIN_COMENTARIO_MANUAL = 10   # caracteres mínimos de los comentarios en una comprobación manual
 
 
 def _rfc_receptor() -> str:
@@ -894,10 +898,31 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
     elif abs(diferencia) >= 0.005:
         st.info(f"Se guardará con una diferencia de {money_md(diferencia)} (dentro de la tolerancia); el revisor la verá resaltada.")
 
+    # Comprobación manual (alguna factura sin XML): los comentarios (qué se gastó y por qué) son obligatorios.
+    hay_manual = any(str(f["datos"].get("Fuente") or "").lower() == "manual" or f["datos"].get("UUID") == "SIN-UUID" for f in facturas)
+    comentario_nuevo = None
+    if hay_manual:
+        if datos_sol_ui is not None:
+            texto_com = str(datos_sol_ui.get("description") or "")
+            ubicacion = "el campo «Description» de «Datos de la solicitud» (arriba)"
+        else:
+            texto_com = str(sol.get("description") or "")
+            ubicacion = "el campo de comentarios de abajo"
+            if len(texto_com.strip()) < MIN_COMENTARIO_MANUAL:
+                comentario_nuevo = st.text_area("Comentarios (obligatorio): ¿qué se gastó y por qué?", value=texto_com, key="cmp_com_manual", height=90,
+                                                placeholder="Ej.: Comida con cliente X por cierre de contrato; no se pudo obtener el XML.")
+                texto_com = comentario_nuevo
+        if len(texto_com.strip()) < MIN_COMENTARIO_MANUAL:
+            st.error(f"⚠️ **Los comentarios son obligatorios en comprobaciones manuales.** Escribe en {ubicacion} qué se gastó y por qué "
+                     f"(mínimo {MIN_COMENTARIO_MANUAL} caracteres). Sin esto no se puede guardar el gasto.")
+            return
+
     if st.button("💾 Guardar gasto", type="primary", key="cmp_guardar"):
         subidos: list[str] = []
         sol_nueva_id = None
         try:
+            if comentario_nuevo is not None and sol.get("id"):   # solicitud existente sin comentarios: se guardan con el gasto
+                db.actualizar_solicitud(sb, sol["id"], {"description": comentario_nuevo.strip()})
             if not sol.get("id"):  # viene del estado de cuenta: la solicitud se crea hasta guardar el gasto
                 datos_sol = {**sol["_datos"], **(datos_sol_ui or {})}
                 for tipo, clave in (("categoria", "category"), ("empleado", "employee_name"), ("material", "material")):
