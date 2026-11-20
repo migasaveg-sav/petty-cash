@@ -22,7 +22,9 @@ _PAGINA = 1000
 
 
 class ErrorNube(Exception):
-    """Error de base de datos / red con mensaje amable para el usuario."""
+    """Error de base de datos / red con mensaje amable para el usuario.
+    `uuid_repetido`: UUID de CFDI que provocó el error de duplicado (si aplica)."""
+    uuid_repetido: str | None = None
 
 
 # ----------------------------------------------------------------------
@@ -56,7 +58,11 @@ def _ejecutar(consulta) -> Any:
             if transitorio and intento < 2:
                 time.sleep(0.7 * (intento + 1))
                 continue
-            raise ErrorNube(_mensaje(e)) from e
+            err = ErrorNube(_mensaje(e))
+            m_uuid = re.search(r"\(uuid_cfdi\)=\(([^)]+)\)", f"{getattr(e, 'details', '') or ''} {e}")
+            if m_uuid and "facturas_uuid_unico" in f"{e} {getattr(e, 'message', '')}":
+                err.uuid_repetido = m_uuid.group(1).strip()
+            raise err from e
         except ErrorNube:
             raise
         except Exception as e:  # red, timeout, token...
@@ -423,7 +429,15 @@ def guardar_gasto(sb, solicitud_id: str, movimiento_ids: list[str], categoria: s
         params["p_detalle_tc"] = detalle_tc.strip()
     if propina_adjunto:   # comprobante de la propina; sin él, la propina queda como «tip sin comprobación»
         params["p_propina_adjunto"] = propina_adjunto
-    return _ejecutar(sb.rpc("guardar_gasto", params))
+    try:
+        return _ejecutar(sb.rpc("guardar_gasto", params))
+    except ErrorNube as e:
+        if e.uuid_repetido:
+            usos = detalle_uuids_usados(sb, [e.uuid_repetido])
+            err = ErrorNube(f"Esta factura ya fue usada en otro gasto. {texto_uso_uuid(e.uuid_repetido, usos.get(e.uuid_repetido))}")
+            err.uuid_repetido = e.uuid_repetido
+            raise err from e
+        raise
 
 
 def revertir_gasto(sb, gasto_id: str) -> None:
@@ -792,6 +806,49 @@ def listar_movimientos_revision(sb, cuenta_id: str, periodo_id: str) -> pd.DataF
     if not df.empty:
         df["monto"] = df["monto"].astype(float)
     return df
+
+
+def detalle_uuids_usados(sb, uuids: list[str]) -> dict[str, list[dict]]:
+    """Dónde está usado cada UUID: cuenta, periodo, solicitud, fecha de comprobación y envío (script 020).
+    Regresa {} si el script todavía no se corre (el mensaje de error sale igual, pero sin detalle)."""
+    lista = [u for u in dict.fromkeys(uuids) if u]
+    if not lista:
+        return {}
+    try:
+        filas = _ejecutar(sb.rpc("detalle_uuids_usados", {"p_uuids": lista})) or []
+    except ErrorNube:
+        return {}
+    out: dict[str, list[dict]] = {}
+    for f in filas:
+        out.setdefault(f["uuid_cfdi"], []).append(f)
+    return out
+
+
+def texto_uso_uuid(uuid_cfdi: str, usos: list[dict] | None) -> str:
+    """Texto legible de dónde se usó un UUID (en Markdown)."""
+    if not usos:
+        return f"UUID {uuid_cfdi}"
+    partes = []
+    for u in usos:
+        t = f"cuenta **{u.get('cuenta')}**"
+        if u.get("periodo"):
+            t += f" · periodo **{u['periodo']}**"
+        if u.get("solicitud_numero") is not None:
+            t += f" · solicitud **#{u['solicitud_numero']}**"
+            if u.get("solicitud_descripcion"):
+                t += f" ({str(u['solicitud_descripcion'])[:60]})"
+            if u.get("aplicante"):
+                t += f" de {u['aplicante']}"
+        if u.get("comprobado_en"):
+            t += f" · comprobada el {u['comprobado_en']}"
+        if u.get("envio_numero") is not None:
+            t += f" · enviada a revisión en el envío **#{u['envio_numero']}** el **{u['enviado_en']}**"
+        else:
+            t += " · todavía no se manda a revisión"
+        if u.get("nombre_emisor") or u.get("monto_total") is not None:
+            t += f" · factura de {u.get('nombre_emisor') or 's/n'} por ${float(u.get('monto_total') or 0):,.2f}"
+        partes.append(t)
+    return f"UUID {uuid_cfdi}\n\n" + "\n".join(f"- {p}" for p in partes)
 
 
 def uuids_usados(sb, uuids: list[str]) -> set[str]:
