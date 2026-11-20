@@ -804,7 +804,7 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
             if error_rfc:
                 st.error(f"❌ **{xf.name}**: {error_rfc}")
                 continue
-            datos.update(extra)
+            cfdi_extra.completar_datos(datos, extra)
             if datos["UUID"] != "SIN-UUID" and datos["UUID"] in usados:
                 continue
             facturas.append({"k": len(facturas) + 1000 * (ver + 1), "datos": datos, "adjunto": None, "adj_ver": 0})
