@@ -6,6 +6,8 @@ Reutiliza bank.py, cfdi.py, catalog.py, matching.py y persistence.py de la app a
 """
 from __future__ import annotations
 
+import re
+
 import base64
 import collections
 import datetime
@@ -15,6 +17,7 @@ import streamlit as st
 
 import adjuntos as adj
 import bbva_detalle
+import estado_texto
 import estilos
 import importar
 import nube_db as db
@@ -920,7 +923,7 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
 # Pestaña: Estado de cuenta
 # ======================================================================
 def _saldo_disponible_ui(sb, cuenta: dict, periodo: dict, movs_mes: pd.DataFrame, revisor: bool) -> dict[str, float]:
-    """Tarjeta «Saldo disponible» del mes: saldo inicial − cargos + abonos + pagos del revisor. Regresa el saldo corrido por movimiento
+    """Tarjeta «Saldo disponible» del mes: saldo del primer día + pagos del revisor − gastos (sin los «no necesarios»). Regresa el saldo corrido por movimiento
     ({} si el mes no tiene saldo inicial). El revisor puede fijar o cambiar el saldo inicial."""
     si = db.saldo_inicial(sb, cuenta["id"], periodo["id"])
     etiqueta = db.etiqueta_periodo(periodo)
@@ -949,11 +952,11 @@ def _saldo_disponible_ui(sb, cuenta: dict, periodo: dict, movs_mes: pd.DataFrame
     except db.ErrorNube:
         pagos = []
     d = reportes.saldo_disponible(movs_mes, pagos, si, etiqueta)
-    k[1].markdown(estilos.tarjeta(f"Saldo disponible ({etiqueta})", "inicial − cargos + abonos + pagos", estilos.money_html(d["saldo"]),
+    k[1].markdown(estilos.tarjeta(f"Saldo disponible ({etiqueta})", "inicial + pagos − gastos", estilos.money_html(d["saldo"]),
                                   "comprobado" if d["saldo"] >= 0 else "rojo"), unsafe_allow_html=True)
     k[2].markdown(estilos.tarjeta("Pagos recibidos", f"{d['n_pagos']} pago(s) del revisor", estilos.money_html(d["pagos"]), "acento"), unsafe_allow_html=True)
-    st.caption(f"Saldo inicial {money_md(si)} − cargos {money_md(d['cargos'])} + abonos {money_md(d['abonos'])} + pagos {money_md(d['pagos'])} = **{money_md(d['saldo'])}**. "
-               "Abono = monto positivo o movimiento cuyo concepto dice «abono».")
+    st.caption(f"Saldo del primer día {money_md(si)} + pagos {money_md(d['pagos'])} − gastos del estado de cuenta {money_md(d['gastos'])} = **{money_md(d['saldo'])}**. "
+               f"Los {d['n_no_necesarios']} movimiento(s) «no necesarios» ({money_md(d['no_necesarios'])}) no se restan; los abonos del banco tampoco suman (solo cuentan los pagos registrados).")
     return d["corrido"]
 
 
@@ -975,6 +978,50 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
         archivo = st.file_uploader("Archivo (CSV, Excel o PDF)", type=["csv", "xlsx", "xls", "pdf"], key="up_estado",
                                    help="PDF: debe traer texto (en BBVAnet: Ctrl+P → Destino «Guardar como PDF»). Se validan los saldos renglón por renglón.")
         df_pdf, error_pdf = None, None
+        # Plan B: si el archivo no es legible con el lector normal (p. ej. cada movimiento en una sola celda), se reformatea solo.
+        if archivo is not None and not archivo.name.lower().endswith(".pdf"):
+            _bytes = archivo.getvalue()
+            _ilegible = None
+            if estado_texto.parece_texto_en_una_celda(_bytes, archivo.name):
+                _ilegible = "cada movimiento viene completo en una sola celda"
+            else:
+                try:
+                    _leer_estado(_bytes, archivo.name, cuenta["formato"])
+                except Exception as e0:
+                    _ilegible = str(e0)
+            if _ilegible:
+                try:
+                    df_pdf = estado_texto.reformatear(_bytes, archivo.name)
+                except estado_texto.ErrorFormato as e1:
+                    error_pdf = f"El archivo no tiene el formato esperado ({_ilegible}) y tampoco pude reformatearlo:\n\n{e1}"
+                    st.error(error_pdf)
+        if df_pdf is None and error_pdf is None:
+            with st.popover("📋 Pegar movimientos como texto"):
+                st.caption("Copia los movimientos de la banca en línea y pégalos aquí (un movimiento por renglón: fecha, concepto, monto y saldo).")
+                _txt = st.text_area("Movimientos", height=220, key="txt_estado", label_visibility="collapsed")
+                if _txt.strip():
+                    try:
+                        st.session_state["df_texto_estado"] = estado_texto.reformatear_texto(_txt)
+                        st.success(f"Se leyeron {len(st.session_state['df_texto_estado'])} movimientos. Cierra esta ventana y revisa la vista previa.")
+                    except estado_texto.ErrorFormato as e2:
+                        st.session_state.pop("df_texto_estado", None)
+                        st.error(str(e2))
+                else:
+                    st.session_state.pop("df_texto_estado", None)
+            if archivo is None and st.session_state.get("df_texto_estado") is not None:
+                df_pdf = st.session_state["df_texto_estado"]
+        _es_pdf = archivo is not None and archivo.name.lower().endswith(".pdf")
+        if df_pdf is not None and not _es_pdf:
+            _origen = df_pdf.attrs.get("origen", "archivo")
+            st.success(f"🔧 Reformateé automáticamente el {_origen}: {len(df_pdf)} movimientos del {df_pdf['Fecha'].min()} al {df_pdf['Fecha'].max()}.")
+            for _av in df_pdf.attrs.get("avisos", []):
+                st.warning(_av)
+            st.caption(f"Cargos {money_md(df_pdf['Cargo'].sum())} · abonos {money_md(df_pdf['Abono'].sum())}. Revisa la vista previa antes de cargar.")
+            st.dataframe(df_pdf[["Fecha", "Descripción", "Cargo", "Abono", "Saldo"]], hide_index=True, use_container_width=True,
+                         height=min(36 * (len(df_pdf) + 1) + 4, 300),
+                         column_config={c: st.column_config.NumberColumn(c, format="$%.2f") for c in ("Cargo", "Abono", "Saldo")})
+            st.download_button("⬇️ Descargar el archivo reformateado (Excel)", estado_texto.a_excel(df_pdf),
+                               file_name="estado_de_cuenta_reformateado.xlsx", key="dl_reformateado")
         if archivo is not None and archivo.name.lower().endswith(".pdf"):
             try:
                 df_pdf = pdf_estado.leer_pdf_estado(archivo.getvalue())
@@ -992,10 +1039,13 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
             except pdf_estado.ErrorPDF as e:
                 error_pdf = str(e)
                 st.error("No se pudo leer el PDF:\n\n" + error_pdf)
-        if archivo is not None and error_pdf is None and st.button("Cargar movimientos", type="primary", key="btn_cargar_estado"):
+        _hay = archivo is not None or df_pdf is not None
+        if _hay and error_pdf is None and st.button("Cargar movimientos", type="primary", key="btn_cargar_estado"):
             try:
                 df = df_pdf if df_pdf is not None else _leer_estado(archivo.getvalue(), archivo.name, cuenta["formato"])
                 r = db.subir_estado_cuenta(sb, cuenta["id"], df)
+                st.session_state.pop("df_texto_estado", None)
+                st.session_state.pop("txt_estado", None)
                 _flash(f"{r['nuevos']} movimiento(s) nuevo(s); {r['ya_existian']} ya estaban cargados"
                        + (f"; {r['sin_fecha_o_monto']} omitido(s) por no tener fecha o monto válido" if r["sin_fecha_o_monto"] else "") + ".")
                 st.rerun()
@@ -1157,8 +1207,13 @@ def _importador(sb, cuenta: dict) -> None:
     if diag["gastos_ya_comprobados"]:
         st.info(f"{len(diag['gastos_ya_comprobados'])} gasto(s) ya están comprobados en la nube y se omitirán.")
     if diag["gastos_uuid_usado"]:
-        st.warning(f"{len(diag['gastos_uuid_usado'])} gasto(s) usan una factura (UUID) que ya existe en otro gasto de la nube y no se importarán: "
-                   + "; ".join(str(x) for x in diag["gastos_uuid_usado"]))
+        _tx = [str(x) for x in diag["gastos_uuid_usado"]]
+        _ids = list(dict.fromkeys(re.findall(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", " ".join(_tx))))
+        _usos = db.detalle_uuids_usados(sb, _ids) if _ids else {}
+        st.warning(f"{len(_tx)} gasto(s) usan una factura (UUID) que ya existe en otro gasto de la nube y no se importarán: " + "; ".join(_tx))
+        for _u in _ids:
+            if _usos.get(_u):
+                st.markdown(db.texto_uso_uuid(_u, _usos[_u]))
     confirma = True
     if plan["banco"] and cuenta.get("formato") and plan["banco"] != cuenta["formato"]:
         st.warning(f"El avance es del formato «{plan['banco']}» y esta cuenta ({cuenta['nombre']}) usa «{cuenta['formato']}». "
