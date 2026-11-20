@@ -27,8 +27,26 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+def _num(v) -> float:
+    try:
+        return float(str(v or 0).replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
+def completar_datos(datos: dict, extra: dict) -> dict:
+    """Agrega a lo que leyó `parse_cfdi` los datos extra. ISH y retenciones solo se completan si el lector principal los dejó en 0."""
+    datos.update({k: extra[k] for k in ("rfc_receptor", "forma_pago", "metodo_pago", "claves_prod", "combustible")})
+    for campo, clave in (("ISH", "ish"), ("ISR Retenido", "isr_retenido"), ("IVA Retenido", "iva_retenido")):
+        if not float(datos.get(campo) or 0) and extra.get(clave):
+            datos[campo] = extra[clave]
+    return datos
+
+
 def leer_extra(contenido: bytes) -> dict:
     """{'rfc_receptor', 'forma_pago' (código '01'…), 'metodo_pago', 'claves_prod' (texto), 'combustible' (nombre o None)}.
+    También 'ish' (impuesto local de hospedaje del complemento «Impuestos locales», implocal), 'isr_retenido' e 'iva_retenido'
+    (retenciones a nivel comprobante) para completar lo que no haya leído `parse_cfdi`.
     Lanza ValueError si el XML no se puede leer."""
     try:
         raiz = ET.fromstring(contenido)
@@ -48,8 +66,26 @@ def leer_extra(contenido: bytes) -> dict:
                 claves.append(c)
         elif t == "Pago" and forma is None:        # complemento de pagos: forma de pago de cada pago
             forma = (el.get("FormaDePagoP") or "").strip() or None
+    ish = 0.0
+    for el in raiz.iter():
+        if _local(el.tag) == "TrasladosLocales":     # implocal:ImpuestosLocales / TrasladosLocales ImpLocTrasladado="ISH"
+            nombre = (el.get("ImpLocTrasladado") or "").strip().upper()
+            if nombre == "ISH" or "HOSPEDAJE" in nombre:
+                ish += _num(el.get("Importe"))
+    isr = iva_ret = 0.0
+    for hijo in raiz:                                 # retenciones del comprobante (no las de cada concepto: se contarían doble)
+        if _local(hijo.tag) != "Impuestos":
+            continue
+        for ret in hijo.iter():
+            if _local(ret.tag) == "Retencion":
+                imp = (ret.get("Impuesto") or "").strip()
+                if imp in ("001", "ISR"):
+                    isr += _num(ret.get("Importe"))
+                elif imp in ("002", "IVA"):
+                    iva_ret += _num(ret.get("Importe"))
     comb = next((COMBUSTIBLES[c] for c in claves if c in COMBUSTIBLES), None)
-    return {"rfc_receptor": rfc, "forma_pago": forma, "metodo_pago": metodo, "claves_prod": ", ".join(claves) or None, "combustible": comb}
+    return {"rfc_receptor": rfc, "forma_pago": forma, "metodo_pago": metodo, "claves_prod": ", ".join(claves) or None, "combustible": comb,
+            "ish": round(ish, 2), "isr_retenido": round(isr, 2), "iva_retenido": round(iva_ret, 2)}
 
 
 def validar_receptor(extra: dict, esperado: str = RFC_RECEPTOR_ESPERADO) -> str | None:
