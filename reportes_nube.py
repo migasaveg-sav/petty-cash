@@ -11,9 +11,12 @@ from typing import Any
 import pandas as pd
 from xlsxwriter.utility import xl_col_to_name
 
+from cfdi_extra import combustible_en_efectivo, etiqueta_forma_pago
+
 C_HEADER = "#DC143C"          # rojo de la bitácora
 C_AMARILLO = "#FFF2CC"        # fila con diferencia (dentro de tolerancia)
 C_GRIS = "#E5E7EB"
+C_ROJO = "#FECACA"          # fila con combustible pagado en efectivo (solo Excel del revisor)
 FORMATO_DINERO = "$#,##0.00"
 
 NOMBRE_RESULTADO = {"aprobado": "Aprobado para pago", "devuelto": "Devuelto", "en_revision": "En revisión"}
@@ -547,7 +550,10 @@ def filas_comprobados(solicitudes: list[dict], gastos: list[dict], envio_gastos:
                     "IVA Retenido": round(_num(f.get("iva_ret_aplicado") if f.get("iva_ret_aplicado") is not None else f.get("iva_retenido")), 2),
                     "ISH": round(_num(f.get("ish_aplicado") if f.get("ish_aplicado") is not None else f.get("ish")), 2),
                     "Reimbursement Cap (With IVA)": round(_num(f.get("monto_aplicado")), 2),
-                    "Cómo se comprobó": "XML" if tipo_factura(f) == "xml" else "Manual"})
+                    "Cómo se comprobó": "XML" if tipo_factura(f) == "xml" else "Manual",
+                    # Solo se muestran en el Excel del revisor (el del aplicante no usa estas columnas)
+                    "Forma de pago": etiqueta_forma_pago(f.get("forma_pago")), "Combustible": f.get("combustible") or "",
+                    "_alerta_efectivo": combustible_en_efectivo(f)})
             filas.append(fila)
             resaltar.append(bool(g.get("tiene_diferencia")))
     return filas, resaltar
@@ -805,9 +811,10 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
     estatus: de los comprobados, solo los gastos con estos estatus (claves de ESTATUS_GASTO); por omisión, todos."""
     hojas = hojas or {"comprobados", "no_necesarios", "sin_comprobar", "pendientes", "resumen"}
     estatus = estatus or set(ESTATUS_GASTO)
-    cols_c = ["Cuenta", "Mes", *COLUMNAS_COMPROBADOS, "Estatus del gasto"]
+    cols_c = ["Cuenta", "Mes", *COLUMNAS_COMPROBADOS, "Forma de pago", "Combustible", "Estatus del gasto"]
     filas_c: list[dict] = []
     marcar: list[bool] = []
+    efectivo: list[bool] = []      # combustible pagado en efectivo → fila en rojo
     resumen_filas: list[dict] = []
     nn, sc, pe = [], [], []
     resumenes_tarjeta: list[tuple[str, str, dict]] = []
@@ -820,6 +827,7 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
             f = {**f, "Cuenta": c["cuenta"], "Mes": c["periodo"], "Estatus del gasto": ESTATUS_GASTO.get(f["_estatus"], f["_estatus"])}
             filas_c.append(f)
             marcar.append(r)
+            efectivo.append(bool(f.get("_alerta_efectivo")))
             if f.get("Expense Outflow Amt") is not None:
                 por_gasto[f["_gasto"]] = (f["_estatus"], float(f["Expense Outflow Amt"]))
         cu = cuadre(con_devolucion(c["movs"], c["gastos"]))
@@ -873,25 +881,30 @@ def excel_revisor(conjuntos: list[dict], hojas: set[str] | None = None, estatus:
             for i, c in enumerate(cols_c):
                 ws.write(0, i, _encabezado(c), head_gris if i >= ini_gris else head)
             for i, c in enumerate(cols_c):
-                ws.set_column(i, i, {"Cuenta": 16, "Mes": 9, "Estatus del gasto": 22}.get(c, 14 if c in _DINERO else {
+                ws.set_column(i, i, {"Cuenta": 16, "Mes": 9, "Estatus del gasto": 22, "Forma de pago": 26, "Combustible": 18}.get(c, 14 if c in _DINERO else {
                     "No.": 6, "No. (gasto)": 6, "Description": 26, "Employee Name": 28, "CFDI Folio": 38, "Lote enviado a revisión": 24,
                     "Resultado de la revisión": 20, "Lote de pago": 30, "Category": 20, "Detalle de la diferencia (tipo de cambio)": 44, "Descripción del gasto (aplicante)": 48}.get(c, 14)), dinero if c in _DINERO else None)
             ws.set_row(0, 42)
             ws.freeze_panes(1, 2)
             ws.autofilter(0, 0, max(len(df), 1), len(cols_c) - 1)
             _formato_comprobacion(wb, ws, cols_c.index("Cómo se comprobó"), len(df))
-            for r, m in enumerate(marcar, start=1):
-                if not m:
+            dinero_rj = wb.add_format({"num_format": FORMATO_DINERO, "bg_color": C_ROJO, "font_color": "#7F1D1D", "bold": True})
+            texto_rj = wb.add_format({"bg_color": C_ROJO, "font_color": "#7F1D1D", "bold": True})
+            for r, (m, ef) in enumerate(zip(marcar, efectivo), start=1):
+                if not (m or ef):
                     continue
+                f_txt, f_din = (texto_rj, dinero_rj) if ef else (texto_am, dinero_am)    # el rojo (efectivo) pesa más que el amarillo (diferencia)
                 for i, c in enumerate(cols_c):
                     v = df.iloc[r - 1, i]
                     v = v.item() if hasattr(v, "item") else v
                     if pd.isna(v):
-                        ws.write_blank(r, i, None, texto_am)
+                        ws.write_blank(r, i, None, f_txt)
                     elif c in _DINERO:
-                        ws.write_number(r, i, float(v), dinero_am)
+                        ws.write_number(r, i, float(v), f_din)
                     else:
-                        ws.write(r, i, v, texto_am)
+                        ws.write(r, i, v, f_txt)
+            ws.write(len(df) + 1, 0, "Fila en ROJO: combustible (Magna / Premium / Diésel) pagado en efectivo. Fila en amarillo: diferencia dentro de la tolerancia.",
+                     wb.add_format({"italic": True, "font_color": "#7F1D1D"}))
             # Resumen de la tarjeta (uno por cuenta y mes) al pie de la hoja
             fila_x = len(df) + 3
             lbl = wb.add_format({"bold": True}); lbl_g = wb.add_format({"bold": True, "top": 1})
