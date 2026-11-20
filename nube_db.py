@@ -463,6 +463,9 @@ def factura_a_json(f: dict, adjunto: dict | None = None) -> dict:
         "iva_retenido": round(float(f.get("IVA Retenido") or 0), 2),
         "ish": round(float(f.get("ISH") or 0), 2),
         "incompleta": bool(f.get("Incompleta")),
+        # Datos del XML para el revisor (los lee cfdi_extra al subir el XML; en facturas manuales van vacíos)
+        "rfc_receptor": f.get("rfc_receptor") or None, "forma_pago": f.get("forma_pago") or None, "metodo_pago": f.get("metodo_pago") or None,
+        "claves_prod": f.get("claves_prod") or None, "combustible": f.get("combustible") or None,
         "fuente": "manual" if str(f.get("Fuente") or "").strip().lower() == "manual" or uuid_cfdi is None else "xml",
         "adjunto": adjunto,
     }
