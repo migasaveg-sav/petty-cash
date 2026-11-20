@@ -340,28 +340,32 @@ def _es_abono(monto: float, descripcion) -> bool:
 
 
 def saldo_disponible(movs: pd.DataFrame, pagos: list[dict], saldo_inicial: float, mes: str) -> dict:
-    """Saldo disponible de la cuenta en el mes: saldo inicial − cargos + abonos + pagos registrados por el revisor (aplicados a ese mes).
+    """Saldo disponible de la cuenta en el mes = saldo del primer día + pagos realizados (aplicados a ese mes) − gastos del estado de cuenta.
+    Gastos = cargos (monto negativo o que no dicen «abono») SIN contar los «no necesarios»; los abonos del banco no suman.
     Regresa el resumen y `corrido` {id de movimiento: saldo tras ese movimiento (con los pagos hasta su fecha)}."""
     pagos_mes = sorted((p for p in pagos if not p.get("anulado") and str(p.get("mes")) == str(mes)), key=lambda p: str(p["fecha_pago"]))
     m = movs.copy() if movs is not None else pd.DataFrame(columns=["id", "fecha", "descripcion", "monto"])
     if len(m):
         m = m.sort_values(["fecha"], kind="stable")
-    cargos = abonos = 0.0
+    gastos = no_nec = 0.0
+    n_gastos = n_no_nec = 0
     corrido: dict[str, float] = {}
     i_pago, pagado_hasta = 0, 0.0
     for fila in m.itertuples():
         while i_pago < len(pagos_mes) and str(pagos_mes[i_pago]["fecha_pago"]) <= str(fila.fecha):
             pagado_hasta += _num(pagos_mes[i_pago]["monto"]); i_pago += 1
         monto = _num(fila.monto)
-        if _es_abono(monto, fila.descripcion):
-            abonos += abs(monto)
-        else:
-            cargos += abs(monto)
-        corrido[fila.id] = round(float(saldo_inicial) + (abonos - cargos) + pagado_hasta, 2)
+        if not _es_abono(monto, fila.descripcion):
+            if getattr(fila, "estado", None) == "no_necesario":
+                no_nec += abs(monto); n_no_nec += 1
+            else:
+                gastos += abs(monto); n_gastos += 1
+        corrido[fila.id] = round(float(saldo_inicial) + pagado_hasta - gastos, 2)
     total_pagos = round(sum(_num(p["monto"]) for p in pagos_mes), 2)
-    return {"saldo_inicial": round(float(saldo_inicial), 2), "cargos": round(cargos, 2), "abonos": round(abonos, 2),
+    return {"saldo_inicial": round(float(saldo_inicial), 2), "gastos": round(gastos, 2), "n_gastos": n_gastos,
+            "no_necesarios": round(no_nec, 2), "n_no_necesarios": n_no_nec,
             "pagos": total_pagos, "n_pagos": len(pagos_mes),
-            "saldo": round(float(saldo_inicial) - cargos + abonos + total_pagos, 2), "corrido": corrido}
+            "saldo": round(float(saldo_inicial) + total_pagos - gastos, 2), "corrido": corrido}
 
 
 def detalle_por_movimiento(solicitudes: list[dict], gastos: list[dict]) -> dict[str, dict]:
