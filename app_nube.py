@@ -17,6 +17,7 @@ import streamlit as st
 
 import adjuntos as adj
 import bbva_detalle
+import cfdi_extra
 import estado_texto
 import estilos
 import importar
@@ -155,6 +156,14 @@ def _campos_solicitud(sb, pref: str, v: dict | None = None) -> dict:
     personas = d2.number_input("Total number of people", min_value=0, step=1, value=int(v.get("number_of_people") or 0), key=f"{pref}_pers")
     return {"fecha": fecha, "monto": monto, "category": category, "material": material, "employee_name": employee,
             "request_number": request_number, "description": description, "number_of_days": dias, "number_of_people": personas}
+
+
+def _rfc_receptor() -> str:
+    """RFC al que deben estar facturados los CFDI (se puede cambiar con el secreto RFC_RECEPTOR)."""
+    try:
+        return str(st.secrets.get("RFC_RECEPTOR", cfdi_extra.RFC_RECEPTOR_ESPERADO)) or cfdi_extra.RFC_RECEPTOR_ESPERADO
+    except Exception:
+        return cfdi_extra.RFC_RECEPTOR_ESPERADO
 
 
 def _leer_estado(contenido: bytes, nombre: str, formato: str) -> pd.DataFrame:
@@ -786,6 +795,16 @@ def _pantalla_comprobar(sb, cuenta: dict, sol: dict, tol: float) -> None:
             except CFDIParseError as e:
                 st.error(f"No se pudo leer el XML '{xf.name}': {e}")
                 continue
+            try:
+                extra = cfdi_extra.leer_extra(xf.getvalue())
+            except ValueError as e:
+                st.error(f"No se pudo leer el XML '{xf.name}': {e}")
+                continue
+            error_rfc = cfdi_extra.validar_receptor(extra, _rfc_receptor())
+            if error_rfc:
+                st.error(f"❌ **{xf.name}**: {error_rfc}")
+                continue
+            datos.update(extra)
             if datos["UUID"] != "SIN-UUID" and datos["UUID"] in usados:
                 continue
             facturas.append({"k": len(facturas) + 1000 * (ver + 1), "datos": datos, "adjunto": None, "adj_ver": 0})
@@ -1664,7 +1683,11 @@ def _detalle_solicitud_enviada(sb, df: pd.DataFrame, r: dict, gastos_por_id: dic
         for g in gs:
             for f in g.get("facturas") or []:
                 cols = st.columns([3.2, 1.2, 1, 1.1] if revisor else [3.2, 1.2, 1])
-                cols[0].caption(f"{_etiqueta_factura(f)} · 🧾 {f.get('uuid_cfdi') or 'SIN-UUID'} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}")
+                cols[0].caption(f"{_etiqueta_factura(f)} · 🧾 {f.get('uuid_cfdi') or 'SIN-UUID'} · {f.get('rfc_emisor') or ''} · {f.get('nombre_emisor') or ''} · {f.get('fecha_factura') or ''}"
+                                + (f" · 💳 {cfdi_extra.etiqueta_forma_pago(f.get('forma_pago')) or 'forma de pago sin dato'}" if revisor else "")
+                                + (f" · ⛽ {f['combustible']}" if revisor and f.get("combustible") else ""))
+                if revisor and cfdi_extra.combustible_en_efectivo(f):
+                    st.error(f"⛽ **Combustible ({f['combustible']}) pagado en EFECTIVO** — revisa esta factura: {f.get('nombre_emisor') or ''} · {money_md(f['monto_aplicado'])}")
                 cols[1].caption(money_md(f["monto_aplicado"]))
                 _boton_pdf(sb, f, f"venv_{g['id']}_{f['id']}", cols[2])
                 if revisor:
