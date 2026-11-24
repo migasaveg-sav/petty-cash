@@ -1091,6 +1091,7 @@ def _tab_estado_cuenta(sb, cuenta: dict, periodo: dict, cerrado: bool) -> None:
                 st.session_state.pop("df_texto_estado", None)
                 st.session_state.pop("txt_estado", None)
                 _flash(f"{r['nuevos']} movimiento(s) nuevo(s); {r['ya_existian']} ya estaban cargados"
+                       + (f" ({r['con_otra_descripcion']} coincidieron por fecha, monto y saldo con movimientos ya cargados aunque la descripción cambió)" if r.get("con_otra_descripcion") else "")
                        + (f"; {r['sin_fecha_o_monto']} omitido(s) por no tener fecha o monto válido" if r["sin_fecha_o_monto"] else "") + ".")
                 st.rerun()
             except BankStatementError as e:
