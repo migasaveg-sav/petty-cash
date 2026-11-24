@@ -237,26 +237,93 @@ def movimientos_desde_df(df: pd.DataFrame) -> tuple[list[dict], int]:
     return filas, descartadas
 
 
+def _norm_desc(t) -> str:
+    """Descripción comparable: sin espacios, signos ni mayúsculas (el mismo movimiento puede venir con distinto formato)."""
+    return re.sub(r"[^A-Z0-9]", "", str(t or "").upper())
+
+
+def _filtrar_nuevos(filas: list[dict], existentes: list[dict]) -> tuple[list[dict], int, int]:
+    """Quita de `filas` lo que ya está cargado. Regresa (nuevas, ya_exactas, coincidieron_con_otra_descripcion).
+
+    Un movimiento ya existe si coincide:
+      1. exacto: fecha + descripción + monto + ocurrencia (y, si ambos traen saldo, el mismo saldo);
+      2. con otra descripción: fecha + monto + saldo (el saldo del banco identifica el movimiento), o fecha + monto + descripción
+         normalizada cuando alguno de los dos no trae saldo.
+    Así subir un estado de cuenta distinto o más reciente (otro formato, otra descripción) no duplica lo ya cargado ni lo ya comprobado.
+    Los movimientos realmente nuevos que chocarían con la llave única reciben la siguiente ocurrencia libre."""
+    def _igual_saldo(e: dict, f: dict) -> bool:
+        if e.get("saldo") is None or f.get("saldo") is None:
+            return True
+        return abs(float(e["saldo"]) - float(f["saldo"])) < 0.005
+
+    usados: set[str] = set()
+    por_llave = {(e["fecha"], e["descripcion"], round(float(e["monto"]), 2), int(e["ocurrencia"])): e for e in existentes}
+    ya_exactas, resto = 0, []
+    for f in filas:
+        e = por_llave.get((f["fecha"], f["descripcion"], f["monto"], f["ocurrencia"]))
+        if e is not None and e["id"] not in usados and _igual_saldo(e, f):
+            usados.add(e["id"]); ya_exactas += 1
+        else:
+            resto.append(f)
+
+    por_saldo: dict[tuple, list[dict]] = {}
+    por_desc: dict[tuple, list[dict]] = {}
+    for e in existentes:
+        if e["id"] in usados:
+            continue
+        if e.get("saldo") is not None:
+            por_saldo.setdefault((e["fecha"], round(float(e["monto"]), 2), round(float(e["saldo"]), 2)), []).append(e)
+        por_desc.setdefault((e["fecha"], round(float(e["monto"]), 2), _norm_desc(e["descripcion"])), []).append(e)
+
+    otra, nuevas = 0, []
+    for f in resto:
+        hallado = None
+        if f.get("saldo") is not None:
+            hallado = next((e for e in por_saldo.get((f["fecha"], f["monto"], f["saldo"]), []) if e["id"] not in usados), None)
+        if hallado is None:
+            hallado = next((e for e in por_desc.get((f["fecha"], f["monto"], _norm_desc(f["descripcion"])), [])
+                            if e["id"] not in usados and (e.get("saldo") is None or f.get("saldo") is None)), None)
+        if hallado is not None:
+            usados.add(hallado["id"]); otra += 1
+        else:
+            nuevas.append(f)
+
+    tomadas = set(por_llave)
+    for f in nuevas:      # ocurrencia libre para no chocar con la llave única de un movimiento distinto ya cargado
+        while (f["fecha"], f["descripcion"], f["monto"], f["ocurrencia"]) in tomadas:
+            f["ocurrencia"] += 1
+        tomadas.add((f["fecha"], f["descripcion"], f["monto"], f["ocurrencia"]))
+    return nuevas, ya_exactas, otra
+
+
 def subir_estado_cuenta(sb, cuenta_id: str, df: pd.DataFrame) -> dict[str, int]:
-    """Inserta solo los movimientos que todavía no existen (según fecha+descripción+monto
-    +ocurrencia). Cada movimiento se liga al periodo (mes) de su propia fecha."""
+    """Inserta solo los movimientos que todavía no existen (ver `_filtrar_nuevos`: por fecha+monto+saldo aunque cambie la descripción).
+    Cada movimiento se liga al periodo (mes) de su propia fecha."""
     filas, descartadas = movimientos_desde_df(df)
     if not filas:
         raise ErrorNube("No se encontraron movimientos con fecha y monto válidos.")
+    fmin, fmax = min(f["fecha"] for f in filas), max(f["fecha"] for f in filas)
+
+    def construir():
+        return (sb.table("movimientos").select("id,fecha,descripcion,monto,saldo,ocurrencia").eq("cuenta_id", cuenta_id)
+                .gte("fecha", fmin).lte("fecha", fmax).order("fecha").order("id"))
+    existentes = _paginado(construir)
+    nuevas, ya_exactas, otra = _filtrar_nuevos(filas, existentes)
     periodos: dict[tuple[int, int], str] = {}
-    for f in filas:
+    for f in nuevas:
         anio, mes = int(f["fecha"][:4]), int(f["fecha"][5:7])
         if (anio, mes) not in periodos:
             periodos[(anio, mes)] = obtener_o_crear_periodo(sb, anio, mes)
         f["cuenta_id"] = cuenta_id
         f["periodo_id"] = periodos[(anio, mes)]
-    nuevos = 0
-    for i in range(0, len(filas), 500):
-        lote = filas[i:i + 500]
+    insertados_n = 0
+    for i in range(0, len(nuevas), 500):
+        lote = nuevas[i:i + 500]
         insertados = _ejecutar(sb.table("movimientos").upsert(
             lote, on_conflict="cuenta_id,fecha,descripcion,monto,ocurrencia", ignore_duplicates=True))
-        nuevos += len(insertados or [])
-    return {"nuevos": nuevos, "ya_existian": len(filas) - nuevos, "sin_fecha_o_monto": descartadas}
+        insertados_n += len(insertados or [])
+    return {"nuevos": insertados_n, "ya_existian": len(filas) - insertados_n, "sin_fecha_o_monto": descartadas,
+            "con_otra_descripcion": otra}
 
 
 def listar_movimientos(sb, cuenta_id: str, estado: "str | list[str] | None" = None,
